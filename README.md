@@ -10,7 +10,7 @@ logged and dropped, never raised into your code. No runtime dependencies.
 | Language | Package | Source |
 | --- | --- | --- |
 | Python 3.9+ | [`generalcontext`](https://pypi.org/project/generalcontext/) | [`python/`](python) |
-| Node.js 18+ | [`@generalcontext/sdk`](https://www.npmjs.com/package/@generalcontext/sdk) | [`node/`](node) |
+| Node.js 18+ | [`generalcontext`](https://www.npmjs.com/package/generalcontext) | [`node/`](node) |
 
 ## Quickstart
 
@@ -32,13 +32,13 @@ with generalcontext.session(conversation_id):
 ```
 
 ```bash
-npm install @generalcontext/sdk
+npm install generalcontext
 ```
 
 ```ts
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
-import { initialize } from '@generalcontext/sdk';
+import { initialize } from 'generalcontext';
 
 initialize({ instrumentModules: { openAI: OpenAI, anthropic: Anthropic } });
 ```
