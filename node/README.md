@@ -22,15 +22,31 @@ import { initialize } from '@generalcontext/sdk';
 initialize({ appName: 'support-agent', instrumentModules: { openAI: OpenAI, anthropic: Anthropic } });
 ```
 
+## Configuration
+
 | Option | Default | |
 | - | - | - |
 | `apiKey` | `GENERALCONTEXT_API_KEY` | |
-| `baseUrl` | `GENERALCONTEXT_BASE_URL`, else `https://generalcontextlabs.com` | |
+| `baseUrl` | `GENERALCONTEXT_BASE_URL`, else `https://generalcontextlabs.com` | The option wins over the env var. Must be `https://`, except `http://localhost`, `127.0.0.1` or `[::1]`. Other URLs are refused and nothing is sent. |
 | `appName` | none | Sent with every batch. |
-| `instrumentModules` | installed `openai` and `@anthropic-ai/sdk` | Pass these whenever a bundler is involved. |
-| `instrumentFetch` | `true` | Also records raw `fetch` POSTs to any `/chat/completions` URL. |
 | `redact` | `false` | See [Redaction](#redaction). |
+| `beforeSend` | none | `(call) => call \| null`. Runs at send time on each call, before redaction. Return the call (edited or not) to send it, or `null` to drop it. A throw drops the call. |
+| `instrumentModules` | installed `openai` and `@anthropic-ai/sdk` | Pass these whenever a bundler is involved. |
+| `instrumentFetch` | `false` | SDK clients are always recorded. Set `true` to also record raw `fetch` POSTs to any `/chat/completions` URL. |
 | `disableBatch` | `false` | Send each call right away. |
+
+| Env var | |
+| - | - |
+| `GENERALCONTEXT_API_KEY` | API key, if `apiKey` is not passed. |
+| `GENERALCONTEXT_BASE_URL` | Collector URL, if `baseUrl` is not passed. |
+| `GENERALCONTEXT_REDACT_SALT` | Secret that keeps redaction placeholders stable across processes. |
+| `GENERALCONTEXT_DISABLED` | `1`, `true` or `yes` makes `initialize()` do nothing. |
+
+Requests never follow redirects. A call over 4 MB is dropped, and the queue holds at most 5000 calls or 64 MB. Pending calls are flushed when the process is about to exit, for at most 2 seconds.
+
+## Proxies
+
+Node's built-in `fetch` ignores `HTTPS_PROXY` by default. On Node 24+, set `NODE_USE_ENV_PROXY=1`. On older versions, install a global dispatcher (for example undici's `setGlobalDispatcher(new EnvHttpProxyAgent())`). If your proxy inspects TLS, point `NODE_EXTRA_CA_CERTS` at its CA certificate.
 
 ## Next.js
 
@@ -93,11 +109,11 @@ Pass a stable `eventId` so retries dedupe. `properties` are flat strings, number
 
 ## Redaction
 
-`initialize({ redact: true })` replaces emails, phone numbers and card or SSN-like numbers with placeholders such as `<email:3f9a1c>` before anything leaves your process. Set `GENERALCONTEXT_REDACT_SALT` to one secret in every process so the same value gets the same placeholder. Or pass your own `(text) => text`.
+`initialize({ redact: true })` replaces emails, phone numbers and card or SSN-like numbers with placeholders such as `<email:3f9a1c>` before anything leaves your process. Set `GENERALCONTEXT_REDACT_SALT` to one secret in every process so the same value gets the same placeholder. Or pass your own `(text) => text`. Redaction also applies to `reportOutcome` and `logEvent`, so a redacted session id still matches its calls.
 
 ## One client only
 
-`wrap(client)` records a single client instance without patching the SDK.
+`wrap(client, { redact })` records a single client instance without patching the SDK. Its `redact` applies to that client only. If `initialize()` already patched the SDK, the client is recorded with the `initialize()` settings.
 
 ## License
 

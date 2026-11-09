@@ -20,8 +20,8 @@ with generalcontext.session(conversation_id, user_id=customer_id, channel="chat"
 
 `initialize()` records every OpenAI (`chat.completions`, `responses`) and Anthropic (`messages`)
 call in the process, sync and async, streamed or not, from clients created before or after it.
-It also records raw `httpx` and `requests` POSTs to `/chat/completions`
-(`instrument_http=False` turns that off). Call it in every process: queue workers and forked
+SDK clients are always recorded. Raw `httpx` and `requests` POSTs to `/chat/completions`
+are recorded only with `instrument_http=True`. Call it in every process: queue workers and forked
 children do not inherit it.
 
 ## Flush before exit
@@ -56,9 +56,26 @@ Values become stable placeholders (`<phone:3f2a1c>`) before anything leaves your
 
 ## Configuration
 
-`initialize(api_key, base_url, app_name, redact, instrument_http, disable_batch)`. Omitted keys
-fall back to `GENERALCONTEXT_API_KEY` and `GENERALCONTEXT_BASE_URL`. A second call is ignored.
-`wrap(client)` and `conversation(...)` from 0.1 still work.
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `api_key` | `GENERALCONTEXT_API_KEY` | Workspace key. Without it nothing is sent. |
+| `base_url` | `GENERALCONTEXT_BASE_URL`, else `https://generalcontextlabs.com` | Must be `https://` (plain `http://` only for localhost). |
+| `app_name` | `None` | Label for this app. |
+| `redact` | `False` | `True` for built-in PII redaction, or a `str -> str` function. Also applied to outcomes and events. |
+| `before_send` | `None` | `fn(call) -> dict or None`, runs on the sender thread before redaction. `None` or an exception drops the call. |
+| `instrument_http` | `False` | Also record raw `httpx`/`requests` POSTs to `/chat/completions`. |
+| `disable_batch` | `False` | Send each call on its own. |
+
+| Env var | Meaning |
+| --- | --- |
+| `GENERALCONTEXT_API_KEY` | Default `api_key`. |
+| `GENERALCONTEXT_BASE_URL` | Default `base_url`. |
+| `GENERALCONTEXT_REDACT_SALT` | Shared secret so redaction placeholders match across processes. |
+| `GENERALCONTEXT_DISABLED` | `1`, `true` or `yes` makes `initialize()` do nothing. |
+
+`HTTPS_PROXY` and `SSL_CERT_FILE` are honored via `urllib`. Redirects are never followed.
+Calls over 4 MB are dropped, and the in-memory queue is capped at 64 MB. A second `initialize()`
+is ignored. `wrap(client)` and `conversation(...)` from 0.1 still work.
 
 Tests: `cd python && python -m unittest test_sdk -v`.
 

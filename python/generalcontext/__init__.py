@@ -11,8 +11,8 @@
 
 `initialize()` patches the installed `openai` and `anthropic` client classes, so every
 client is recorded: chat.completions, responses and messages, sync and async, streamed or
-not. With `instrument_http=True` it also records raw `httpx` and `requests` POSTs to
-`/chat/completions`. Calls are sent from a background thread. Your agent never waits on
+not. Raw `httpx` and `requests` POSTs to `/chat/completions` are recorded only with
+`instrument_http=True`. Calls are sent from a background thread. Your agent never waits on
 General Context, and a failure on our side is logged and dropped, never raised.
 
 `redact=True` replaces emails, phone numbers and card or SSN-like numbers with stable
@@ -25,6 +25,7 @@ Standard library only. `wrap(client)` and `conversation(...)` from 0.1 still wor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
+import atexit
 import functools
 import hashlib
 import hmac
@@ -35,6 +36,8 @@ import os
 import queue
 import re
 import threading
+import time
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -52,7 +55,8 @@ _task = ContextVar("generalcontext_task", default=None)
 # twice or its HTTP request passes through a patched transport.
 _inside = ContextVar("generalcontext_inside", default=False)
 
-_config = {"initialized": False, "api_key": None, "base_url": None, "app": None, "scrub": None, "batch": BATCH}
+_config = {"initialized": False, "api_key": None, "base_url": None, "app": None, "scrub": None, "batch": BATCH,
+           "before_send": None}
 
 
 def _api_key():
@@ -67,17 +71,34 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _disabled():
+    """GENERALCONTEXT_DISABLED=1 turns the SDK off without a code change."""
+    return os.environ.get("GENERALCONTEXT_DISABLED", "").strip().lower() in ("1", "true", "yes")
+
+
 # ---- Setup -------------------------------------------------------------------------------
 
-def initialize(api_key=None, base_url=None, app_name=None, redact=False, instrument_http=True, disable_batch=False):
-    """Record every OpenAI and Anthropic call in this process. Call once, in every process."""
+def initialize(api_key=None, base_url=None, app_name=None, redact=False, before_send=None,
+               instrument_http=False, disable_batch=False):
+    """Record every OpenAI and Anthropic call in this process. Call once, in every process.
+
+    SDK clients are always recorded. Raw httpx/requests POSTs to /chat/completions are
+    recorded only with instrument_http=True. before_send(call) runs on the sender thread and
+    returns the dict to send, or None to drop the call.
+    """
+    if _disabled():
+        log.info("GENERALCONTEXT_DISABLED is set; General Context is off")
+        return
     if _config["initialized"]:
         log.warning("generalcontext.initialize() was already called; this call is ignored")
         return
     _config.update(initialized=True, api_key=api_key, base_url=base_url, app=app_name,
-                   scrub=_redactor(redact), batch=1 if disable_batch else BATCH)
+                   scrub=_redactor(redact), before_send=before_send, batch=1 if disable_batch else BATCH)
     if not _api_key():
         log.warning("GENERALCONTEXT_API_KEY is not set; model calls will not be recorded")
+    if not _secure(_base_url()):
+        _warn_insecure()
+    atexit.register(_flush_at_exit)
     _patch_sdks()
     if instrument_http:
         _patch_http()
@@ -105,6 +126,8 @@ def _patch_sdks():
 
 def wrap(client, *, redact=False):
     """Record every model call `client` makes. Returns the same client. Prefer initialize()."""
+    if _disabled():
+        return client
     scrub = _redactor(redact)
     targets = []
     if hasattr(client, "chat") and hasattr(getattr(client.chat, "completions", None), "create"):
@@ -153,56 +176,172 @@ def task(name):
 
 # ---- Sending -----------------------------------------------------------------------------
 
+MAX_CALL_BYTES = 4_000_000     # The server rejects larger calls.
+MAX_QUEUE_BYTES = 64_000_000
+MAX_BATCH_BYTES = 4_000_000
+MAX_QUEUE_CALLS = 5000
+_warned_at = {}
+
+
+def _warn(key, message, *args):
+    """Log `message` at most once per 60 seconds per `key`."""
+    now = time.monotonic()
+    if now - _warned_at.get(key, -1e9) >= 60:
+        _warned_at[key] = now
+        log.warning(message, *args)
+
+
+def _secure(url):
+    """HTTPS, or plain HTTP to this machine for local development."""
+    parts = urllib.parse.urlsplit(url)
+    return parts.scheme == "https" or (parts.scheme == "http" and parts.hostname in ("localhost", "127.0.0.1", "::1"))
+
+
+def _warn_insecure():
+    _warn("http", "General Context base_url %s is not https; nothing will be sent", _base_url())
+
+
+def _size(value, limit):
+    """Cheap size estimate of a snapshot; stops counting past `limit`."""
+    total, stack = 0, [value]
+    while stack and total <= limit:
+        item = stack.pop()
+        total += 8
+        if isinstance(item, str):
+            total += len(item)
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return total
+
+
 class _Sender:
-    """One daemon thread that batches recorded calls and posts them."""
+    """One daemon thread that redacts, encodes, batches and posts recorded calls."""
 
     def __init__(self):
-        self.queue = queue.Queue(maxsize=5000)
-        self.thread = None
-        self.lock = threading.Lock()
+        self._reset()
         self.warned = False
 
-    def put(self, call):
+    def _reset(self):
+        # Also run in a forked child: the parent's thread and lock do not exist there.
+        self.queue = queue.Queue(maxsize=MAX_QUEUE_CALLS)
+        self.lock = threading.Lock()
+        self.bytes = 0
+        self.thread = None
+
+    def put(self, call, scrub):
+        """Runs on the caller's thread, so it only measures and enqueues."""
         if not _api_key():
             if not self.warned:
                 log.warning("GENERALCONTEXT_API_KEY is not set; model calls are not recorded")
                 self.warned = True
             return
+        if not _secure(_base_url()):
+            return _warn_insecure()
+        size = _size(call, MAX_CALL_BYTES)
+        if size > MAX_CALL_BYTES:
+            return _warn("oversized", "General Context dropped a model call larger than %d bytes", MAX_CALL_BYTES)
         with self.lock:
+            if self.bytes + size > MAX_QUEUE_BYTES:
+                return _warn("full", "General Context queue is full; a model call was dropped")
+            try:
+                self.queue.put_nowait((call, scrub, size))
+            except queue.Full:
+                return _warn("full", "General Context queue is full; a model call was dropped")
+            self.bytes += size
             if self.thread is None or not self.thread.is_alive():
                 self.thread = threading.Thread(target=self._run, name="generalcontext", daemon=True)
                 self.thread.start()
+
+    def _take(self, pending, timeout):
+        """Move one call from the queue into `pending` as JSON bytes. False when the queue stayed empty."""
         try:
-            self.queue.put_nowait(call)
-        except queue.Full:
-            log.warning("General Context queue is full; a model call was dropped")
+            call, scrub, size = self.queue.get(timeout=timeout)
+        except queue.Empty:
+            return False
+        with self.lock:
+            self.bytes -= size
+        data = _encode(call, scrub)
+        if data is None:
+            self.queue.task_done()
+        else:
+            pending.append(data)
+        return True
 
     def _run(self):
+        pending = []  # Encoded calls taken from the queue; each still owes one task_done.
         while True:
-            batch = [self.queue.get()]
-            while len(batch) < _config["batch"]:
-                try:
-                    batch.append(self.queue.get(timeout=0.5))
-                except queue.Empty:
+            if not pending:
+                self._take(pending, None)
+                continue
+            while (len(pending) < _config["batch"] and sum(map(len, pending)) < MAX_BATCH_BYTES
+                   and self._take(pending, 0.5)):
+                pass
+            count, size = 0, 0
+            for data in pending:
+                if count and (count >= _config["batch"] or size + len(data) + 1 > MAX_BATCH_BYTES):
                     break
+                count, size = count + 1, size + len(data) + 1
+            batch, pending = pending[:count], pending[count:]
             try:
-                _post("/api/platform-collect/sdk", {"calls": batch, "sdk": f"python/{__version__}", "app": _config["app"]})
+                head = json.dumps({"sdk": f"python/{__version__}", "app": _config["app"]})[:-1]
+                _post("/api/platform-collect/sdk", (head + ', "calls": [').encode() + b",".join(batch) + b"]}", 15)
             except Exception as error:  # Never let our failure reach the agent.
-                log.warning("General Context did not accept %d calls: %s", len(batch), error)
+                _warn("send", "General Context did not accept %d calls: %s", len(batch), error)
             finally:
                 for _ in batch:
                     self.queue.task_done()
 
 
-def _post(path, body):
-    data = json.dumps(body, default=str).encode()
-    request = urllib.request.Request(_base_url() + path, data=data, headers={
+def _encode(call, scrub):
+    """before_send, redaction and JSON encoding, on the sender thread. None drops the call."""
+    try:
+        before_send = _config["before_send"]
+        if before_send is not None:
+            try:
+                call = before_send(call)
+            except Exception as error:
+                _warn("before_send", "General Context before_send raised; a call was dropped: %s", error)
+                return None
+            if call is None:
+                return None
+        data = json.dumps(_scrubbed(call, scrub), default=str).encode()
+    except Exception as error:
+        _warn("encode", "General Context could not encode a model call: %s", error)
+        return None
+    if len(data) > MAX_CALL_BYTES:
+        _warn("oversized", "General Context dropped a model call larger than %d bytes", MAX_CALL_BYTES)
+        return None
+    return data
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects, so the Authorization header is never forwarded anywhere else."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None  # urllib then raises HTTPError for the 3xx.
+
+
+_opener = urllib.request.build_opener(_NoRedirect)  # Honors HTTPS_PROXY and SSL_CERT_FILE.
+
+
+def _post(path, body, timeout):
+    url = _base_url() + path
+    if not _secure(url):
+        _warn_insecure()
+        raise ValueError("refusing to send to a non-https base_url")
+    data = body if isinstance(body, bytes) else json.dumps(body, default=str).encode()
+    request = urllib.request.Request(url, data=data, headers={
         "Authorization": "Bearer " + (_api_key() or ""), "Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with _opener.open(request, timeout=timeout) as response:
         response.read()
 
 
 _sender = _Sender()
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_sender._reset)
 
 
 def flush(timeout=10):
@@ -216,39 +355,62 @@ def flush(timeout=10):
         return False
 
 
+def _flush_at_exit():
+    try:
+        flush(2)
+    except Exception:
+        pass
+
+
 def _send_after_flush(path, body, what):
     """Flush first, so the conversation exists when the server receives `body`."""
     try:
+        if not _api_key():
+            return False
         flush()
-        _post(path, body)
+        _post(path, body, 10)
         return True
     except Exception as error:
         log.warning("General Context did not accept the %s: %s", what, error)
         return False
 
 
+def _scrub_text(value):
+    scrub = _config["scrub"]
+    return scrub(value) if scrub is not None and isinstance(value, str) else value
+
+
 def report_outcome(session_id, outcome, note=None):
     """Mark a conversation as a success or a failure. True if General Context accepted it."""
-    if outcome not in ("success", "fail"):
-        log.warning("report_outcome expects 'success' or 'fail', got %r", outcome)
+    try:
+        if outcome not in ("success", "fail"):
+            log.warning("report_outcome expects 'success' or 'fail', got %r", outcome)
+            return False
+        body = {"session_id": _scrub_text(str(session_id)), "outcome": outcome, "note": _scrub_text(note)}
+    except Exception as error:
+        log.warning("General Context could not build the outcome: %s", error)
         return False
-    return _send_after_flush("/api/platform-collect/outcomes",
-                             {"session_id": str(session_id), "outcome": outcome, "note": note}, "outcome")
+    return _send_after_flush("/api/platform-collect/outcomes", body, "outcome")
 
 
 def log_event(session_id, event_type, properties=None, event_id=None, timestamp=None):
     """Record something that happened in your systems (order.refunded, ticket.escalated). Pass a stable event_id so retries dedupe."""
-    event = {"event_id": event_id or str(uuid.uuid4()), "event_type": event_type, "timestamp": timestamp or _now(),
-             "session_id": str(session_id), "properties": properties or {}}
+    try:
+        event = {"event_id": event_id or str(uuid.uuid4()), "event_type": _scrub_text(event_type),
+                 "timestamp": timestamp or _now(), "session_id": _scrub_text(str(session_id)),
+                 "properties": {key: _scrub_text(value) for key, value in (properties or {}).items()}}
+    except Exception as error:
+        log.warning("General Context could not build the event: %s", error)
+        return False
     return _send_after_flush("/api/platform-collect/events", {"events": [event]}, "event")
 
 
 def _record(meta, response=None, error=None):
-    """Enqueue one finished call. Never raises."""
+    """Snapshot and enqueue one finished call. Never raises."""
     try:
         call = dict(meta["call"], response=_plain(response) if response is not None else None,
                     ended_at=_now(), error=f"{type(error).__name__}: {error}" if error is not None else None)
-        _sender.put(_scrubbed(call, meta["scrub"]))
+        _sender.put(call, meta["scrub"])
     except Exception as failure:
         log.warning("General Context could not record a model call: %s", failure)
 
@@ -261,6 +423,14 @@ def _start(api, request, scrub=None):
 
 # ---- SDK patching --------------------------------------------------------------------------
 
+def _safe_start(api, request, scrub=None):
+    try:
+        return _start(api, request, scrub)
+    except Exception as error:
+        _warn("start", "General Context could not snapshot a model call; it runs unrecorded: %s", error)
+        return None
+
+
 def _recording(create, api, is_async, scrub=None):
     """Wrap a `create` method so each call is recorded. The caller gets exactly what `create` returns."""
     if is_async:
@@ -268,8 +438,10 @@ def _recording(create, api, is_async, scrub=None):
         async def wrapped(*args, **kwargs):
             if _inside.get():
                 return await create(*args, **kwargs)
+            meta = _safe_start(api, kwargs, scrub)
+            if meta is None:
+                return await create(*args, **kwargs)
             token = _inside.set(True)
-            meta = _start(api, kwargs, scrub)
             try:
                 reply = await create(*args, **kwargs)
             except Exception as error:
@@ -286,8 +458,10 @@ def _recording(create, api, is_async, scrub=None):
         def wrapped(*args, **kwargs):
             if _inside.get():
                 return create(*args, **kwargs)
+            meta = _safe_start(api, kwargs, scrub)
+            if meta is None:
+                return create(*args, **kwargs)
             token = _inside.set(True)
-            meta = _start(api, kwargs, scrub)
             try:
                 reply = create(*args, **kwargs)
             except Exception as error:
@@ -388,7 +562,9 @@ def _recording_stream_manager(stream, is_async):
 
     @functools.wraps(stream)
     def wrapped(*args, **kwargs):
-        return _StreamManager(stream(*args, **kwargs), _start("anthropic", dict(kwargs, stream=True)))
+        meta = _safe_start("anthropic", dict(kwargs, stream=True))
+        inner = stream(*args, **kwargs)
+        return inner if meta is None else _StreamManager(inner, meta)
     wrapped._generalcontext = True
     return wrapped
 
@@ -569,7 +745,7 @@ def _http_finish(meta, send, streamed, text):
 # ---- Redaction -----------------------------------------------------------------------------
 
 PATTERNS = [
-    ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
+    ("email", re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}")),
     ("card", re.compile(r"\b(?:\d[ -]?){13,16}\b")),
     ("ssn", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
     ("phone", re.compile(r"(?<![\w])\+?1?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?![\w])")),
@@ -617,6 +793,8 @@ def _plain(value, depth=0):
     """SDK objects (pydantic models) as plain JSON. Request bodies may hold anything; keep what serializes."""
     if depth > 40:
         return None
+    if inspect.isclass(value):  # e.g. response_format=SomeModel
+        return f"{value.__module__}.{value.__qualname__}"
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json", exclude_none=True)
     if isinstance(value, dict):

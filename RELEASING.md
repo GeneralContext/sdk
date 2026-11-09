@@ -11,15 +11,21 @@ pushed. Nothing is uploaded from a laptop.
 ## One-time setup
 
 1. **GitHub environment.** In the repository's settings, create an environment named
-   `sdk-release` and add required reviewers, so a release needs a second person's approval.
-2. **PyPI.** Sign in to a company PyPI account (2FA on). Under "Publishing", add a pending
+   `sdk-release`. Add required reviewers, turn on "Prevent self-review", and under
+   "Deployment branches and tags" allow only tags matching `python-v*` and `node-v*`.
+2. **Protect `main` and the tags.** Add a ruleset for `main` requiring a pull request with one
+   approval and the `CI` checks, and blocking force pushes and deletion. Add a tag ruleset for
+   `python-v*` and `node-v*` that only admins can create, update or delete.
+3. **Private vulnerability reporting.** Settings, Code security: turn on private vulnerability
+   reporting (available once the repository is public).
+4. **PyPI.** Sign in to a company PyPI account (2FA on). Under "Publishing", add a pending
    trusted publisher: project `generalcontext`, owner `GeneralContext`, repository
    `sdk`, workflow `release.yml`, environment `sdk-release`. No token is stored.
-3. **npm.** Confirm the `generalcontext` org on npm belongs to us (or create it). Create a
+5. **npm.** Confirm the `generalcontext` org on npm belongs to us (or create it). Create a
    granular automation token limited to `@generalcontext/sdk` and save it as the `NPM_TOKEN`
    secret on the `sdk-release` environment. Once the package exists, switch it to npm trusted
    publishing and delete the token.
-4. **Rehearse** (optional): point the Python job at TestPyPI by adding
+6. **Rehearse** (optional): point the Python job at TestPyPI by adding
    `repository-url: https://test.pypi.org/legacy/` to the publish step and tagging a `.dev` version.
 
 ## Each release
@@ -29,9 +35,11 @@ pushed. Nothing is uploaded from a laptop.
    `node/src/index.ts`.
 2. Merge to `main`.
 3. Tag and push: `git tag python-v0.2.0 && git push origin python-v0.2.0` (or `node-v0.2.0`).
-4. Approve the `sdk-release` deployment. The job checks the tag matches the version, runs the
-   tests, builds, and publishes.
-5. Check it installs: `pip install generalcontext==0.2.0` or `npm install @generalcontext/sdk@0.2.0`.
+4. The build job checks the tag matches the version, runs the tests, builds once, and signs a
+   build-provenance attestation for the files.
+5. Approve the `sdk-release` deployment. The publish job uploads exactly those files.
+6. Check it: `pip install generalcontext==0.2.0` or `npm install @generalcontext/sdk@0.2.0`, then
+   `gh attestation verify <downloaded file> --repo GeneralContext/sdk`.
 
 A published version can't be replaced. To fix one, release the next patch version.
 

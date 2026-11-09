@@ -5,57 +5,84 @@ on:
   pull_request:
 permissions:
   contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
+# Actions are pinned to commit SHAs; Dependabot keeps them current.
 jobs:
   python:
-    runs-on: ubuntu-latest
+    # Pinned image: newer Ubuntu runners no longer ship Python 3.9.
+    runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
-        python: ['3.9', '3.12', '3.13']
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13']
     defaults:
       run:
         working-directory: python
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python }}
       - name: Tests without the provider clients (they skip cleanly)
         run: python -m unittest test_sdk -v
       - name: Tests with the provider clients
         run: |
-          pip install openai anthropic httpx requests
+          python -m pip install openai anthropic httpx requests
           python -m unittest test_sdk -v
       - name: Build
         run: |
-          pip install build twine
+          python -m pip install build twine
           python -m build --outdir dist
-          twine check dist/*
+          twine check --strict dist/*
 
   node:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
-        node: ['18', '20', '22']
+        node: ['18', '20', '22', '24']
     defaults:
       run:
         working-directory: node
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm test
       - run: npm pack --dry-run
+      - name: No runtime dependencies
+        run: test "$(node -p "Object.keys(require('./package.json').dependencies || {}).length")" = 0
 
-  license:
-    runs-on: ubuntu-latest
+  repository:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Each package ships the repository's LICENSE and NOTICE unchanged
         run: |
           for package in python node; do
             cmp LICENSE "$package/LICENSE"
             cmp NOTICE "$package/NOTICE"
           done
+      - name: Python and Node report the same version line
+        run: |
+          python3 - <<'EOF'
+          import json, re, tomllib
+          py = tomllib.load(open("python/pyproject.toml", "rb"))["project"]["version"]
+          init = re.search(r'__version__ = "([^"]+)"', open("python/generalcontext/__init__.py").read()).group(1)
+          node = json.load(open("node/package.json"))["version"]
+          const = re.search(r"VERSION = '([^']+)'", open("node/src/index.ts").read()).group(1)
+          assert py == init, f"pyproject {py} != __version__ {init}"
+          assert node == const, f"package.json {node} != VERSION {const}"
+          print("python", py, "node", node)
+          EOF
