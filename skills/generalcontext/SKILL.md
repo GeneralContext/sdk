@@ -86,7 +86,7 @@ return Response.json(result);
 
 ### Report outcomes and events (ground truth)
 
-When the app knows whether a conversation actually worked (the order refunded, the tour booked, the customer came back angry, a person had to step in), report it. Reviewers see it next to the transcript, and a conversation that sounded fine but booked nothing is caught.
+When the app knows whether a conversation actually worked (the order refunded, the tour booked, the customer came back angry, a person had to step in), report it. We see it next to the transcript, and a conversation that sounded fine but booked nothing is caught.
 
 ```ts
 import { reportOutcome, logEvent } from "generalcontext";
