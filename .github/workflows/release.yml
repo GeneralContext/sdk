@@ -2,30 +2,37 @@
 #   python-v0.2.0  ->  generalcontext on PyPI
 #   node-v0.2.0    ->  @generalcontext/sdk on npm
 #
-# No long-lived tokens. PyPI uses trusted publishing (OIDC) and npm uses provenance, both tied
-# to this workflow and the `sdk-release` environment, which should require a reviewer.
-# One-time setup is in RELEASING.md. A tag whose version differs from the package's fails.
-name: Release SDKs
+# Each release is built once, tested, attested (SLSA build provenance, verifiable with
+# `gh attestation verify`), and only then published, from the exact files that were built.
+# Publishing needs approval on the `sdk-release` environment. PyPI uses trusted publishing (no
+# token); npm publishes with provenance. One-time setup is in RELEASING.md.
+name: Release
 on:
   push:
     tags: ['python-v*', 'node-v*']
 permissions:
   contents: read
+# One release at a time, and never cancel one that has started.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  python:
+  build-python:
     if: startsWith(github.ref_name, 'python-v')
-    runs-on: ubuntu-latest
-    environment: sdk-release
+    runs-on: ubuntu-24.04
     permissions:
-      contents: read
-      id-token: write   # PyPI trusted publishing
+      contents: read        # check out the tagged source
+      id-token: write       # sign the attestation
+      attestations: write   # store the attestation
     defaults:
       run:
         working-directory: python
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
       - name: Tag matches version
@@ -34,39 +41,94 @@ jobs:
           test "python-v$version" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != python-v$version"; exit 1; }
       - name: Test
         run: |
-          pip install openai anthropic httpx requests
+          python -m pip install openai anthropic httpx requests
           python -m unittest test_sdk -v
       - name: Build
         run: |
-          pip install build twine
+          python -m pip install build twine
           python -m build --outdir dist
-          twine check dist/*
-      - uses: pypa/gh-action-pypi-publish@release/v1
+          twine check --strict dist/*
+          sha256sum dist/* | tee dist/SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          packages-dir: python/dist
+          subject-path: python/dist/generalcontext-*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-dist
+          path: python/dist/
+          if-no-files-found: error
 
-  node:
-    if: startsWith(github.ref_name, 'node-v')
-    runs-on: ubuntu-latest
+  publish-python:
+    needs: build-python
+    runs-on: ubuntu-24.04
     environment: sdk-release
     permissions:
-      contents: read
-      id-token: write   # npm provenance
+      id-token: write       # PyPI trusted publishing
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: python-dist
+          path: dist/
+      - run: rm dist/SHA256SUMS
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist/
+
+  build-node:
+    if: startsWith(github.ref_name, 'node-v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read        # check out the tagged source
+      id-token: write       # sign the attestation
+      attestations: write   # store the attestation
     defaults:
       run:
         working-directory: node
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
+          package-manager-cache: false   # never restore a cache into a release build
       - name: Tag matches version
         run: |
           version=$(node -p "require('./package.json').version")
           test "node-v$version" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != node-v$version"; exit 1; }
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm test
-      - run: npm publish --provenance --access public
+      - name: Pack
+        run: |
+          mkdir -p dist-pack
+          npm pack --pack-destination dist-pack
+          sha256sum dist-pack/* | tee dist-pack/SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: node/dist-pack/*.tgz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: node-pack
+          path: node/dist-pack/
+          if-no-files-found: error
+
+  publish-node:
+    needs: build-node
+    runs-on: ubuntu-24.04
+    environment: sdk-release
+    permissions:
+      id-token: write       # npm provenance
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: node-pack
+          path: pack/
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Publish the tested tarball
+        run: npm publish pack/*.tgz --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

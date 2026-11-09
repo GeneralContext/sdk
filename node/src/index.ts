@@ -9,8 +9,8 @@
 //   initialize({ instrumentModules: { openAI: OpenAI } });
 //   await withSession(conversationId, async () => { ... });
 //
-// Every model call (history sent, tools offered, reply and tool calls) is queued and sent in
-// the background. Your agent never waits on General Context, and a failure on our side is
+// Every SDK model call (history sent, tools offered, reply and tool calls) is queued and sent in
+// the background. Raw fetch capture is opt-in with instrumentFetch: true. Your agent never waits on General Context, and a failure on our side is
 // logged and dropped, never thrown. No runtime dependencies.
 
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -20,65 +20,107 @@ import { createRequire } from 'node:module';
 export const VERSION = '0.2.0';
 const BATCH = 20;
 const MAX_QUEUE = 5000;
+const MAX_CALL_BYTES = 4_000_000; // the server rejects larger calls
+const MAX_QUEUE_BYTES = 64_000_000;
+const MAX_BATCH_BYTES = 4_000_000;
+const SEND_TIMEOUT_MS = 15_000;
+const DIRECT_TIMEOUT_MS = 10_000; // reportOutcome and logEvent
+const EXIT_FLUSH_MS = 2_000;
 
 type Metadata = Record<string, string | number | boolean>;
 export type Session = { sessionId: string; userId?: string; channel?: string; product?: string; metadata?: Metadata };
 type Tags = { id: string; user_id?: string; channel?: string; product?: string; metadata?: Metadata };
 type Api = 'openai-chat' | 'openai-responses' | 'anthropic';
-type Call = {
+export type Call = {
   api: Api; conversation: Tags | null; task: string | null; request: unknown; response: unknown;
   started_at: string; ended_at: string; error: string | null;
 };
 type Scrub = (text: string) => string;
+type BeforeSend = (call: Call) => Call | null | undefined;
 type Scope = { tags?: Tags; task?: string; inSdkCall?: boolean };
+// A queued call: its JSON snapshot, and the scrub to apply at send time (undefined = the global one).
+type Entry = { json: string; bytes: number; scrub?: Scrub | null };
 
 export type InitializeOptions = {
   apiKey?: string;
+  /** Collector URL. Must be https://, except http://localhost, 127.0.0.1 or [::1]. */
   baseUrl?: string;
   appName?: string;
   /** true for built-in email/phone/card/SSN placeholders, or your own (text) => text. */
   redact?: boolean | Scrub;
+  /** Runs at send time on each call, before redaction. Return the call to send, or null to drop it. */
+  beforeSend?: BeforeSend;
   /** SDK classes or modules to patch, e.g. { openAI: OpenAI, anthropic: Anthropic }. */
   instrumentModules?: { openAI?: unknown; anthropic?: unknown };
-  /** Record raw fetch POSTs to any URL ending /chat/completions. Default true. */
+  /** Also record raw fetch POSTs to any URL ending /chat/completions. Default false. */
   instrumentFetch?: boolean;
   /** Send each call right away instead of batching. */
   disableBatch?: boolean;
 };
 
+const DEFAULT_BASE_URL = 'https://generalcontextlabs.com';
 const config = {
   apiKey: undefined as string | undefined,
-  baseUrl: 'https://generalcontextlabs.com',
+  baseUrl: undefined as string | undefined,
   appName: undefined as string | undefined,
   scrub: null as Scrub | null,
+  beforeSend: null as BeforeSend | null,
   disableBatch: false,
 };
 const scope = new AsyncLocalStorage<Scope>();
-const queue: Call[] = [];
+const queue: Entry[] = [];
+let queuedBytes = 0;
 let initialized = false;
 let sending: Promise<void> | null = null;
 let timer: ReturnType<typeof setTimeout> | null = null;
 let originalFetch: typeof fetch = globalThis.fetch;
+let exitHooked = false;
+let stopped = false; // set when the exit flush runs out of time
+const inflight = new Set<AbortController>();
 
 const apiKey = () => config.apiKey ?? process.env.GENERALCONTEXT_API_KEY;
-const baseUrl = () => (process.env.GENERALCONTEXT_BASE_URL ?? config.baseUrl).replace(/\/+$/, '');
+// Explicit option, then env var, then default. Trailing slashes are trimmed without a regex.
+const trimSlashes = (url: string) => { let end = url.length; while (end > 0 && url[end - 1] === '/') end--; return url.slice(0, end); };
+const baseUrl = () => trimSlashes(config.baseUrl ?? process.env.GENERALCONTEXT_BASE_URL ?? DEFAULT_BASE_URL);
 const warn = (message: string) => console.warn(`[generalcontext] ${message}`);
+
+// Warn at most once per minute for each key, so a broken collector cannot flood logs.
+const lastWarned = new Map<string, number>();
+function warnLimited(key: string, message: string) {
+  const now = Date.now();
+  if (now - (lastWarned.get(key) ?? -Infinity) < 60_000) return;
+  lastWarned.set(key, now);
+  warn(message);
+}
+
+// Only send the API key over https, or plain http to this machine for local development.
+function secureUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'https:' || (u.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname));
+  } catch { return false; }
+}
+
+const disabledByEnv = () => /^(1|true|yes)$/i.test((process.env.GENERALCONTEXT_DISABLED ?? '').trim());
 
 /** Configure recording once per process, before your agent makes model calls. */
 export function initialize(options: InitializeOptions = {}): void {
   if (initialized) { warn('initialize was already called; ignoring the second call'); return; }
   initialized = true;
+  if (disabledByEnv()) { warn('GENERALCONTEXT_DISABLED is set; recording is off'); return; }
   config.apiKey = options.apiKey ?? process.env.GENERALCONTEXT_API_KEY;
-  config.baseUrl = options.baseUrl ?? process.env.GENERALCONTEXT_BASE_URL ?? config.baseUrl;
+  config.baseUrl = options.baseUrl;
   config.appName = options.appName;
   config.scrub = redactor(options.redact);
+  config.beforeSend = options.beforeSend ?? null;
   config.disableBatch = options.disableBatch ?? false;
   if (!config.apiKey) warn('no API key; set GENERALCONTEXT_API_KEY or pass apiKey');
+  if (!secureUrl(baseUrl())) warn(`baseUrl ${baseUrl()} is not https; nothing will be sent`);
 
   const modules = options.instrumentModules ?? autoload();
   if (modules.openAI) patchOpenAI(modules.openAI);
   if (modules.anthropic) patchAnthropic(modules.anthropic);
-  if (options.instrumentFetch ?? true) patchFetch();
+  if (options.instrumentFetch ?? false) patchFetch();
 }
 
 // Load installed SDKs when the caller did not pass them. Bundlers can hide these; pass instrumentModules there.
@@ -140,42 +182,102 @@ export function task<T>(name: string, run: () => T): T {
   return scope.run({ ...scope.getStore(), task: name }, run);
 }
 
-function record(call: Omit<Call, 'conversation' | 'task'>, at: Scope | undefined) {
+// Runs before the caller's await continues, so only take the snapshot here. Redaction and beforeSend run at send time.
+function record(call: Omit<Call, 'conversation' | 'task'>, at: Scope | undefined, scrub?: Scrub | null) {
   try {
-    const full: Call = { ...call, conversation: at?.tags ?? null, task: at?.task ?? null };
-    enqueue(scrubbed(JSON.parse(JSON.stringify(full)), config.scrub) as Call);
-  } catch (error) { warn(`could not record a model call: ${(error as Error).message}`); }
+    if (!apiKey()) { warnLimited('no-key', 'GENERALCONTEXT_API_KEY is not set; a model call was not recorded'); return; }
+    const json = JSON.stringify({ ...call, conversation: at?.tags ?? null, task: at?.task ?? null });
+    const bytes = Buffer.byteLength(json);
+    if (bytes > MAX_CALL_BYTES) { warnLimited('oversized', `a model call of ${bytes} bytes is over the ${MAX_CALL_BYTES} byte limit and was dropped`); return; }
+    if (queue.length >= MAX_QUEUE || queuedBytes + bytes > MAX_QUEUE_BYTES) { warnLimited('queue-full', 'queue is full; a model call was dropped'); return; }
+    queue.push({ json, bytes, scrub });
+    queuedBytes += bytes;
+    hookExit();
+    if (config.disableBatch || queue.length >= BATCH) void send();
+    else if (!timer) { timer = setTimeout(() => { timer = null; void send(); }, 500); timer.unref?.(); }
+  } catch (error) { warnLimited('record', `could not record a model call: ${(error as Error).message}`); }
 }
 
-function enqueue(call: Call) {
-  if (!apiKey()) { warn('GENERALCONTEXT_API_KEY is not set; a model call was not recorded'); return; }
-  if (queue.length >= MAX_QUEUE) { warn('queue is full; a model call was dropped'); return; }
-  queue.push(call);
-  if (config.disableBatch || queue.length >= BATCH) void send();
-  else if (!timer) { timer = setTimeout(() => { timer = null; void send(); }, 500); timer.unref?.(); }
+// Flush once when the event loop empties, capped at EXIT_FLUSH_MS. Pending requests are aborted at the cap.
+function hookExit() {
+  if (exitHooked) return;
+  exitHooked = true;
+  process.once('beforeExit', () => {
+    const cap = setTimeout(() => { stopped = true; for (const c of inflight) c.abort(); }, EXIT_FLUSH_MS);
+    cap.unref?.();
+    void flush().finally(() => clearTimeout(cap));
+  });
 }
 
-async function post(path: string, body: unknown): Promise<Response | null> {
+// Apply beforeSend and redaction. Returns the JSON to send, or null to drop.
+function prepare(entry: Entry): string | null {
+  let call = JSON.parse(entry.json) as Call | null | undefined;
+  if (config.beforeSend) {
+    try { call = config.beforeSend(call as Call); } catch (error) {
+      warnLimited('before-send', `beforeSend threw; a model call was dropped: ${(error as Error).message}`);
+      return null;
+    }
+    if (call == null) return null;
+  }
+  return JSON.stringify(scrubbed(call, entry.scrub === undefined ? config.scrub : entry.scrub));
+}
+
+async function post(path: string, body: string, timeoutMs: number): Promise<Response | null> {
+  const url = `${baseUrl()}${path}`;
+  if (!secureUrl(url)) { warnLimited('insecure', `refusing to send to ${baseUrl()}: baseUrl must be https`); return null; }
+  if (stopped) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  timeout.unref?.();
+  inflight.add(controller);
   try {
-    return await originalFetch(`${baseUrl()}${path}`, {
+    return await originalFetch(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${apiKey()}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000),
+      body,
+      redirect: 'error', // never forward the API key to another host
+      signal: controller.signal,
     });
   } catch (error) {
-    warn(`could not reach ${path}: ${(error as Error).message}`);
+    warnLimited(`send:${path}`, `could not reach ${path}: ${(error as Error).message}`);
     return null;
+  } finally {
+    clearTimeout(timeout);
+    inflight.delete(controller);
   }
 }
 
 function send(): Promise<void> {
   if (sending) return sending;
   sending = (async () => {
-    while (queue.length) {
-      const batch = queue.splice(0, BATCH);
-      const response = await post('/api/platform-collect/sdk', { calls: batch, sdk: `node/${VERSION}`, app: config.appName });
-      if (response && !response.ok) warn(`${batch.length} calls not accepted: ${response.status}`);
+    const envelope = JSON.stringify({ sdk: `node/${VERSION}`, app: config.appName });
+    while (queue.length && !stopped) {
+      // Up to BATCH calls and MAX_BATCH_BYTES per request.
+      const parts: string[] = [];
+      let size = envelope.length + 16;
+      while (queue.length && parts.length < BATCH) {
+        const entry = queue[0];
+        let json: string | null;
+        try { json = prepare(entry); } catch (error) {
+          warnLimited('prepare', `could not prepare a model call: ${(error as Error).message}`);
+          json = null;
+        }
+        const bytes = json === null ? 0 : Buffer.byteLength(json);
+        if (json !== null && bytes > MAX_CALL_BYTES) {
+          warnLimited('oversized', `a model call of ${bytes} bytes is over the ${MAX_CALL_BYTES} byte limit and was dropped`);
+          json = null;
+        }
+        if (json !== null && parts.length && size + bytes + 1 > MAX_BATCH_BYTES) break; // send what we have; retry this one next
+        queue.shift();
+        queuedBytes -= entry.bytes;
+        if (json === null) continue;
+        parts.push(json);
+        size += bytes + 1;
+      }
+      if (!parts.length) continue;
+      const body = `{"calls":[${parts.join(',')}],${envelope.slice(1)}`;
+      const response = await post('/api/platform-collect/sdk', body, SEND_TIMEOUT_MS);
+      if (response && !response.ok) warnLimited('rejected', `${parts.length} calls not accepted: ${response.status}`);
     }
   })().catch(() => {}).finally(() => { sending = null; });
   return sending;
@@ -187,30 +289,39 @@ export async function flush(): Promise<void> {
   try { await send(); } catch { /* send already logs */ }
 }
 
+const scrubText = (value: string) => (config.scrub ? config.scrub(value) : value);
+
 /** Mark how a session ended. Returns true when the platform accepted it. Never throws. */
 export async function reportOutcome(sessionId: string, outcome: 'success' | 'fail', note?: string): Promise<boolean> {
-  await flush();
-  if (!apiKey()) { warn('GENERALCONTEXT_API_KEY is not set; outcome not reported'); return false; }
-  const response = await post('/api/platform-collect/outcomes', { session_id: sessionId, outcome, note: note ?? null });
-  return Boolean(response?.ok);
+  try {
+    if (!apiKey()) { warnLimited('no-key', 'GENERALCONTEXT_API_KEY is not set; outcome not reported'); return false; }
+    await flush();
+    const body = { session_id: scrubText(String(sessionId)), outcome, note: note == null ? null : scrubText(note) };
+    const response = await post('/api/platform-collect/outcomes', JSON.stringify(body), DIRECT_TIMEOUT_MS);
+    return Boolean(response?.ok);
+  } catch { return false; }
 }
 
 export type AppEvent = { sessionId: string; eventType: string; properties?: Metadata; eventId?: string; timestamp?: string | Date };
 
 /** Record something that happened in your systems, such as 'order.refunded'. Pass a stable eventId so retries dedupe. Never throws. */
 export async function logEvent(event: AppEvent): Promise<boolean> {
-  await flush();
-  if (!apiKey()) { warn('GENERALCONTEXT_API_KEY is not set; event not logged'); return false; }
-  const timestamp = event.timestamp instanceof Date ? event.timestamp.toISOString() : event.timestamp ?? new Date().toISOString();
-  const response = await post('/api/platform-collect/events', { events: [{
-    event_id: event.eventId ?? randomUUID(), event_type: event.eventType, timestamp,
-    session_id: event.sessionId, properties: event.properties ?? {},
-  }] });
-  return Boolean(response?.ok);
+  try {
+    if (!apiKey()) { warnLimited('no-key', 'GENERALCONTEXT_API_KEY is not set; event not logged'); return false; }
+    await flush();
+    const timestamp = event.timestamp instanceof Date ? event.timestamp.toISOString() : event.timestamp ?? new Date().toISOString();
+    const properties = Object.fromEntries(Object.entries(event.properties ?? {}).map(([k, v]) => [k, typeof v === 'string' ? scrubText(v) : v]));
+    const body = { events: [{
+      event_id: event.eventId ?? randomUUID(), event_type: scrubText(event.eventType), timestamp,
+      session_id: scrubText(String(event.sessionId)), properties,
+    }] };
+    const response = await post('/api/platform-collect/events', JSON.stringify(body), DIRECT_TIMEOUT_MS);
+    return Boolean(response?.ok);
+  } catch { return false; }
 }
 
 // Wrap an SDK create method. The SDK's own promise is returned untouched; recording happens on a side branch.
-function recording(create: (...args: unknown[]) => unknown, api: Api) {
+function recording(create: (...args: unknown[]) => unknown, api: Api, scrub?: Scrub | null) {
   const wrapped = function (this: unknown, ...args: unknown[]): unknown {
     const started = new Date().toISOString();
     const at = scope.getStore();
@@ -219,11 +330,11 @@ function recording(create: (...args: unknown[]) => unknown, api: Api) {
     const reply = scope.run({ ...at, inSdkCall: true }, () => create.apply(this, args));
     if (!reply || typeof (reply as { then?: unknown }).then !== 'function') return reply;
     (reply as Promise<unknown>).then(response => {
-      const done = (result: unknown) => record({ api, request, response: result, started_at: started, ended_at: new Date().toISOString(), error: null }, at);
+      const done = (result: unknown) => record({ api, request, response: result, started_at: started, ended_at: new Date().toISOString(), error: null }, at, scrub);
       if (request?.stream && isStream(response)) observeStream(response, api, done);
       else done(response);
     }, error => {
-      record({ api, request, response: null, started_at: started, ended_at: new Date().toISOString(), error: String((error as Error)?.message ?? error) }, at);
+      record({ api, request, response: null, started_at: started, ended_at: new Date().toISOString(), error: String((error as Error)?.message ?? error) }, at, scrub);
     });
     return reply;
   };
@@ -356,7 +467,8 @@ function assembleSSE(text: string): unknown {
 }
 
 const PATTERNS: [string, RegExp][] = [
-  ['email', /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g],
+  // Bounded repeats and a token-start lookbehind keep this linear on adversarial input.
+  ['email', /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}/g],
   ['card', /\b(?:\d[ -]?){13,16}\b/g],
   ['ssn', /\b\d{3}-\d{2}-\d{4}\b/g],
   ['phone', /(?<![\w])\+?1?[\s.-]?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?![\w])/g],
@@ -386,9 +498,13 @@ function scrubbed(value: unknown, scrub: Scrub | null): unknown {
   return value;
 }
 
-/** Record one client instance only, without initialize(). Returns the same client. */
+/**
+ * Record one client instance only, without initialize(). Returns the same client.
+ * `redact` applies to this client only. If initialize() already patched the SDK, its settings apply instead.
+ */
 export function wrap<C extends object>(client: C, options: { redact?: boolean | Scrub } = {}): C {
-  if (options.redact !== undefined) config.scrub = redactor(options.redact);
+  if (disabledByEnv()) return client;
+  const scrub = options.redact === undefined ? undefined : redactor(options.redact);
   const target = client as Record<string, any>;
   const owners: [Record<string, any>, Api][] = [];
   if (target.chat?.completions?.create) owners.push([target.chat.completions, 'openai-chat']);
@@ -396,7 +512,7 @@ export function wrap<C extends object>(client: C, options: { redact?: boolean | 
   if (!target.chat && target.messages?.create) owners.push([target.messages, 'anthropic']);
   if (!owners.length) throw new TypeError('wrap expects an OpenAI or Anthropic client');
   for (const [owner, api] of owners) {
-    if (!owner.create[MARK]) owner.create = recording(owner.create.bind(owner), api);
+    if (!owner.create[MARK]) owner.create = recording(owner.create.bind(owner), api, scrub);
   }
   return client;
 }

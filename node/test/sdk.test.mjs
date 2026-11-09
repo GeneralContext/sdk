@@ -2,9 +2,12 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 
+const childPosts = new Map(); // keyed by request path
 const collected = { calls: [], outcomes: [], events: [], batches: [] };
 const sse = (res, events) => {
   res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -44,6 +47,11 @@ before(async () => {
     for await (const chunk of req) body += chunk;
     const json = body ? JSON.parse(body) : {};
     const reply = (status, obj) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
+    if (req.url.startsWith('/child/')) {
+      if (!childPosts.has(req.url)) childPosts.set(req.url, []);
+      childPosts.get(req.url).push({ auth: req.headers.authorization, body: json });
+      return reply(200, { ok: true });
+    }
     if (req.url === '/api/platform-collect/sdk') { collected.batches.push(json); collected.calls.push(...json.calls); return reply(200, { ok: true }); }
     if (req.url === '/api/platform-collect/outcomes') { collected.outcomes.push({ auth: req.headers.authorization, ...json }); return reply(200, { ok: true }); }
     if (req.url === '/api/platform-collect/events') { collected.events.push(json); return reply(200, { ingested: 1, skipped: 0, failures: [] }); }
@@ -74,7 +82,7 @@ test('initialize patches instances created before and after', async () => {
   early.openai = openai();
   early.anthropic = anthropic();
   process.env.GENERALCONTEXT_REDACT_SALT = 'salt';
-  sdk.initialize({ apiKey: 'gc_key', baseUrl: base, appName: 'test-app', redact: true, instrumentModules: { openAI: OpenAI, anthropic: Anthropic } });
+  sdk.initialize({ apiKey: 'gc_key', baseUrl: base, appName: 'test-app', redact: true, instrumentFetch: true, instrumentModules: { openAI: OpenAI, anthropic: Anthropic } });
   const warnings = [];
   const warn = console.warn; console.warn = m => warnings.push(m);
   sdk.initialize({ apiKey: 'other' });
@@ -187,17 +195,187 @@ test('reportOutcome and logEvent post to the collector', async () => {
   assert.deepEqual(collected.events.at(-1), { events: [{ event_id: 'e1', event_type: 'tour.booked', timestamp: '2026-01-01T00:00:00.000Z', session_id: 's1', properties: { unit: '4B' } }] });
 });
 
+test('reportOutcome and logEvent apply redaction so scrubbed session ids match', async () => {
+  assert.equal(await sdk.reportOutcome('jo@x.com', 'fail', 'call 612-555-0177'), true);
+  const outcome = collected.outcomes.at(-1);
+  assert.match(outcome.session_id, /^<email:[0-9a-f]{6}>$/);
+  assert.match(outcome.note, /<phone:/);
+  await sdk.withSession('jo@x.com', () => openai().chat.completions.create({ model: 'gpt-x', messages: [] }));
+  const [call] = await drain();
+  assert.equal(call.conversation.id, outcome.session_id);
+  assert.equal(await sdk.logEvent({ sessionId: 'jo@x.com', eventType: 'mail.jo@x.com', properties: { to: 'jo@x.com', n: 1 } }), true);
+  const ev = collected.events.at(-1).events[0];
+  assert.equal(ev.session_id, outcome.session_id);
+  assert.doesNotMatch(JSON.stringify(ev), /jo@x\.com/);
+  assert.equal(ev.properties.n, 1);
+});
+
+test('email redaction is linear on a 1 MB adversarial string', async () => {
+  const evil = 'a'.repeat(500_000) + '@' + 'a.'.repeat(250_000);
+  const started = Date.now();
+  await openai().chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: evil }] });
+  const [call] = await drain();
+  assert.ok(Date.now() - started < 1000, `took ${Date.now() - started} ms`);
+  assert.ok(call);
+});
+
+test('SDK calls are recorded but raw fetch is not without instrumentFetch', async () => {
+  const out = await child(`
+    initialize({ apiKey: 'k', baseUrl: BASE + '/child/nofetch', instrumentModules: {} });
+    await fetch(BASE + '/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'gpt-x', messages: [] }) });
+    await new Promise(r => setTimeout(r, 30)); await flush();`);
+  assert.equal(out.code, 0);
+  assert.equal(childPosts.get('/child/nofetch/api/platform-collect/sdk'), undefined);
+});
+
+// Run a short ES module against the built SDK in a fresh process, with BASE pointing at the fake server.
+const dist = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+function child(code, env = {}) {
+  const src = `import { initialize, flush, reportOutcome, logEvent, wrap } from ${JSON.stringify(dist)};
+    import OpenAI from 'openai';
+    const BASE = ${JSON.stringify(base)};
+    const record = (path) => { const o = new OpenAI({ apiKey: 'k', baseURL: BASE + '/v1', maxRetries: 0 }); return o; };
+    ${code}`;
+  return new Promise(resolve => {
+    const p = spawn(process.execPath, ['--input-type=module', '-e', src], {
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
+      env: { ...process.env, GENERALCONTEXT_API_KEY: '', GENERALCONTEXT_BASE_URL: '', GENERALCONTEXT_DISABLED: '', ...env },
+    });
+    let stderr = '', stdout = '';
+    p.stderr.on('data', d => { stderr += d; });
+    p.stdout.on('data', d => { stdout += d; });
+    p.on('close', code => resolve({ code, stderr, stdout }));
+  });
+}
+const callOnce = `{ const o = record(); await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'hello' }] }); }`;
+const recorded = path => (childPosts.get(`/child/${path}/api/platform-collect/sdk`) ?? []).flatMap(p => p.body.calls);
+
 test('collector outage never throws', async () => {
-  process.env.GENERALCONTEXT_BASE_URL = 'http://127.0.0.1:1';
-  const warn = console.warn; console.warn = () => {};
+  const out = await child(`
+    initialize({ apiKey: 'k', baseUrl: 'http://127.0.0.1:1', instrumentModules: { openAI: OpenAI } });
+    ${callOnce}
+    await new Promise(r => setTimeout(r, 30)); await flush();
+    if (await reportOutcome('s1', 'fail') !== false) process.exit(2);
+    if (await logEvent({ sessionId: 's1', eventType: 'x' }) !== false) process.exit(3);`);
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal((out.stderr.match(/could not reach \/api\/platform-collect\/sdk/g) ?? []).length, 1);
+});
+
+test('explicit baseUrl wins over GENERALCONTEXT_BASE_URL, which wins over the default', async () => {
+  let out = await child(`initialize({ apiKey: 'k', baseUrl: BASE + '/child/opt', instrumentModules: { openAI: OpenAI } }); ${callOnce} await new Promise(r => setTimeout(r, 30)); await flush();`,
+    { GENERALCONTEXT_BASE_URL: `${base}/child/env` });
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(recorded('opt').length, 1);
+  assert.equal(recorded('env').length, 0);
+  out = await child(`initialize({ apiKey: 'k', instrumentModules: { openAI: OpenAI } }); ${callOnce} await new Promise(r => setTimeout(r, 30)); await flush();`,
+    { GENERALCONTEXT_BASE_URL: `${base}/child/env` });
+  assert.equal(recorded('env').length, 1);
+});
+
+test('refuses to send the key over plain http to a non-local host', async () => {
+  const out = await child(`
+    globalThis.fetch = new Proxy(globalThis.fetch, { apply(t, s, a) { if (String(a[0]).includes('example.com')) process.exit(9); return Reflect.apply(t, s, a); } });
+    initialize({ apiKey: 'k', baseUrl: 'http://collector.example.com', instrumentModules: { openAI: OpenAI } });
+    ${callOnce} ${callOnce}
+    await new Promise(r => setTimeout(r, 30)); await flush();
+    if (await reportOutcome('s', 'fail') !== false) process.exit(2);`);
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal((out.stderr.match(/refusing to send/g) ?? []).length, 1);
+});
+
+test('redirects are not followed and the key never reaches the redirect target', async () => {
+  let leaked = [];
+  const target = http.createServer((req, res) => { leaked.push(req.headers.authorization); res.end('{}'); });
+  await new Promise(r => target.listen(0, '127.0.0.1', r));
+  const redirector = http.createServer((req, res) => { res.writeHead(302, { location: `http://127.0.0.1:${target.address().port}${req.url}` }); res.end(); });
+  await new Promise(r => redirector.listen(0, '127.0.0.1', r));
   try {
-    await openai().chat.completions.create({ model: 'gpt-x', messages: [] });
-    await new Promise(r => setTimeout(r, 30));
-    await sdk.flush();
-    assert.equal(await sdk.reportOutcome('s1', 'fail'), false);
-    assert.equal(await sdk.logEvent({ sessionId: 's1', eventType: 'handoff.to_human' }), false);
-  } finally {
-    console.warn = warn;
-    delete process.env.GENERALCONTEXT_BASE_URL;
-  }
+    const out = await child(`
+      initialize({ apiKey: 'secret', baseUrl: 'http://127.0.0.1:${redirector.address().port}', instrumentModules: { openAI: OpenAI } });
+      ${callOnce} await new Promise(r => setTimeout(r, 30)); await flush();
+      if (await reportOutcome('s', 'fail') !== false) process.exit(2);`);
+    assert.equal(out.code, 0, out.stderr);
+    assert.deepEqual(leaked, []);
+  } finally { target.close(); redirector.close(); }
+});
+
+test('oversized calls are dropped with one warning', async () => {
+  const out = await child(`
+    initialize({ apiKey: 'k', baseUrl: BASE + '/child/big', instrumentModules: { openAI: OpenAI } });
+    const o = record();
+    for (let i = 0; i < 2; i++) await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'x'.repeat(4_100_000) }] });
+    ${callOnce} await new Promise(r => setTimeout(r, 30)); await flush();`);
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal((out.stderr.match(/byte limit/g) ?? []).length, 1);
+  assert.deepEqual(recorded('big').map(c => c.request.messages[0].content), ['hello']);
+});
+
+test('batches split by bytes as well as count', async () => {
+  const out = await child(`
+    initialize({ apiKey: 'k', baseUrl: BASE + '/child/split', instrumentModules: { openAI: OpenAI } });
+    const o = record();
+    for (let i = 0; i < 5; i++) await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: String(i) + 'x'.repeat(1_500_000) }] });
+    await new Promise(r => setTimeout(r, 30)); await flush();`);
+  assert.equal(out.code, 0, out.stderr);
+  const posts = childPosts.get('/child/split/api/platform-collect/sdk');
+  assert.deepEqual(posts.map(p => p.body.calls.length), [2, 2, 1]);
+  assert.deepEqual(recorded('split').map(c => c.request.messages[0].content[0]), ['0', '1', '2', '3', '4']);
+});
+
+test('beforeSend can modify, drop, and throw', async () => {
+  const out = await child(`
+    let n = 0;
+    initialize({ apiKey: 'k', baseUrl: BASE + '/child/hook', redact: true, instrumentModules: { openAI: OpenAI },
+      beforeSend: call => {
+        n++;
+        if (!call.request.messages[0].content.includes('jo@x.com')) process.exit(4); // sees unredacted data
+        if (n === 2) return null;
+        if (n === 3) throw new Error('boom');
+        call.task = 'edited'; return call;
+      } });
+    const o = record();
+    for (let i = 0; i < 3; i++) await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'jo@x.com ' + i }] });
+    await new Promise(r => setTimeout(r, 30)); await flush();`, { GENERALCONTEXT_REDACT_SALT: 's' });
+  assert.equal(out.code, 0, out.stderr);
+  const calls = recorded('hook');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].task, 'edited');
+  assert.match(calls[0].request.messages[0].content, /^<email:[0-9a-f]{6}> 0$/);
+  assert.match(out.stderr, /beforeSend threw/);
+});
+
+test('GENERALCONTEXT_DISABLED turns initialize into a no-op', async () => {
+  const out = await child(`initialize({ apiKey: 'k', baseUrl: BASE + '/child/off', instrumentModules: { openAI: OpenAI } }); ${callOnce} await new Promise(r => setTimeout(r, 30)); await flush();`,
+    { GENERALCONTEXT_DISABLED: 'TRUE' });
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stderr, /GENERALCONTEXT_DISABLED/);
+  assert.equal(recorded('off').length, 0);
+});
+
+test('pending calls are flushed on exit without flush()', async () => {
+  const out = await child(`initialize({ apiKey: 'k', baseUrl: BASE + '/child/exit', instrumentModules: { openAI: OpenAI } }); ${callOnce}`);
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(recorded('exit').length, 1);
+});
+
+test('exit flush gives up after 2 s against a hung collector', async () => {
+  const hung = http.createServer(() => {});
+  await new Promise(r => hung.listen(0, '127.0.0.1', r));
+  try {
+    const started = Date.now();
+    const out = await child(`initialize({ apiKey: 'k', baseUrl: 'http://127.0.0.1:${hung.address().port}', instrumentModules: { openAI: OpenAI } }); ${callOnce}`);
+    assert.equal(out.code, 0, out.stderr);
+    assert.ok(Date.now() - started < 5000, `took ${Date.now() - started} ms`);
+  } finally { hung.closeAllConnections?.(); hung.close(); }
+});
+
+test('wrap redact applies to that client only', async () => {
+  const out = await child(`
+    process.env.GENERALCONTEXT_API_KEY = 'k'; process.env.GENERALCONTEXT_BASE_URL = BASE + '/child/wrap';
+    const a = wrap(record(), { redact: true }); const b = wrap(record());
+    await a.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'jo@x.com' }] });
+    await b.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'jo@x.com' }] });
+    await new Promise(r => setTimeout(r, 30)); await flush();`, { GENERALCONTEXT_REDACT_SALT: 's' });
+  assert.equal(out.code, 0, out.stderr);
+  assert.deepEqual(recorded('wrap').map(c => c.request.messages[0].content.startsWith('<email:')), [true, false]);
 });

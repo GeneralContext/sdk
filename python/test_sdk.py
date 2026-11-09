@@ -11,7 +11,9 @@ import importlib.util
 import json
 import os
 import threading
+import time
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import generalcontext
@@ -116,7 +118,7 @@ class SdkTest(unittest.TestCase):
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         cls.url = f"http://127.0.0.1:{cls.server.server_port}"
         os.environ["GENERALCONTEXT_REDACT_SALT"] = "shared-secret"
-        generalcontext.initialize(api_key=KEY, base_url=cls.url, app_name="leasing-bot")
+        generalcontext.initialize(api_key=KEY, base_url=cls.url, app_name="support-bot", instrument_http=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -138,17 +140,17 @@ class SdkTest(unittest.TestCase):
     def test_records_a_call_with_session_and_task_and_returns_the_reply_unchanged(self):
         reply = {"choices": [{"message": {"role": "assistant", "content": "Unit 402 is open."}}]}
         client = generalcontext.wrap(Client(reply))
-        with generalcontext.session("sms:thread-1", user_id="u1", channel="sms", product="leasing"):
+        with generalcontext.session("chat:thread-1", user_id="u1", channel="chat", product="support"):
             with generalcontext.task("qualify"):
                 result = client.chat.completions.create(model="m", messages=[{"role": "user", "content": "2 beds?"}])
         self.assertIs(result, reply)
         self.assertTrue(generalcontext.flush(5))
         path, authorization, body = Server.received[0]
         self.assertEqual((path, authorization), ("/api/platform-collect/sdk", "Bearer " + KEY))
-        self.assertEqual((body["sdk"], body["app"]), ("python/0.2.0", "leasing-bot"))
+        self.assertEqual((body["sdk"], body["app"]), ("python/0.2.0", "support-bot"))
         call = body["calls"][0]
         self.assertEqual(call["api"], "openai-chat")
-        self.assertEqual(call["conversation"], {"id": "sms:thread-1", "user_id": "u1", "channel": "sms", "product": "leasing"})
+        self.assertEqual(call["conversation"], {"id": "chat:thread-1", "user_id": "u1", "channel": "chat", "product": "support"})
         self.assertEqual(call["task"], "qualify")
         self.assertEqual(call["request"]["messages"][0]["content"], "2 beds?")
         self.assertEqual((call["response"], call["error"]), (reply, None))
@@ -215,6 +217,165 @@ class SdkTest(unittest.TestCase):
         generalcontext.log_event("s", "lease.signed")
         event = Server.received[-1][2]["events"][0]
         self.assertTrue(event["event_id"] and event["timestamp"])
+
+    # Hardening.
+
+    def using(self, **config):
+        """Temporarily override _config entries."""
+        old = {key: generalcontext._config[key] for key in config}
+        generalcontext._config.update(config)
+        self.addCleanup(generalcontext._config.update, old)
+
+    def test_refuses_plain_http_to_other_hosts(self):
+        self.assertTrue(generalcontext._secure("https://generalcontextlabs.com"))
+        for url in ("http://localhost:1", "http://127.0.0.1:1", "http://[::1]:1"):
+            self.assertTrue(generalcontext._secure(url))
+        self.assertFalse(generalcontext._secure("http://generalcontextlabs.com"))
+        self.using(base_url="http://example.com")
+        generalcontext._warned_at.pop("http", None)
+        with self.assertLogs("generalcontext", "WARNING"):
+            generalcontext.wrap(Client({})).chat.completions.create(messages=[])
+        self.assertEqual(generalcontext._sender.queue.qsize(), 0)
+        self.assertFalse(generalcontext.report_outcome("s", "success"))
+
+    def test_redirects_are_not_followed(self):
+        class Second(BaseHTTPRequestHandler):
+            hits = []
+
+            def do_POST(self):
+                Second.hits.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        class Redirect(Second):
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header("Location", second_url + "/api/platform-collect/sdk")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        servers = [ThreadingHTTPServer(("127.0.0.1", 0), handler) for handler in (Second, Redirect)]
+        for server in servers:
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.shutdown)
+        second_url = f"http://127.0.0.1:{servers[0].server_port}"
+        self.using(base_url=f"http://127.0.0.1:{servers[1].server_port}")
+        generalcontext.wrap(Client({})).chat.completions.create(messages=[])
+        self.assertTrue(generalcontext.flush(5))
+        self.assertFalse(generalcontext.log_event("s", "x"))
+        self.assertEqual(Second.hits, [])
+
+    def test_a_class_argument_is_recorded_by_name_and_never_breaks_the_call(self):
+        class Answer:
+            @classmethod
+            def model_dump(cls, **kwargs):
+                raise TypeError("unbound")
+        client = generalcontext.wrap(Client({"ok": True}))
+        self.assertEqual(client.chat.completions.create(messages=[], response_format=Answer), {"ok": True})
+        self.assertTrue(self.calls()[0]["request"]["response_format"].endswith("Answer"))
+        with mock.patch.object(generalcontext, "_start", side_effect=RuntimeError("boom")):
+            self.assertEqual(client.chat.completions.create(messages=[]), {"ok": True})
+
+    def test_oversized_call_is_dropped(self):
+        client = generalcontext.wrap(Client({}))
+        client.chat.completions.create(messages=[{"role": "user", "content": "x" * (generalcontext.MAX_CALL_BYTES + 1)}])
+        client.chat.completions.create(messages=[{"role": "user", "content": "small"}])
+        calls = self.calls()
+        self.assertEqual([c["request"]["messages"][0]["content"] for c in calls], ["small"])
+
+    def test_batches_split_by_bytes(self):
+        client = generalcontext.wrap(Client({}))
+        big = "y" * 1_500_000
+        for _ in range(4):
+            client.chat.completions.create(messages=[{"role": "user", "content": big}])
+        self.assertEqual(len(self.calls()), 4)
+        batches = [body for path, _, body in Server.received if path.endswith("/sdk")]
+        self.assertGreaterEqual(len(batches), 2)
+        self.assertTrue(all(len(b["calls"]) <= 2 for b in batches))
+
+    def test_before_send_can_modify_or_drop(self):
+        def before_send(call):
+            if call["request"].get("drop"):
+                return None
+            if call["request"].get("raise"):
+                raise RuntimeError("nope")
+            call["task"] = "changed"
+            return call
+        self.using(before_send=before_send)
+        client = generalcontext.wrap(Client({}))
+        client.chat.completions.create(messages=[], drop=True)
+        client.chat.completions.create(messages=[], **{"raise": True})
+        client.chat.completions.create(messages=[])
+        calls = self.calls()
+        self.assertEqual([c["task"] for c in calls], ["changed"])
+
+    def test_outcomes_and_events_are_redacted_like_calls(self):
+        self.using(scrub=generalcontext._redactor(True))
+        generalcontext.wrap(Client({}), redact=True).chat.completions.create(messages=[])
+        with generalcontext.session("jo@example.com"):
+            generalcontext.wrap(Client({}), redact=True).chat.completions.create(messages=[])
+        session_id = self.calls()[-1]["conversation"]["id"]
+        self.assertTrue(generalcontext.report_outcome("jo@example.com", "fail", note="call 612-555-0177"))
+        body = Server.received[-1][2]
+        self.assertEqual(body["session_id"], session_id)
+        self.assertNotIn("555-0177", body["note"])
+        self.assertTrue(generalcontext.log_event("jo@example.com", "x", {"who": "jo@example.com", "n": 1}))
+        event = Server.received[-1][2]["events"][0]
+        self.assertEqual((event["session_id"], event["properties"]["n"]), (session_id, 1))
+        self.assertNotIn("@", event["properties"]["who"])
+
+    def test_redaction_is_fast_on_adversarial_input(self):
+        scrub = generalcontext._redactor(True)
+        start = time.monotonic()
+        scrub("a." * 500000 + "@")
+        self.assertLess(time.monotonic() - start, 1)
+
+    def test_disabled_env_skips_initialize(self):
+        with mock.patch.dict(os.environ, {"GENERALCONTEXT_DISABLED": "TRUE"}), \
+                mock.patch.object(generalcontext, "_patch_sdks") as patch:
+            with self.assertLogs("generalcontext", "INFO") as logs:
+                generalcontext.initialize(api_key="other")
+        patch.assert_not_called()
+        self.assertIn("DISABLED", logs.output[0])
+        self.assertEqual(generalcontext._api_key(), KEY)
+
+    def test_fork_reset_gives_a_fresh_queue_and_no_thread(self):
+        sender = generalcontext._Sender()
+        sender.queue.put_nowait(({"x": "y"}, None, 10))
+        sender.bytes, sender.thread = 10, threading.current_thread()
+        old_queue, old_lock = sender.queue, sender.lock
+        sender._reset()
+        self.assertIsNot(sender.queue, old_queue)
+        self.assertIsNot(sender.lock, old_lock)
+        self.assertEqual((sender.bytes, sender.thread, sender.queue.qsize()), (0, None, 0))
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs os.fork")
+    def test_a_forked_child_records_and_sends_on_its_own(self):
+        # Like gunicorn or Celery: the parent has a live sender thread, then forks.
+        client = generalcontext.wrap(Client({"choices": []}))
+        client.chat.completions.create(model="m", messages=[{"role": "user", "content": "parent"}])
+        self.assertTrue(generalcontext.flush(5))
+        Server.received.clear()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                client.chat.completions.create(model="m", messages=[{"role": "user", "content": "child"}])
+                os._exit(0 if generalcontext.flush(5) else 1)
+            except BaseException:
+                os._exit(2)
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else status >> 8, 0)
+        contents = [m["content"] for _, _, body in Server.received for c in body["calls"] for m in c["request"]["messages"]]
+        self.assertIn("child", contents)
+
+    def test_without_a_key_outcomes_return_false_immediately(self):
+        self.using(api_key=None)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(generalcontext.report_outcome("s", "success"))
+            self.assertFalse(generalcontext.log_event("s", "x"))
 
     # Real SDKs, patched by initialize().
 
@@ -315,3 +476,14 @@ class SdkTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KillSwitchWrapTest(unittest.TestCase):
+    def test_wrap_does_nothing_when_disabled(self):
+        os.environ["GENERALCONTEXT_DISABLED"] = "true"
+        try:
+            client = Client({"choices": []})
+            self.assertIs(generalcontext.wrap(client), client)
+            self.assertNotIn("create", vars(client.chat.completions), "wrap must not patch the client")
+        finally:
+            del os.environ["GENERALCONTEXT_DISABLED"]

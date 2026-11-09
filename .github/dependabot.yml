@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+  # Development and test dependencies only; the published packages have none at runtime.
+  - package-ecosystem: npm
+    directory: /node
+    schedule:
+      interval: weekly
+    groups:
+      dev:
+        patterns: ['*']
+  - package-ecosystem: pip
+    directory: /python
+    schedule:
+      interval: weekly
