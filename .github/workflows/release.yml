@@ -4,8 +4,8 @@
 #
 # Each release is built once, tested, attested (SLSA build provenance, verifiable with
 # `gh attestation verify`), and only then published, from the exact files that were built.
-# Publishing needs approval on the `sdk-release` environment. PyPI uses trusted publishing (no
-# token); npm publishes with provenance. One-time setup is in RELEASING.md.
+# Publishing needs approval on the `sdk-release` environment. PyPI and npm use trusted publishing (no
+# stored tokens). One-time setup is in RELEASING.md.
 name: Release
 on:
   push:
@@ -117,7 +117,7 @@ jobs:
     runs-on: ubuntu-24.04
     environment: sdk-release
     permissions:
-      id-token: write       # npm provenance
+      id-token: write       # npm trusted publishing (OIDC) and provenance
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -125,11 +125,10 @@ jobs:
           path: pack/
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22
+          node-version: 24      # ships npm 11.5+, which trusted publishing needs
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - name: Publish the tested tarball
+        # No token: npm trusts this repo, workflow and environment (package settings on npmjs.com).
         # The ./ matters: without it npm reads `pack/x.tgz` as a GitHub `owner/repo` shorthand.
         run: npm publish ./pack/*.tgz --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
