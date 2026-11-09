@@ -23,7 +23,8 @@ pushed. Nothing is uploaded from a laptop.
    `sdk`, workflow `release.yml`, environment `sdk-release`. No token is stored.
 5. **npm.** The package is the unscoped `generalcontext`, owned by the `generalcontext` npm org.
    Publish through npm trusted publishing (package settings > Trusted Publisher: GitHub Actions,
-   org `GeneralContext`, repo `sdk`, workflow `release.yml`, environment `sdk-release`). Only
+   org `GeneralContext`, repo `sdk`, workflow `release.yml`, environment `sdk-release`, with
+   "Allow npm publish" ticked and "Allow npm dist-tag" left off). Only
    the very first publish of a new package needs a short-lived granular token with bypass-2FA,
    stored as the `NPM_TOKEN` secret on the `sdk-release` environment and deleted afterwards.
 6. **Rehearse** (optional): point the Python job at TestPyPI by adding
