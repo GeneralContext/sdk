@@ -253,7 +253,7 @@ class SdkTest(unittest.TestCase):
         class Redirect(Second):
             def do_POST(self):
                 self.send_response(302)
-                self.send_header("Location", second_url + self.path)
+                self.send_header("Location", second_url + "/api/platform-collect/sdk")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 

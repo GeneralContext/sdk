@@ -79,8 +79,9 @@ let stopped = false; // set when the exit flush runs out of time
 const inflight = new Set<AbortController>();
 
 const apiKey = () => config.apiKey ?? process.env.GENERALCONTEXT_API_KEY;
-// Explicit option, then env var, then default.
-const baseUrl = () => (config.baseUrl ?? process.env.GENERALCONTEXT_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
+// Explicit option, then env var, then default. Trailing slashes are trimmed without a regex.
+const trimSlashes = (url: string) => { let end = url.length; while (end > 0 && url[end - 1] === '/') end--; return url.slice(0, end); };
+const baseUrl = () => trimSlashes(config.baseUrl ?? process.env.GENERALCONTEXT_BASE_URL ?? DEFAULT_BASE_URL);
 const warn = (message: string) => console.warn(`[generalcontext] ${message}`);
 
 // Warn at most once per minute for each key, so a broken collector cannot flood logs.

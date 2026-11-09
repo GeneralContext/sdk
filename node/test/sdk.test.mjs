@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 
-const childPosts = {};
+const childPosts = new Map(); // keyed by request path
 const collected = { calls: [], outcomes: [], events: [], batches: [] };
 const sse = (res, events) => {
   res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -47,7 +47,11 @@ before(async () => {
     for await (const chunk of req) body += chunk;
     const json = body ? JSON.parse(body) : {};
     const reply = (status, obj) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
-    if (req.url.startsWith('/child/')) { (childPosts[req.url] ??= []).push({ auth: req.headers.authorization, body: json }); return reply(200, { ok: true }); }
+    if (req.url.startsWith('/child/')) {
+      if (!childPosts.has(req.url)) childPosts.set(req.url, []);
+      childPosts.get(req.url).push({ auth: req.headers.authorization, body: json });
+      return reply(200, { ok: true });
+    }
     if (req.url === '/api/platform-collect/sdk') { collected.batches.push(json); collected.calls.push(...json.calls); return reply(200, { ok: true }); }
     if (req.url === '/api/platform-collect/outcomes') { collected.outcomes.push({ auth: req.headers.authorization, ...json }); return reply(200, { ok: true }); }
     if (req.url === '/api/platform-collect/events') { collected.events.push(json); return reply(200, { ingested: 1, skipped: 0, failures: [] }); }
@@ -221,7 +225,7 @@ test('SDK calls are recorded but raw fetch is not without instrumentFetch', asyn
     await fetch(BASE + '/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'gpt-x', messages: [] }) });
     await new Promise(r => setTimeout(r, 30)); await flush();`);
   assert.equal(out.code, 0);
-  assert.equal(childPosts['/child/nofetch/api/platform-collect/sdk'], undefined);
+  assert.equal(childPosts.get('/child/nofetch/api/platform-collect/sdk'), undefined);
 });
 
 // Run a short ES module against the built SDK in a fresh process, with BASE pointing at the fake server.
@@ -244,7 +248,7 @@ function child(code, env = {}) {
   });
 }
 const callOnce = `{ const o = record(); await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'hello' }] }); }`;
-const recorded = path => (childPosts[`/child/${path}/api/platform-collect/sdk`] ?? []).flatMap(p => p.body.calls);
+const recorded = path => (childPosts.get(`/child/${path}/api/platform-collect/sdk`) ?? []).flatMap(p => p.body.calls);
 
 test('collector outage never throws', async () => {
   const out = await child(`
@@ -313,7 +317,7 @@ test('batches split by bytes as well as count', async () => {
     for (let i = 0; i < 5; i++) await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: String(i) + 'x'.repeat(1_500_000) }] });
     await new Promise(r => setTimeout(r, 30)); await flush();`);
   assert.equal(out.code, 0, out.stderr);
-  const posts = childPosts['/child/split/api/platform-collect/sdk'];
+  const posts = childPosts.get('/child/split/api/platform-collect/sdk');
   assert.deepEqual(posts.map(p => p.body.calls.length), [2, 2, 1]);
   assert.deepEqual(recorded('split').map(c => c.request.messages[0].content[0]), ['0', '1', '2', '3', '4']);
 });
