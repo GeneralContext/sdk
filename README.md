@@ -62,3 +62,11 @@ leaves the process. Full details: [docs](https://generalcontextlabs.com/platform
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+## For coding agents
+
+[`skills/generalcontext/SKILL.md`](skills/generalcontext/SKILL.md) is one page with everything a coding agent needs to connect an app: finding every model call, setup, sessions, workers and serverless, outcomes, redaction, verifying, and common issues. It is also served at https://generalcontextlabs.com/platform/agents.md. Install it as a skill:
+
+```bash
+mkdir -p .claude/skills/generalcontext && curl -fsSL https://generalcontextlabs.com/platform/agents.md -o .claude/skills/generalcontext/SKILL.md
+```
