@@ -129,6 +129,7 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - name: Publish the tested tarball
-        run: npm publish pack/*.tgz --provenance --access public
+        # The ./ matters: without it npm reads `pack/x.tgz` as a GitHub `owner/repo` shorthand.
+        run: npm publish ./pack/*.tgz --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
