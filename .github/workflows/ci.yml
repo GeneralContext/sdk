@@ -1,0 +1,61 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.9', '3.12', '3.13']
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Tests without the provider clients (they skip cleanly)
+        run: python -m unittest test_sdk -v
+      - name: Tests with the provider clients
+        run: |
+          pip install openai anthropic httpx requests
+          python -m unittest test_sdk -v
+      - name: Build
+        run: |
+          pip install build twine
+          python -m build --outdir dist
+          twine check dist/*
+
+  node:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ['18', '20', '22']
+    defaults:
+      run:
+        working-directory: node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: npm test
+      - run: npm pack --dry-run
+
+  license:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Each package ships the repository's LICENSE and NOTICE unchanged
+        run: |
+          for package in python node; do
+            cmp LICENSE "$package/LICENSE"
+            cmp NOTICE "$package/NOTICE"
+          done

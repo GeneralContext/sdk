@@ -1,0 +1,37 @@
+[project]
+name = "generalcontext"
+version = "0.2.0"
+description = "Record your agent's OpenAI and Anthropic calls for General Context review and testing."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "General Context Labs", email = "research@generalcontextlabs.com" }]
+keywords = ["llm", "agents", "observability", "evaluation", "openai", "anthropic", "opentelemetry"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://generalcontextlabs.com/platform"
+Documentation = "https://generalcontextlabs.com/platform/docs/sdk"
+Source = "https://github.com/GeneralContext/sdk/tree/main/python"
+Issues = "https://github.com/GeneralContext/sdk/issues"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+include = ["generalcontext", "README.md", "LICENSE", "NOTICE", "test_sdk.py"]
+exclude = ["**/__pycache__"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["generalcontext"]

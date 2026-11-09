@@ -1,0 +1,40 @@
+{
+  "name": "@generalcontext/sdk",
+  "version": "0.2.0",
+  "description": "Record your agent's OpenAI and Anthropic calls for General Context review and testing.",
+  "license": "Apache-2.0",
+  "author": "General Context Labs <research@generalcontextlabs.com>",
+  "homepage": "https://generalcontextlabs.com/platform/docs/sdk",
+  "bugs": "https://github.com/GeneralContext/sdk/issues",
+  "keywords": ["llm", "agents", "observability", "evaluation", "openai", "anthropic", "opentelemetry"],
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsc -p . && node --test test/*.test.mjs",
+    "prepublishOnly": "npm test"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^1.6.0",
+    "@types/node": "^22.20.5",
+    "openai": "^7.53.0",
+    "typescript": "^5.9.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GeneralContext/sdk.git",
+    "directory": "node"
+  }
+}

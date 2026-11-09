@@ -1,0 +1,72 @@
+# Publishes the SDKs when a release tag is pushed:
+#   python-v0.2.0  ->  generalcontext on PyPI
+#   node-v0.2.0    ->  @generalcontext/sdk on npm
+#
+# No long-lived tokens. PyPI uses trusted publishing (OIDC) and npm uses provenance, both tied
+# to this workflow and the `sdk-release` environment, which should require a reviewer.
+# One-time setup is in RELEASING.md. A tag whose version differs from the package's fails.
+name: Release SDKs
+on:
+  push:
+    tags: ['python-v*', 'node-v*']
+permissions:
+  contents: read
+
+jobs:
+  python:
+    if: startsWith(github.ref_name, 'python-v')
+    runs-on: ubuntu-latest
+    environment: sdk-release
+    permissions:
+      contents: read
+      id-token: write   # PyPI trusted publishing
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Tag matches version
+        run: |
+          version=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          test "python-v$version" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != python-v$version"; exit 1; }
+      - name: Test
+        run: |
+          pip install openai anthropic httpx requests
+          python -m unittest test_sdk -v
+      - name: Build
+        run: |
+          pip install build twine
+          python -m build --outdir dist
+          twine check dist/*
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist
+
+  node:
+    if: startsWith(github.ref_name, 'node-v')
+    runs-on: ubuntu-latest
+    environment: sdk-release
+    permissions:
+      contents: read
+      id-token: write   # npm provenance
+    defaults:
+      run:
+        working-directory: node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Tag matches version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          test "node-v$version" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != node-v$version"; exit 1; }
+      - run: npm ci
+      - run: npm test
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
