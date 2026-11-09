@@ -1,5 +1,5 @@
 {
-  "name": "@generalcontext/sdk",
+  "name": "generalcontext",
   "version": "0.2.0",
   "description": "Record your agent's OpenAI and Anthropic calls for General Context review and testing.",
   "license": "Apache-2.0",

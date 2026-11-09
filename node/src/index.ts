@@ -4,7 +4,7 @@
 // Record your agent's model calls for General Context, without changing how it runs.
 //
 //   import OpenAI from 'openai';
-//   import { initialize, withSession } from '@generalcontext/sdk';
+//   import { initialize, withSession } from 'generalcontext';
 //
 //   initialize({ instrumentModules: { openAI: OpenAI } });
 //   await withSession(conversationId, async () => { ... });

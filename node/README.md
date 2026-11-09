@@ -1,11 +1,11 @@
-# @generalcontext/sdk
+# generalcontext
 
 Record your agent's model calls for General Context. Your agent never waits on us, and a failure on our side is logged and dropped, never thrown. No runtime dependencies. Supports OpenAI (`chat.completions`, `responses`) and Anthropic (`messages`), streamed or not.
 
 ## Install
 
 ```sh
-npm install @generalcontext/sdk
+npm install generalcontext
 ```
 
 Set `GENERALCONTEXT_API_KEY` to the key from your workspace's Connect page.
@@ -17,7 +17,7 @@ Call once per process, before your agent makes model calls. Every OpenAI and Ant
 ```ts
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
-import { initialize } from '@generalcontext/sdk';
+import { initialize } from 'generalcontext';
 
 initialize({ appName: 'support-agent', instrumentModules: { openAI: OpenAI, anthropic: Anthropic } });
 ```
@@ -55,7 +55,7 @@ Initialize in `instrumentation.ts` at the project root, not in a route file:
 ```ts
 export async function register() {
   if (process.env.NEXT_RUNTIME === 'nodejs') {
-    const { initialize } = await import('@generalcontext/sdk');
+    const { initialize } = await import('generalcontext');
     const { OpenAI } = await import('openai');
     const anthropic = await import('@anthropic-ai/sdk');
     initialize({ appName: 'my-agent', instrumentModules: { openAI: OpenAI, anthropic } });
@@ -77,7 +77,7 @@ Use the Node.js runtime. The Edge runtime is not supported.
 Tag calls with your own ids. Tags carry across `await`.
 
 ```ts
-import { withSession, task } from '@generalcontext/sdk';
+import { withSession, task } from 'generalcontext';
 
 await withSession({ sessionId: conversationId, userId: 'u_42', channel: 'chat' }, async () => {
   await task('triage', () => client.chat.completions.create({ ... }));

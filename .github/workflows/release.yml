@@ -1,6 +1,6 @@
 # Publishes the SDKs when a release tag is pushed:
 #   python-v0.2.0  ->  generalcontext on PyPI
-#   node-v0.2.0    ->  @generalcontext/sdk on npm
+#   node-v0.2.0    ->  generalcontext on npm
 #
 # Each release is built once, tested, attested (SLSA build provenance, verifiable with
 # `gh attestation verify`), and only then published, from the exact files that were built.
