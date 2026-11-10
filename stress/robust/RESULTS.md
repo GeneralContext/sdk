@@ -76,13 +76,13 @@ Notes:
   errors that openai or httpx raises itself. The SDK passes them through unchanged and still records
   the failed call.
 
-## Node (all pass, 2 known)
+## Node (all pass)
 
 | Scenario | Result | Numbers |
 |---|---|---|
 | collector dead | pass | model p50 0.236 -> 0.212 ms (p99 0.768 -> 1.154), agent errors 0, flush(3000) returned false in 0 s, exit after last call 0.01 s |
-| collector blackhole | KNOWN | model p50 0.287 -> 0.244 ms (p99 1.832 -> 2.144), agent errors 0, flush(3000) returned false in 3.001 s, exit after last call 13.88 s |
-| collector slow | KNOWN | model p50 0.238 -> 0.212 ms (p99 0.858 -> 1.037), agent errors 0, flush(3000) returned false in 3 s, exit after last call 13.92 s |
+| collector blackhole | pass | model p50 0.217 -> 0.202 ms (p99 0.733 -> 1.187), agent errors 0, flush(3000) returned false in 3.001 s, exit after last call 2.02 s |
+| collector slow | pass | model p50 0.219 -> 0.196 ms (p99 0.771 -> 1.251), agent errors 0, flush(3000) returned false in 3.002 s, exit after last call 2.02 s |
 | collector 500 | pass | model p50 0.233 -> 0.21 ms (p99 0.839 -> 1.159), agent errors 0, flush(3000) returned true in 0 s, exit after last call 0.01 s |
 | collector 429 | pass | model p50 0.232 -> 0.204 ms (p99 0.878 -> 1.395), agent errors 0, flush(3000) returned true in 0 s, exit after last call 0 s |
 | collector 401 | pass | model p50 0.232 -> 0.203 ms (p99 0.863 -> 1.328), agent errors 0, flush(3000) returned true in 0 s, exit after last call 0.01 s |
@@ -109,14 +109,12 @@ Notes:
 | redaction under load (10k calls) | pass | 10000/10000 calls delivered in 500 batches, raw values found none, 0.64 s |
 
 Notes:
-- **KNOWN, not fixed: Node exit against a collector that accepts but never answers (blackhole and
-  slow).** The in-flight `fetch` holds the event loop open, so `beforeExit` never fires and the 2 s
-  exit cap never starts. The process ends when the 15 s send timeout aborts the request (measured:
-  13.9 s after the last line). Without the circuit-breaker fix below, it stayed alive for minutes
-  (270 s measured). The script prints KNOWN and fails if the delay goes past 16 s. A full fix means
-  unref'ing the collector socket, which built-in `fetch` cannot do. That needs a design decision
-  (node:http with `socket.unref()`, or a shorter send timeout), so I did not make it silently.
-  Connection refused, 4xx/5xx and garbage replies all exit at once.
+- **Fixed after the first run: Node exit against a collector that accepts but never answers
+  (blackhole and slow).** The in-flight `fetch` held the event loop open, so the process lived until
+  the 15 s send timeout (13.9 s measured). The SDK now posts with `node:http(s)` and unrefs the
+  socket, except while the app awaits `flush()`, `reportOutcome()` or `logEvent()`. Exit now takes
+  2.0 s, the documented exit flush cap. Regression test: `a collector that accepts and never answers
+  does not keep a finished process alive` (fails at 17 s without the fix).
 - The concurrency run caps requests on the wire at 64 while all 200 promises stay alive. Without
   that cap, the small threaded Python fake provider timed out on 73 of 1000 calls even with no SDK
   loaded.

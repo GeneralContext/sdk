@@ -68,10 +68,7 @@ try {
     const exitDelay = r.exit_mark ? +(r._end - r.exit_mark).toFixed(2) : null;
     const added = r.after ? +(r.after.p50 - r.before.p50).toFixed(3) : null;
     const ok = r._code === 0 && r.error_count === 0 && r.flush_s <= 3.5 && exitDelay !== null && exitDelay <= 2.6 && added !== null && added < 1;
-    // KNOWN (RESULTS.md): against a collector that accepts and never answers, the in-flight fetch keeps the event
-    // loop alive until the 15 s send timeout, so the 2 s exit cap never starts. Still fail if it gets worse.
-    const known = !ok && ['blackhole', 'slow'].includes(mode) && r._code === 0 && r.error_count === 0 && r.flush_s <= 3.5 && exitDelay <= 16 && added < 1;
-    row(`collector ${mode}`, known ? 'known' : ok, `model p50 ${r.before?.p50} -> ${r.after?.p50} ms (p99 ${r.before?.p99} -> ${r.after?.p99}), agent errors ${r.error_count}, flush(3000) returned ${r.flush_returned} in ${r.flush_s} s, exit after last call ${exitDelay} s${r._code ? `, code ${r._code} ${r._signal ?? ''}` : ''}`);
+    row(`collector ${mode}`, ok, `model p50 ${r.before?.p50} -> ${r.after?.p50} ms (p99 ${r.before?.p99} -> ${r.after?.p99}), agent errors ${r.error_count}, flush(3000) returned ${r.flush_returned} in ${r.flush_s} s, exit after last call ${exitDelay} s${r._code ? `, code ${r._code} ${r._signal ?? ''}` : ''}`);
   }
   await control('/_mode', { mode: 'healthy' });
 
