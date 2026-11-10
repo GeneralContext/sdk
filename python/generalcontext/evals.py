@@ -7,8 +7,9 @@
 
 A task (format generalcontext.task/v1, exported from the platform's Tasks page) holds a real
 conversation, made anonymous: what the person wrote and knows, what the agent's tools returned,
-the policies, what the agent should have done, and a rubric. Three pieces turn it into an eval
-that runs anywhere, with no copy of your systems to build:
+the policies, what the agent should have done, and a rubric. General Context runs tasks in a
+synthetic environment of the customer's systems. This module is the portable replay of the same
+tasks, for CI and laptops, with no environment to stand up. Three pieces make it:
 
 - **Replay world.** The agent gets the same tools. A call with the arguments production saw
   returns what production returned. A call production never made is answered honestly as

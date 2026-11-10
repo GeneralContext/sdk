@@ -11,7 +11,7 @@ description: Connect an AI agent to General Context: install the generalcontext 
 > mkdir -p .claude/skills/generalcontext && curl -fsSL https://generalcontextlabs.com/docs/agents.md -o .claude/skills/generalcontext/SKILL.md
 > ```
 
-General Context turns an AI agent's real production conversations into RL and eval tasks. The SDK records every OpenAI (including Azure), Anthropic (including Bedrock, Vertex and beta clients), Google Gemini and AWS Bedrock Converse model call your process makes (the request, the reply, tool calls and results, timing, usage) and sends it in the background; General Context rebuilds each **conversation** from those calls. General Context reads conversations against the company's policies, repeated failures become **issues**, and each confirmed issue becomes a **task**: a synthetic environment rebuilt from the recorded tool results, a simulated person and a grader. The tasks together are the company's benchmark. Recording quality directly determines task quality: a conversation split across ids, or missing the calls a worker made, cannot be judged or rebuilt.
+General Context builds a synthetic environment of the systems an AI agent works in, shaped by the company's domain experts and its production traffic, and turns the agent's real conversations into RL and eval tasks in it. The SDK records every OpenAI (including Azure), Anthropic (including Bedrock, Vertex and beta clients), Google Gemini and AWS Bedrock Converse model call your process makes (the request, the reply, tool calls and results, timing, usage) and sends it in the background; General Context rebuilds each **conversation** from those calls. General Context reads conversations against the company's policies, repeated failures become **issues**, and each confirmed issue becomes a **task**: the situation set up in the environment, a simulated person and a grader. The tasks together are the company's benchmark. Recording quality directly determines task quality: the recorded tool calls and results show which systems the environment needs and what their records look like, and a conversation split across ids, or missing the calls a worker made, cannot be judged.
 
 ## Prerequisites
 
@@ -166,7 +166,7 @@ Without `--session` it shows the workspace, what the key can do, and when traffi
 
 ## Run the benchmark in CI
 
-Once the workspace has ready tasks, use a key that can run the benchmark (on **API keys**, check **Run the benchmark**; send-only keys get `403`): `generalcontext benchmark pull --out benchmark.json`, then `generalcontext evals run benchmark.json --agent my_agent:handle --trials 3 --upload`. `--upload` sends the `generalcontext.runs/v1` results to your workspace, so each agent's scores show on **Tasks**.
+Once the workspace has ready tasks, CI can run their portable replay with a key that can run the benchmark (on **API keys**, check **Run the benchmark**; send-only keys get `403`): `generalcontext benchmark pull --out benchmark.json`, then `generalcontext evals run benchmark.json --agent my_agent:handle --trials 3 --upload`. `--upload` sends the `generalcontext.runs/v1` results to your workspace, so each agent's scores show on **Tasks**.
 
 ## Common issues
 
