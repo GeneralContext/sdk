@@ -119,6 +119,8 @@ def _patch_sdks():
     # Anthropic's `stream` helpers post directly too, so they are wrapped on their own.
     targets = [
         ("openai.resources.chat.completions", "Completions", "AsyncCompletions", "openai-chat", ()),
+        # openai 1.40 to 1.92 have parse only under beta.chat.completions, and it posts directly.
+        ("openai.resources.beta.chat.completions", "Completions", "AsyncCompletions", "openai-chat", ()),
         ("openai.resources.responses", "Responses", "AsyncResponses", "openai-responses", ()),
         ("anthropic.resources.messages", "Messages", "AsyncMessages", "anthropic", ("stream",)),
         ("anthropic.resources.beta.messages.messages", "Messages", "AsyncMessages", "anthropic", ("stream",)),

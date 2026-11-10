@@ -486,6 +486,31 @@ class SdkTest(unittest.TestCase):
             self.assertEqual(call["response"]["usage"]["total_tokens"], 9)
         self.assertIsNone(streaming_call["response"])  # The body is the caller's to read.
 
+    @unittest.skipUnless(HAS_OPENAI and importlib.util.find_spec("openai.resources.beta.chat") is not None,
+                         "needs an openai release with beta.chat.completions (1.40 to 1.x)")
+    def test_openai_beta_chat_completions_parse_is_recorded_once(self):
+        # Regression: openai 1.40 to 1.92 offer parse only as beta.chat.completions.parse, which posts
+        # directly instead of calling create, so it was not recorded at all. Raw HTTP capture (on in
+        # this test class) would hide that, so it is off here, as it is by default.
+        http_off = mock.patch.object(generalcontext, "_http_start", lambda *args: None)
+        http_off.start()
+        self.addCleanup(http_off.stop)
+        client = self.openai()
+        reply = client.beta.chat.completions.parse(model="gpt-test", messages=[{"role": "user", "content": "p"}],
+                                                   response_format={"type": "json_object"})
+
+        async def run():
+            other = openai.AsyncOpenAI(api_key="sk-test", base_url=self.url + "/v1", max_retries=0)
+            return await other.beta.chat.completions.parse(model="gpt-test", messages=[], response_format={"type": "json_object"})
+        asyncio.run(run())
+        with client.beta.chat.completions.stream(model="gpt-test", messages=[]) as stream:
+            list(stream)
+        self.assertEqual(reply.choices[0].message.content, "Unit 402 is open.")
+        calls = self.calls()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0]["request"]["messages"][0]["content"], "p")
+        self.assertEqual(calls[0]["response"]["choices"][0]["message"]["content"], "Unit 402 is open.")
+
     @unittest.skipUnless(HAS_ANTHROPIC, "anthropic is not installed")
     def test_anthropic_plain_streamed_and_stream_helper(self):
         import anthropic
