@@ -45,14 +45,14 @@ initialize({ instrumentModules: { openAI: OpenAI, anthropic: Anthropic } });
 
 Already tracing with OpenTelemetry? You don't need this SDK: point an OTLP exporter at
 `https://generalcontextlabs.com/api/platform-collect/v1/traces`. See the
-[docs](https://generalcontextlabs.com/platform/docs/opentelemetry).
+[docs](https://generalcontextlabs.com/docs/opentelemetry).
 
 ## What is sent
 
 For each model call: the request (messages, tools, model and settings), the response, timing,
 token usage, any error, and the session tags you set. Nothing else from your process.
 `redact=True` replaces emails, phone numbers and card or SSN-like numbers before anything
-leaves the process. Full details: [docs](https://generalcontextlabs.com/platform/docs/sdk).
+leaves the process. Full details: [docs](https://generalcontextlabs.com/docs/sdk).
 
 ## Repository
 
@@ -65,8 +65,8 @@ Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 ## For coding agents
 
-[`skills/generalcontext/SKILL.md`](skills/generalcontext/SKILL.md) is one page with everything a coding agent needs to connect an app: finding every model call, setup, sessions, workers and serverless, outcomes, redaction, verifying, and common issues. It is also served at https://generalcontextlabs.com/platform/agents.md. Install it as a skill:
+[`skills/generalcontext/SKILL.md`](skills/generalcontext/SKILL.md) is one page with everything a coding agent needs to connect an app: finding every model call, setup, sessions, workers and serverless, outcomes, redaction, verifying, and common issues. It is also served at https://generalcontextlabs.com/docs/agents.md. Install it as a skill:
 
 ```bash
-mkdir -p .claude/skills/generalcontext && curl -fsSL https://generalcontextlabs.com/platform/agents.md -o .claude/skills/generalcontext/SKILL.md
+mkdir -p .claude/skills/generalcontext && curl -fsSL https://generalcontextlabs.com/docs/agents.md -o .claude/skills/generalcontext/SKILL.md
 ```

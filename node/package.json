@@ -4,7 +4,7 @@
   "description": "Record your agent's OpenAI and Anthropic calls for General Context review and testing.",
   "license": "Apache-2.0",
   "author": "General Context Labs <research@generalcontextlabs.com>",
-  "homepage": "https://generalcontextlabs.com/platform/docs/sdk",
+  "homepage": "https://generalcontextlabs.com/docs/sdk",
   "bugs": "https://github.com/GeneralContext/sdk/issues",
   "keywords": ["llm", "agents", "observability", "evaluation", "openai", "anthropic", "opentelemetry"],
   "type": "module",

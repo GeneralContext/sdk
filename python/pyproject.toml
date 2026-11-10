@@ -25,7 +25,7 @@ generalcontext-evals = "generalcontext.evals:cli"
 
 [project.urls]
 Homepage = "https://generalcontextlabs.com/platform"
-Documentation = "https://generalcontextlabs.com/platform/docs/sdk"
+Documentation = "https://generalcontextlabs.com/docs/sdk"
 Source = "https://github.com/GeneralContext/sdk/tree/main/python"
 Issues = "https://github.com/GeneralContext/sdk/issues"
 
