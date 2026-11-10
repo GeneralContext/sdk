@@ -98,10 +98,9 @@ Tests: `cd python && python -m unittest test_sdk test_evals -v`.
 
 ## Run your benchmark
 
-General Context runs your tasks in a synthetic environment of your systems. Every task also runs
-here as a portable replay, with no environment and no access to your systems, for CI: each task
-carries what your tools returned in production, and the replay answers from it. A model plays the
-person, and a judge grades the task's rubric for a reward from 0 to 1.
+Tasks built from your traffic run anywhere, with no access to your systems: each carries what your
+tools returned in production, and the task's environment answers from it. A model plays the person,
+and a judge grades the task's rubric for a reward from 0 to 1.
 
 ```bash
 pip install generalcontext openai anthropic
