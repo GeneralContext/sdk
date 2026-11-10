@@ -3,6 +3,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import OpenAI from 'openai';
@@ -809,4 +810,28 @@ test('await ready() makes a call right after initialize() safe', async () => {
     await new Promise(r => setTimeout(r, 30)); await flush();`);
   assert.equal(out.code, 0, out.stderr);
   assert.equal(recorded('ready').length, 1);
+});
+
+test('plain initialize() warns once when no model SDK resolves, and not with instrumentModules', async () => {
+  // A copy of dist in an empty directory resolves none of the provider SDKs, like generalcontext installed
+  // in a different project from the app's model SDK.
+  const { mkdtempSync, copyFileSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(path.join(tmpdir(), 'gc-nosdk-'));
+  copyFileSync(dist, path.join(dir, 'index.js'));
+  writeFileSync(path.join(dir, 'package.json'), '{"type":"module"}');
+  const run = code => new Promise(resolve => {
+    const p = spawn(process.execPath, ['--input-type=module', '-e', `import { initialize, ready } from './index.js'; ${code}`], { cwd: dir, env: { ...process.env, NODE_PATH: '' } });
+    let stderr = '';
+    p.stderr.on('data', d => { stderr += d; });
+    p.on('close', code => resolve({ code, stderr }));
+  });
+  const bare = await run(`initialize({ apiKey: 'k', baseUrl: 'http://127.0.0.1:1' }); await ready();`);
+  assert.equal(bare.code, 0, bare.stderr);
+  assert.equal((bare.stderr.match(/found no model SDK/g) ?? []).length, 1);
+  const given = await run(`initialize({ apiKey: 'k', baseUrl: 'http://127.0.0.1:1', instrumentModules: {} }); await ready();`);
+  assert.doesNotMatch(given.stderr, /found no model SDK/);
+  // In node/, where the SDKs are installed, there is no warning.
+  const found = await child(`initialize({ apiKey: 'k', baseUrl: BASE + '/child/found' }); const { ready } = await import(${JSON.stringify(dist)}); await ready();`);
+  assert.doesNotMatch(found.stderr, /found no model SDK/);
 });

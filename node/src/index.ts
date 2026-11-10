@@ -138,7 +138,9 @@ export function initialize(options: InitializeOptions = {}): void {
     const esm: [string, (m: unknown) => void][] = [['openai', patchOpenAI], ['@anthropic-ai/sdk', patchAnthropic]];
     if (modules.googleGenAI) esm.push(['@google/genai', patchGemini]);
     // @aws-sdk/client-bedrock-runtime resolves to one class from both require() and import(), so it needs nothing here.
-    pending = Promise.all(esm.map(([name, patch]) => import(name as string).then(patch, () => {}))).then(() => {});
+    let found = Object.values(modules).some(Boolean);
+    pending = Promise.all(esm.map(([name, patch]) => import(name as string).then(m => { found = true; patch(m); }, () => {})))
+      .then(() => { if (!found) warn(NO_SDK); });
   }
   if (modules.openAI) patchOpenAI(modules.openAI);
   if (modules.anthropic) patchAnthropic(modules.anthropic);
@@ -148,6 +150,9 @@ export function initialize(options: InitializeOptions = {}): void {
 }
 
 let pending: Promise<void> = Promise.resolve();
+// Resolution is from this file's location, so an SDK installed in another project's node_modules is not found.
+const NO_SDK = 'found no model SDK to record (openai, @anthropic-ai/sdk, @google/genai, @aws-sdk/client-bedrock-runtime). '
+  + 'Install generalcontext in the same project as your model SDK, or pass instrumentModules.';
 
 /**
  * Resolves once initialize() has patched every SDK build it found, including the ES module builds it loads
