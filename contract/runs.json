@@ -1,0 +1,25 @@
+{
+  "format": "generalcontext.runs/v1",
+  "runs": [
+    {
+      "task": "tst_contract_replay",
+      "agent": "openai:gpt-6.1-terra",
+      "passed": false,
+      "reward": 0.5,
+      "at": "2026-11-10T00:00:00+00:00",
+      "trial": "late-fee-portal-outage--openai-gpt-6.1-terra--1",
+      "note": "1/2 criteria; failed: routes",
+      "origin": "failure"
+    },
+    {
+      "task": "tst_contract_counter",
+      "agent": "my_agent:run",
+      "passed": true,
+      "reward": 1.0,
+      "at": "2026-11-10T00:01:00+00:00",
+      "trial": "counter-to-three--my_agent-run--1",
+      "note": "reward 1.0",
+      "origin": "success"
+    }
+  ]
+}
