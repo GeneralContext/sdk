@@ -106,7 +106,7 @@ test('configuration and usage errors exit 2', async () => {
     [['benchmark'], {}, /Usage/],
     [[], {}, /Usage/],
     [['evals', 'run', 'x'], {}, /pip install generalcontext && generalcontext evals run/],
-    [['improve', 'x'], {}, /pip install generalcontext && generalcontext evals run/],
+    [['improve', 'x'], {}, /Usage/],
   ]) {
     const n = seen.length;
     const out = await run(args, env);

@@ -438,7 +438,7 @@ things up and to act. Messages from the person arrive as user messages."""
 def reference_agent(model_call, task, instructions=None):
     """A model on the instructions recorded from the customer's agent, or a plain brief without them.
 
-    `instructions` replaces the recorded instructions (used by `generalcontext improve`).
+    `instructions` replaces the recorded instructions, to compare a revised prompt on the same tasks.
     """
     if instructions is None:
         instructions = (task.get("agent") or {}).get("instructions") or ""

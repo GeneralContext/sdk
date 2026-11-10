@@ -6,7 +6,6 @@
     generalcontext verify [--session ID] [--json]
     generalcontext benchmark pull [--out benchmark.json]
     generalcontext evals run BENCHMARK --agent ... [--upload]
-    generalcontext improve BENCHMARK --agent openai:<model> [--upload]
 
 Uses GENERALCONTEXT_API_KEY and GENERALCONTEXT_BASE_URL. Exit 0 on success, 1 on a failed check,
 2 on a usage or configuration error.
@@ -106,13 +105,10 @@ def benchmark_pull(args):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    # evals run and improve take their own flags: hand them over untouched.
+    # evals run takes its own flags: hand them over untouched.
     if argv[:2] == ["evals", "run"]:
         from . import evals
         return _exit_code(lambda: evals.main(argv[2:], prog="generalcontext evals run"))
-    if argv[:1] == ["improve"]:
-        from . import improve
-        return _exit_code(lambda: improve.main(argv[1:]))
     parser = argparse.ArgumentParser(prog="generalcontext", description="General Context from the command line.")
     commands = parser.add_subparsers(dest="command", metavar="command")
     check = commands.add_parser("verify", help="check the key and that calls are arriving")
@@ -124,7 +120,6 @@ def main(argv=None):
     pull.add_argument("--out", default="benchmark.json")
     run = commands.add_parser("evals", help="run the benchmark (generalcontext evals run --help)")
     run.add_argument("action", choices=["run"])
-    commands.add_parser("improve", help="propose better instructions (generalcontext improve --help)")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exit:

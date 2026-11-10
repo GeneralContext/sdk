@@ -127,7 +127,7 @@ async function main(argv: string[]): Promise<number> {
   try {
     if (command === 'verify') return await verify(args);
     if (command === 'benchmark') return await benchmark(args);
-    if (command === 'evals' || command === 'improve') { console.error(PYTHON_HINT); return 2; }
+    if (command === 'evals') { console.error(PYTHON_HINT); return 2; }
     if (command === '-h' || command === '--help' || command === 'help') { console.log(USAGE); return 0; }
     console.error(USAGE);
     return 2;

@@ -129,15 +129,7 @@ generalcontext verify                       # the key works, and when the last c
 generalcontext verify --session chat:42     # that one conversation arrived (add --json for scripts)
 generalcontext benchmark pull               # writes benchmark.json (needs a key that runs the benchmark)
 generalcontext evals run benchmark.json --agent openai:gpt-6.1-terra --upload
-generalcontext improve benchmark.json --agent openai:gpt-6.1-terra --upload
 ```
-
-`improve` proposes better instructions for your agent. It never edits your code. It runs the
-agent on the train tasks with your current instructions (`--instructions FILE`, or the ones
-recorded in the benchmark), asks a model for the smallest general change that fixes the
-failures, and keeps a change only if the pass rate rises. Held-out tasks are never shown to that
-model: they are run at the end, before and after, so you can trust the comparison. Review
-`improve/instructions.diff`, then apply it yourself. `report.json` and `runs.json` sit next to it.
 
 ## License
 

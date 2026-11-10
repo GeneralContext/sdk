@@ -166,7 +166,7 @@ Without `--session` it shows the workspace, what the key can do, and when traffi
 
 ## Run the benchmark in CI
 
-Once the workspace has tests, use a key that can run the benchmark (on **API keys**, check **Run the benchmark**; send-only keys get `403`): `generalcontext benchmark pull --out benchmark.json`, then `generalcontext evals run benchmark.json --agent my_agent:handle --trials 3 --upload`. `--upload` sends the `generalcontext.runs/v1` results to your workspace, so pass rates show per agent on **Tests**. `generalcontext improve` proposes revised instructions from the failures without editing code.
+Once the workspace has tests, use a key that can run the benchmark (on **API keys**, check **Run the benchmark**; send-only keys get `403`): `generalcontext benchmark pull --out benchmark.json`, then `generalcontext evals run benchmark.json --agent my_agent:handle --trials 3 --upload`. `--upload` sends the `generalcontext.runs/v1` results to your workspace, so pass rates show per agent on **Tests**.
 
 ## Common issues
 

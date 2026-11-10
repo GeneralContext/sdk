@@ -1,4 +1,4 @@
-"""The `generalcontext` command and prompt improvement, offline: a fake collector and scripted models.
+"""The `generalcontext` command, offline, against a fake collector.
 
     python -m unittest test_cli
 """
@@ -14,7 +14,7 @@ import unittest
 import unittest.mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from generalcontext import cli, evals, improve
+from generalcontext import cli, evals
 from test_evals import TASK, scripted
 
 EVALS_KEY, INGEST_KEY = "gck_evals", "gck_ingest"
@@ -154,157 +154,6 @@ class CliTest(unittest.TestCase):
                                             "--upload", key=INGEST_KEY)
         self.assertEqual(code, 1)
         self.assertIn("upload failed", err)
-
-
-# ---- improve ------------------------------------------------------------------------------
-
-GOOD = "Always ask when they paid before routing."
-SECRET = "HELDOUT-SECRET-7731"
-
-
-def benchmark():
-    tasks = []
-    for number, split in ((1, "train"), (2, "train"), (3, "held_out")):
-        task = copy.deepcopy(TASK)
-        task.update(id=f"t{number}", split=split, title=f"Task {number}")
-        if split == "held_out":
-            task.update(title=SECRET, expected=SECRET + " expected")
-            task["scenario"]["opening"] = SECRET + " opening"
-            task["scenario"]["context"] = SECRET + " context"
-        tasks.append(task)
-    return tasks
-
-
-def agent_model(system, messages, tools):
-    """Says 'good' when its instructions contain GOOD, 'okay' for a half rule, else 'bad'."""
-    word = "good" if GOOD in system else "okay" if "half" in system else "bad"
-    return {"text": word, "tool_calls": []}
-
-
-def judge_model(system, messages, tools):
-    content = messages[0]["content"]
-    first = "agent: good" in content or "agent: okay" in content
-    second = "agent: good" in content
-    return {"text": json.dumps({"criteria": [{"id": "asks-date", "passed": first, "reason": "r1"},
-                                             {"id": "routes", "passed": second, "reason": "r2"}]}), "tool_calls": []}
-
-
-def person_model(system, messages, tools):
-    return {"text": "", "tool_calls": [{"id": "1", "name": "leave", "arguments": {"message": "bye"}}]}
-
-
-def proposer(*instructions):
-    return scripted(*[{"text": json.dumps({"instructions": text, "rationale": f"try {i}"}), "tool_calls": []}
-                      for i, text in enumerate(instructions)])
-
-
-class ImproveTest(unittest.TestCase):
-    def run_improve(self, proposer_model, rounds=2, optimize_on="train", tasks=None):
-        logs = []
-        report, best, results = improve.improve(tasks or benchmark(), "openai:a", agent_model, proposer_model, person_model,
-                                                judge_model, "You are the front desk.", rounds=rounds, trials=2,
-                                                optimize_on=optimize_on, log=logs.append)
-        return report, best, results, logs
-
-    def test_reference_agent_takes_an_instructions_override(self):
-        model = scripted({"text": "hi", "tool_calls": []})
-        evals.reference_agent(model, TASK, "Override.")([{"role": "user", "content": "x"}], evals.Toolbox(TASK))
-        evals.reference_agent(model, TASK)([{"role": "user", "content": "x"}], evals.Toolbox(TASK))
-        self.assertEqual([seen["system"] for seen in model.seen], ["Override.", "You are the front desk."])
-
-    def test_a_better_candidate_is_kept_and_held_out_is_never_shown_to_the_proposer(self):
-        model = proposer("You are the front desk. " + GOOD)
-        report, best, results, logs = self.run_improve(model)
-        self.assertEqual(best, "You are the front desk. " + GOOD)
-        self.assertEqual(report["optimize"]["before"]["pass_rate"], 0.0)
-        self.assertEqual(report["optimize"]["after"]["pass_rate"], 1.0)
-        self.assertEqual(report["held_out"], {"before": {"runs": 2, "pass_rate": 0.0, "reward": 0.0},
-                                              "after": {"runs": 2, "pass_rate": 1.0, "reward": 1.0}})
-        self.assertEqual(len(model.seen), 1)  # A perfect score stops the rounds.
-        shown = json.dumps(model.seen)
-        self.assertNotIn(SECRET, shown)
-        self.assertNotIn("t3", shown)
-        self.assertIn("Task 1", shown)
-        self.assertIn("r2", shown)  # The judge's reasons reach the proposer.
-        self.assertIn("never copy", model.seen[0]["system"].lower())
-        labels = {r["label"] for r in results}
-        self.assertEqual(labels, {"openai:a (current instructions)", "openai:a (proposed instructions)"})
-
-    def test_a_worse_or_equal_candidate_is_rejected(self):
-        report, best, _, _ = self.run_improve(proposer("Something else entirely."))
-        self.assertEqual(best, "You are the front desk.")
-        self.assertFalse(report["changed"])
-        self.assertEqual([r["kept"] for r in report["rounds"]], [False])
-        self.assertEqual(report["held_out"]["before"], report["held_out"]["after"])
-
-    def test_ties_on_pass_rate_are_broken_by_reward_and_rounds_continue(self):
-        model = proposer("You are the front desk. half", "You are the front desk. " + GOOD)
-        report, best, _, _ = self.run_improve(model)
-        self.assertEqual([(r["pass_rate"], r["reward"], r["kept"]) for r in report["rounds"]],
-                         [(0.0, 0.5, True), (1.0, 1.0, True)])
-        self.assertEqual(best, "You are the front desk. " + GOOD)
-        self.assertIn("half", model.seen[1]["messages"][0]["content"])
-
-    def test_optimize_on_all_warns_and_has_no_held_out(self):
-        report, _, _, logs = self.run_improve(proposer("x"), optimize_on="all")
-        self.assertIn("no longer an honest check", logs[0])
-        self.assertEqual((report["optimize_tasks"], report["held_out"]), (3, None))
-
-    def test_base_instructions_come_from_the_file_or_the_most_common(self):
-        tasks = benchmark()
-        tasks[0]["agent"]["instructions"] = "Rare."
-        self.assertEqual(improve.base_instructions(tasks), "You are the front desk.")
-        for task in tasks:
-            task["agent"]["instructions"] = ""
-        with self.assertRaises(ValueError):
-            improve.base_instructions(tasks)
-
-    def test_the_command_writes_the_proposal_and_uploads(self):
-        Collector.posted.clear()
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Collector)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.shutdown)
-        models = {"openai:a": agent_model, "openai:proposer": proposer("You are the front desk.\n" + GOOD),
-                  "openai:person": person_model, "openai:judge": judge_model}
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "b.json")
-            with open(path, "w") as handle:
-                json.dump({"format": evals.BENCHMARK_FORMAT, "tasks": benchmark()}, handle)
-            out = os.path.join(directory, "improve")
-            env = {"GENERALCONTEXT_API_KEY": EVALS_KEY, "GENERALCONTEXT_BASE_URL": f"http://127.0.0.1:{server.server_port}"}
-            stdout = io.StringIO()
-            with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(evals, "model", models.__getitem__), \
-                    contextlib.redirect_stdout(stdout):
-                code = cli.main(["improve", path, "--agent", "openai:a", "--proposer", "openai:proposer", "--person", "openai:person",
-                                 "--judge", "openai:judge", "--out", out, "--upload"])
-            files = {}
-            for name in sorted(os.listdir(out)):
-                with open(os.path.join(out, name)) as handle:
-                    files[name] = handle.read()
-        self.assertEqual(code, 0)
-        self.assertEqual(sorted(files), ["instructions.diff", "instructions.md", "report.json", "runs.json"])
-        self.assertEqual(files["instructions.md"], "You are the front desk.\n" + GOOD)
-        self.assertIn("+" + GOOD, files["instructions.diff"])
-        self.assertIn("-You are the front desk.", files["instructions.diff"])
-        self.assertEqual(json.loads(files["report.json"])["held_out"]["after"]["pass_rate"], 1.0)
-        self.assertEqual(json.loads(files["runs.json"])["format"], evals.RUNS_FORMAT)
-        self.assertIn("Optimize set: 0% -> 100% pass", stdout.getvalue())
-        self.assertIn("Held out: 0% -> 100% pass", stdout.getvalue())
-        self.assertIn("instructions.diff", stdout.getvalue())
-        self.assertEqual(Collector.posted[0][0], "/api/platform-collect/runs")
-        self.assertEqual(len(Collector.posted[0][1]["runs"]), 4 + 4 + 2 + 2)
-
-    def test_the_command_without_instructions_exits_2(self):
-        tasks = benchmark()
-        for task in tasks:
-            task["agent"]["instructions"] = ""
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "b.json")
-            with open(path, "w") as handle:
-                json.dump({"format": evals.BENCHMARK_FORMAT, "tasks": tasks}, handle)
-            with contextlib.redirect_stderr(io.StringIO()) as err:
-                self.assertEqual(cli.main(["improve", path, "--agent", "openai:a"]), 2)
-        self.assertIn("--instructions", err.getvalue())
 
 
 if __name__ == "__main__":
