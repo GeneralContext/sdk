@@ -136,6 +136,18 @@ Pass a stable `eventId` so retries dedupe. `properties` are flat strings, number
 
 `wrap(client, { redact })` records a single OpenAI, Anthropic, `GoogleGenAI` or `BedrockRuntimeClient` instance without patching the SDK. Its `redact` applies to that client only. If `initialize()` already patched the SDK, the client is recorded with the `initialize()` settings.
 
+## Command line
+
+The package installs a `generalcontext` command. It reads `GENERALCONTEXT_API_KEY` and `GENERALCONTEXT_BASE_URL`, with the same https rule as the SDK.
+
+```sh
+npx generalcontext verify                      # workspace, key scopes, when the last call arrived
+npx generalcontext verify --session conv-123   # did this conversation arrive? exits 1 if not yet
+npx generalcontext benchmark pull --out benchmark.json
+```
+
+`--json` prints the raw status. `benchmark pull` needs a key that can run the benchmark. Running the benchmark and improving instructions are in the Python package: `pip install generalcontext && generalcontext evals run ...`. Exit codes: 0 success, 1 failed check, 2 usage or configuration error.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
