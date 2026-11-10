@@ -40,6 +40,7 @@ import hmac
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -329,7 +330,8 @@ def _encode(call, scrub):
                 return None
             if call is None:
                 return None
-        data = json.dumps(_scrubbed(call, scrub), default=str).encode()
+        # allow_nan=False: a NaN that before_send adds drops this call only, not the whole batch.
+        data = json.dumps(_scrubbed(call, scrub), default=str, allow_nan=False).encode()
     except Exception as error:
         _warn("encode", "General Context could not encode a model call: %s", error)
         return None
@@ -1080,19 +1082,37 @@ def _scrubbed(value, scrub):
     return value
 
 
-def _plain(value, depth=0):
-    """SDK objects (pydantic models) as plain JSON. Request bodies may hold anything; keep what serializes."""
-    if depth > 40:
+PLAIN_MAX_NODES = 200_000  # Past this many values a snapshot is cut, so a huge or shared structure stays cheap.
+
+
+def _plain(value, depth=0, _path=None, _budget=None):
+    """SDK objects (pydantic models) as plain JSON. Request bodies may hold anything; keep what serializes.
+
+    Circular references become "<circular>" and NaN or Infinity become strings, so the snapshot
+    is always strict JSON and always finishes in time linear in its size.
+    """
+    if _budget is None:
+        _path, _budget = set(), [PLAIN_MAX_NODES]
+    _budget[0] -= 1
+    if depth > 40 or _budget[0] < 0:
         return None
     if inspect.isclass(value):  # e.g. response_format=SomeModel
         return f"{value.__module__}.{value.__qualname__}"
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json", exclude_none=True)
-    if isinstance(value, dict):
-        return {str(key): _plain(item, depth + 1) for key, item in value.items()
-                if not str(key).startswith(("extra_headers", "timeout"))}
-    if isinstance(value, (list, tuple)):
-        return [_plain(item, depth + 1) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
+    if isinstance(value, (dict, list, tuple)):
+        if id(value) in _path:
+            return "<circular>"
+        _path.add(id(value))
+        try:
+            if isinstance(value, dict):
+                return {str(key): _plain(item, depth + 1, _path, _budget) for key, item in value.items()
+                        if not str(key).startswith(("extra_headers", "timeout"))}
+            return [_plain(item, depth + 1, _path, _budget) for item in value]
+        finally:
+            _path.discard(id(value))
     return str(value)

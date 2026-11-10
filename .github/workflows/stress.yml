@@ -66,3 +66,32 @@ jobs:
           name: compat-${{ matrix.lang }}-${{ matrix.runtime }}
           path: stress/compat/*/results-*.json
           if-no-files-found: ignore
+
+  robust:
+    # Layer 2: the customer's app is never hurt (stress/robust/RESULTS.md).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: Python
+        run: |
+          python -m pip install openai anthropic httpx pydantic
+          python stress/robust/python/run.py | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Node
+        if: always()
+        run: |
+          (cd node && npm ci --ignore-scripts && npm run build)
+          node stress/robust/node/run.mjs | tee -a "$GITHUB_STEP_SUMMARY"
+        env:
+          PYTHON: python

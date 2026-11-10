@@ -432,6 +432,38 @@ test('exit flush gives up after 2 s against a hung collector', async () => {
   } finally { hung.closeAllConnections?.(); hung.close(); }
 });
 
+test('flush(timeoutMs) returns false at the deadline against a hung collector', async () => {
+  // flush() used to wait for every queued batch, 15 s each, so a serverless handler hung for minutes.
+  const hung = http.createServer(() => {});
+  await new Promise(r => hung.listen(0, '127.0.0.1', r));
+  try {
+    const out = await child(`initialize({ apiKey: 'k', baseUrl: 'http://127.0.0.1:${hung.address().port}', instrumentModules: { openAI: OpenAI } });
+      for (let i = 0; i < 45; i++) ${callOnce}
+      const t = Date.now(); const ok = await flush(300); const waited = Date.now() - t;
+      if (ok !== false || waited > 1500) { console.error('flush', ok, waited); process.exit(5); }
+      process.exit(0);`);
+    assert.equal(out.code, 0, out.stderr);
+  } finally { hung.closeAllConnections?.(); hung.close(); }
+});
+
+test('an unreachable collector is tried once per pause, not once per queued batch', async () => {
+  // Each failed batch used to be followed by the next, 15 s apiece against a hung collector, so a finished
+  // script stayed alive for minutes. Now the sender stops at the first failure and keeps the rest queued.
+  let connections = 0;
+  const reset = http.createServer();
+  reset.on('connection', socket => { connections++; socket.destroy(); });
+  await new Promise(r => reset.listen(0, '127.0.0.1', r));
+  try {
+    const out = await child(`initialize({ apiKey: 'k', baseUrl: 'http://127.0.0.1:${reset.address().port}', instrumentModules: { openAI: OpenAI } });
+      for (let i = 0; i < 65; i++) ${callOnce}
+      await new Promise(r => setTimeout(r, 300));
+      if (await flush(1000) !== false) process.exit(6);
+      process.exit(0);`);
+    assert.equal(out.code, 0, out.stderr);
+    assert.ok(connections <= 2, `${connections} connections`);
+  } finally { reset.close(); }
+});
+
 test('wrap redact applies to that client only', async () => {
   const out = await child(`
     process.env.GENERALCONTEXT_API_KEY = 'k'; process.env.GENERALCONTEXT_BASE_URL = BASE + '/child/wrap';

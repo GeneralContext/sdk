@@ -320,6 +320,33 @@ class SdkTest(unittest.TestCase):
         calls = self.calls()
         self.assertEqual([c["request"]["messages"][0]["content"] for c in calls], ["small"])
 
+    def test_nan_and_infinity_in_a_request_never_poison_the_batch(self):
+        # The collector rejects NaN/Infinity (not JSON), which used to drop every call in the batch.
+        client = generalcontext.wrap(Client({}))
+        client.chat.completions.create(messages=[], temperature=float("nan"), extra_body={"x": float("-inf")})
+        client.chat.completions.create(messages=[{"role": "user", "content": "next"}])
+        self.assertTrue(generalcontext.flush(5))
+        raw = [body for path, _, body in Server.received if path.endswith("/sdk")]
+        json.dumps(raw, allow_nan=False)  # Raises if a NaN reached the wire.
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["request"]["temperature"], "nan")
+
+    def test_shared_and_circular_references_are_recorded_quickly(self):
+        # A dict that refers to itself twice used to take 2**40 steps on the caller's thread.
+        loop = {"name": "loop"}
+        loop["a"] = loop
+        loop["b"] = loop
+        client = generalcontext.wrap(Client({"ok": True}))
+        start = time.monotonic()
+        self.assertEqual(client.chat.completions.create(messages=[], extra_body=loop), {"ok": True})
+        self.assertLess(time.monotonic() - start, 1)
+        recorded = self.calls()[0]["request"]["extra_body"]
+        self.assertEqual((recorded["name"], recorded["a"], recorded["b"]), ("loop", "<circular>", "<circular>"))
+        shared = {"k": "v"}
+        client.chat.completions.create(messages=[shared, shared])
+        self.assertEqual(self.calls()[-1]["request"]["messages"], [{"k": "v"}, {"k": "v"}])
+
     def test_batches_split_by_bytes(self):
         client = generalcontext.wrap(Client({}))
         big = "y" * 1_500_000
