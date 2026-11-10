@@ -541,7 +541,9 @@ test('Anthropic beta toolRunner records each turn once', async () => {
 
 test('AnthropicBedrock and AnthropicVertex share the patched Messages class', { skip: (!anthropicBedrock || !anthropicVertex) && 'bedrock/vertex sdk not installed' }, () => {
   const b = new anthropicBedrock.AnthropicBedrock({ awsRegion: 'us-east-1', awsAccessKey: 'x', awsSecretKey: 'y' });
-  const v = new anthropicVertex.AnthropicVertex({ region: 'us-east5', projectId: 'p', accessToken: 't' });
+  // A stand-in auth client: without one the constructor looks up Google credentials in the background,
+  // which fails (after this test ends) on machines with none, such as CI.
+  const v = new anthropicVertex.AnthropicVertex({ region: 'us-east5', projectId: 'p', accessToken: 't', authClient: { getRequestHeaders: async () => ({}) } });
   assert.ok(b.messages.create[Symbol.for('generalcontext.recorded')]);
   assert.ok(v.messages.create[Symbol.for('generalcontext.recorded')]);
 });

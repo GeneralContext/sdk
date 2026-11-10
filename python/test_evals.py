@@ -171,7 +171,7 @@ class ClaudeCode(unittest.TestCase):
                 handle.write("#!/usr/bin/env python3\nimport json, os, sys\nsys.stdin.read()\n"
                              "print(json.dumps({'structured_output': {'text': 'key' if os.environ.get('ANTHROPIC_API_KEY') else 'no key',"
                              " 'tool_calls': [{'name': 'ledger__get', 'arguments': {'unit': '303'}}]}}))\n")
-            os.chmod(fake, 0o755)
+            os.chmod(fake, 0o700)
             with unittest.mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-test", "PATH": directory + os.pathsep + os.environ["PATH"]}):
                 reply = evals.model("claude-code:claude-haiku-5-5")("system", [{"role": "user", "content": "hi"}], evals.Toolbox(TASK).specs)
         self.assertEqual(reply["text"], "no key")

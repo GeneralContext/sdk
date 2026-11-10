@@ -10,6 +10,7 @@ Only local fake servers are contacted; no real model API, no real collector.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -48,7 +49,8 @@ def row(scenario, ok, numbers):
 
 
 def main():
-    portfile = tempfile.mktemp(suffix=".json")
+    portdir = tempfile.mkdtemp(prefix="gc-robust-")
+    portfile = os.path.join(portdir, "ports.json")
     fakes = subprocess.Popen([sys.executable, FAKES, portfile], stdin=subprocess.PIPE)
     try:
         for _ in range(100):
@@ -68,8 +70,7 @@ def main():
             fakes.wait(5)
         except subprocess.TimeoutExpired:
             fakes.kill()
-        if os.path.exists(portfile):
-            os.unlink(portfile)
+        shutil.rmtree(portdir, ignore_errors=True)
     print("\n| Scenario | Result | Numbers |\n|---|---|---|")
     for scenario, status, numbers in ROWS:
         print(f"| {scenario} | {status} | {numbers} |")

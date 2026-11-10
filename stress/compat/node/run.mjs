@@ -37,8 +37,10 @@ const MATRIX = {
 const key = v => v.split('.').map(Number);
 const cmp = (a, b) => { const x = key(a), y = key(b); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] - y[i]; return 0; };
 
-const SCRATCH = path.join(process.env.STRESS_SCRATCH || process.env.JCODE_SCRATCH_DIR || os.tmpdir(), 'gc-compat-node');
-fs.mkdirSync(SCRATCH, { recursive: true });
+// A chosen scratch root is used as is (CI and local runs reuse it); otherwise a private temp dir.
+const ROOT = process.env.STRESS_SCRATCH || process.env.JCODE_SCRATCH_DIR;
+const SCRATCH = ROOT ? path.join(ROOT, 'gc-compat-node') : fs.mkdtempSync(path.join(os.tmpdir(), 'gc-compat-node-'));
+fs.mkdirSync(SCRATCH, { recursive: true, mode: 0o700 });
 const NPM_ENV = { ...process.env, npm_config_cache: path.join(SCRATCH, 'npm-cache'), npm_config_audit: 'false', npm_config_fund: 'false', npm_config_update_notifier: 'false' };
 
 function fnmExec(node, cmd, cwd, timeout = 600_000) {
@@ -46,8 +48,10 @@ function fnmExec(node, cmd, cwd, timeout = 600_000) {
   return spawnSync(bin, rest, { cwd, env: NPM_ENV, encoding: 'utf8', timeout });
 }
 
-// Build and pack the SDK once.
-const pack = spawnSync('sh', ['-c', 'npm run build >/dev/null && npm pack --silent --pack-destination "$0"', SCRATCH], { cwd: path.join(REPO, 'node'), env: NPM_ENV, encoding: 'utf8' });
+// Build and pack the SDK once. No shell: the scratch path is an argument, never part of a command line.
+const build = spawnSync('npm', ['run', 'build'], { cwd: path.join(REPO, 'node'), env: NPM_ENV, encoding: 'utf8' });
+if (build.status) { console.error(build.stdout, build.stderr); process.exit(2); }
+const pack = spawnSync('npm', ['pack', '--silent', '--pack-destination', SCRATCH], { cwd: path.join(REPO, 'node'), env: NPM_ENV, encoding: 'utf8' });
 if (pack.status) { console.error(pack.stdout, pack.stderr); process.exit(2); }
 const TARBALL = path.join(SCRATCH, pack.stdout.trim().split('\n').pop());
 
