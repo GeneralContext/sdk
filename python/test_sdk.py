@@ -464,6 +464,28 @@ class SdkTest(unittest.TestCase):
         self.assertIsNone(call["response"])
         self.assertTrue(call["error"].startswith("BadRequestError"))
 
+    @unittest.skipUnless(HAS_OPENAI, "openai is not installed")
+    def test_with_raw_response_records_the_parsed_reply_not_the_wrapper(self):
+        # Regression: the APIResponse wrapper was recorded as its repr string.
+        raw = self.openai().chat.completions.with_raw_response.create(model="gpt-test", messages=[])
+        self.assertEqual(raw.status_code, 200)
+        self.assertIs(raw.parse(), raw.parse())
+        self.assertEqual(raw.parse().choices[0].message.content, "Unit 402 is open.")
+
+        async def run():
+            client = openai.AsyncOpenAI(api_key="sk-test", base_url=self.url + "/v1", max_retries=0)
+            raw = await client.chat.completions.with_raw_response.create(model="gpt-test", messages=[])
+            parsed = raw.parse()  # Sync on the legacy raw response, a coroutine on some versions.
+            return await parsed if asyncio.iscoroutine(parsed) else parsed
+        self.assertEqual(asyncio.run(run()).usage.total_tokens, 9)
+        with self.openai().chat.completions.with_streaming_response.create(model="gpt-test", messages=[]) as streaming:
+            self.assertEqual(streaming.parse().choices[0].message.content, "Unit 402 is open.")
+        sync, asynchronous, streaming_call = self.calls()
+        for call in (sync, asynchronous):
+            self.assertEqual(call["response"]["choices"][0]["message"]["content"], "Unit 402 is open.")
+            self.assertEqual(call["response"]["usage"]["total_tokens"], 9)
+        self.assertIsNone(streaming_call["response"])  # The body is the caller's to read.
+
     @unittest.skipUnless(HAS_ANTHROPIC, "anthropic is not installed")
     def test_anthropic_plain_streamed_and_stream_helper(self):
         import anthropic

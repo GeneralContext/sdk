@@ -470,6 +470,16 @@ def _recording(create, api, is_async, scrub=None):
                 raise
             finally:
                 _inside.reset(token)
+            if _is_raw_response(reply):
+                body = _raw_body(reply, kwargs)
+                if inspect.isawaitable(body):
+                    try:
+                        body = await body
+                    except Exception as error:
+                        _warn("raw", "General Context could not read a raw response: %s", error)
+                        body = None
+                _record(meta, body)
+                return reply
             if kwargs.get("stream") is True:
                 return _AsyncStream(reply, meta)
             _record(meta, reply)
@@ -490,12 +500,36 @@ def _recording(create, api, is_async, scrub=None):
                 raise
             finally:
                 _inside.reset(token)
+            if _is_raw_response(reply):
+                _record(meta, _raw_body(reply, kwargs))
+                return reply
             if kwargs.get("stream") is True:
                 return _SyncStream(reply, meta)
             _record(meta, reply)
             return reply
     wrapped._generalcontext = True
     return wrapped
+
+
+def _is_raw_response(reply):
+    """`with_raw_response` / `with_streaming_response` hand back a response wrapper, not the model."""
+    return hasattr(reply, "http_response") and callable(getattr(reply, "parse", None))
+
+
+def _raw_body(reply, kwargs):
+    """The parsed reply of a raw response, or None when reading it would change what the caller gets.
+
+    parse() caches its result, so the caller's own parse() returns the same object afterwards.
+    Streamed and `with_streaming_response` bodies are left unread.
+    """
+    try:
+        headers = kwargs.get("extra_headers") or {}
+        if kwargs.get("stream") is True or headers.get("X-Stainless-Raw-Response") == "stream":
+            return None
+        return reply.parse()  # A coroutine for async raw responses; the async wrapper awaits it.
+    except Exception as error:
+        _warn("raw", "General Context could not read a raw response: %s", error)
+        return None
 
 
 class _StreamBase:
