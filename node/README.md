@@ -112,7 +112,7 @@ await withSession({ sessionId: conversationId, userId: 'u_42', channel: 'chat' }
 Calls send in the background. Before a function or script exits:
 
 ```ts
-await flush(); // never throws
+await flush(); // waits up to 10 s (flush(ms) to change), resolves true when sent, never throws
 ```
 
 ## Outcomes and events

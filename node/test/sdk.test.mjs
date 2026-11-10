@@ -432,6 +432,20 @@ test('exit flush gives up after 2 s against a hung collector', async () => {
   } finally { hung.closeAllConnections?.(); hung.close(); }
 });
 
+test('flush(timeoutMs) returns false at the deadline against a hung collector', async () => {
+  // flush() used to wait for every queued batch, 15 s each, so a serverless handler hung for minutes.
+  const hung = http.createServer(() => {});
+  await new Promise(r => hung.listen(0, '127.0.0.1', r));
+  try {
+    const out = await child(`initialize({ apiKey: 'k', baseUrl: 'http://127.0.0.1:${hung.address().port}', instrumentModules: { openAI: OpenAI } });
+      for (let i = 0; i < 45; i++) ${callOnce}
+      const t = Date.now(); const ok = await flush(300); const waited = Date.now() - t;
+      if (ok !== false || waited > 1500) { console.error('flush', ok, waited); process.exit(5); }
+      process.exit(0);`);
+    assert.equal(out.code, 0, out.stderr);
+  } finally { hung.closeAllConnections?.(); hung.close(); }
+});
+
 test('wrap redact applies to that client only', async () => {
   const out = await child(`
     process.env.GENERALCONTEXT_API_KEY = 'k'; process.env.GENERALCONTEXT_BASE_URL = BASE + '/child/wrap';

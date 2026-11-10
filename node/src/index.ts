@@ -26,6 +26,7 @@ const MAX_BATCH_BYTES = 4_000_000;
 const SEND_TIMEOUT_MS = 15_000;
 const DIRECT_TIMEOUT_MS = 10_000; // reportOutcome and logEvent
 const EXIT_FLUSH_MS = 2_000;
+const FLUSH_TIMEOUT_MS = 10_000; // flush() default, like the Python SDK
 
 type Metadata = Record<string, string | number | boolean>;
 export type Session = { sessionId: string; userId?: string; channel?: string; product?: string; metadata?: Metadata };
@@ -334,10 +335,19 @@ function send(): Promise<void> {
   return sending;
 }
 
-/** Wait until recorded calls are sent. Call before a serverless function or script exits. Never throws. */
-export async function flush(): Promise<void> {
+/**
+ * Wait until recorded calls are sent, for at most `timeoutMs` (default 10 s). Call before a serverless
+ * function or script exits. Resolves true when the queue was sent, false at the deadline. Never throws.
+ * Sending continues in the background after the deadline.
+ */
+export async function flush(timeoutMs = FLUSH_TIMEOUT_MS): Promise<boolean> {
   if (timer) { clearTimeout(timer); timer = null; }
-  try { await send(); } catch { /* send already logs */ }
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const sent = send().then(() => true, () => true);
+    const late = new Promise<boolean>(resolve => { deadline = setTimeout(() => resolve(false), Math.max(0, timeoutMs)); deadline.unref?.(); });
+    return await Promise.race([sent, late]);
+  } catch { return false; } finally { clearTimeout(deadline); }
 }
 
 const scrubText = (value: string) => (config.scrub ? config.scrub(value) : value);
