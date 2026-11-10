@@ -4,34 +4,54 @@
 """Run an agent on RL and eval tasks built from its own production traffic.
 
     python -m generalcontext.evals benchmark.json --agent openai:gpt-6.1-terra --trials 3 --out runs
+    generalcontext evals check benchmark.json
 
-A task (format generalcontext.task/v1, exported from the platform's Tasks page) holds a real
-conversation, made anonymous: what the person wrote and knows, what the agent's tools returned,
-the policies, what the agent should have done, and a rubric. Three pieces turn it into an eval
-that runs anywhere, with no access to the customer's systems:
+A task (format generalcontext.task/v1, exported from the platform's Tasks page) has a small core:
+the `prompt` the agent is given, what the agent should do (`expected`), the policies, and an
+`origin`. A task from a `failure` catches a confirmed issue: the agent got it wrong. A task from a
+`success` keeps a good example right. Everything specific to one kind of agent lives in two
+parts, each with a `kind`: the `environment` the agent works in, and the `grader` that scores it.
 
-- **Replay world.** The agent gets the same tools. A call with the arguments production saw
-  returns what production returned. A call production never made is answered honestly as
-  unrecorded, and counted, so a run that strays far from the recording says so. Writes
-  (send, create, update, ...) are logged for the judge.
-- **Simulated person.** A model plays the person from the task's brief. It knows every fact in
-  the task, with an instruction to share `when_asked` facts only when the agent asks for them,
-  so the agent has to ask. With no brief, the person's recorded replies are replayed in order.
-- **Judge.** A model grades each rubric criterion against the transcript, the agent's writes and
-  the task's ground-truth facts and policies. The reward is the share of criteria met, from 0 to
-  1, and the task passes when every criterion does. `run_task` runs one episode, so the same
-  harness serves as an RL environment: train on the `train` split only.
+Built-in environment `replay`. The agent gets the same tools it had in production. A call with
+the arguments production saw returns what production returned. A call production never made is
+answered honestly as unrecorded, and counted, so a run that strays far from the recording says so.
+Writes (send, create, update, ...) are logged for the grader. A simulated person, played by a
+model from the task's brief, answers the agent. It knows every fact in the task, with an
+instruction to share `when_asked` facts only when the agent asks for them. With no brief, the
+person's recorded replies are replayed in order.
+
+Built-in grader `rubric`. A judge model grades each criterion against the transcript, the agent's
+writes and the task's ground-truth facts and policies. The reward is the share of criteria met,
+from 0 to 1, and the task passes when every criterion does.
+
+Any other kind is your own code, named on the command line and never in the file, so a downloaded
+task never names code to run. `--environment module:fn` is called as fn(task) and returns an
+environment with `.tools` (specs), `.call(name, arguments)`, `.start()` (the first message to the
+agent), `.respond(said)` returning (message, done), and optional `.state()` and `.close()`. An
+environment that is not a conversation can return done on the first respond and put the agent's
+`output` in its state. `--grader module:fn` is called as fn(task, episode), where episode is
+{transcript, tool_calls, output, state, error}, and returns {"reward": 0..1, "passed": bool,
+"criteria": [...], "note": "..."}. A task whose kind has no code given is skipped with a printed
+reason, never guessed.
+
+`run_task(task, agent, person, judge)` runs one episode, so the same harness serves as an RL
+environment: train on the `train` split only. `--task`, `--split` and `--origin` pick tasks.
+
+`evals check` grades each task's `reference` runs, the known runs stored with the task, before any
+agent runs. A failure's production run should score below 1 and a success's should pass. Any
+reference whose grade disagrees with its `expect` is reported and the command exits 1, so a
+grader is checked before a model is spent on it.
 
 The agent under test is either a reference agent (`openai:<model>`, `claude-code:<model>` through
 the local Claude Code CLI, or `anthropic:<model>` through the API, run on the instructions recorded
 from your agent) or your own function, `--agent module:fn`,
 called as `fn(messages, toolbox) -> str`: run your loop, call tools through `toolbox.call(name,
-arguments)`, return the final text. `toolbox.openai_tools()` and `toolbox.anthropic_tools()` give
-the tool definitions in each provider's format.
+arguments)`, return the final text. The toolbox is the environment. `toolbox.openai_tools()` and
+`toolbox.anthropic_tools()` give the tool definitions in each provider's format.
 
-Results are written as generalcontext.runs/v1, for the platform's "Import results". With
-`--upload` they are also sent to General Context with GENERALCONTEXT_API_KEY (and
-GENERALCONTEXT_BASE_URL, https only). `generalcontext-evals` is the same command.
+Results are written as generalcontext.runs/v1, each run with its task's origin, for the platform's
+"Import results". With `--upload` they are also sent to General Context with GENERALCONTEXT_API_KEY
+(and GENERALCONTEXT_BASE_URL, https only). `generalcontext-evals` is the same command.
 Standard library only; the `openai` or `anthropic` package is needed for the models you name.
 """
 

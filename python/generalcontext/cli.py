@@ -6,6 +6,7 @@
     generalcontext verify [--session ID] [--json]
     generalcontext benchmark pull [--out benchmark.json]
     generalcontext evals run BENCHMARK --agent ... [--upload]
+    generalcontext evals check BENCHMARK [--judge MODEL] [--grader module:function]
 
 Uses GENERALCONTEXT_API_KEY and GENERALCONTEXT_BASE_URL. Exit 0 on success, 1 on a failed check,
 2 on a usage or configuration error.
@@ -109,6 +110,9 @@ def main(argv=None):
     if argv[:2] == ["evals", "run"]:
         from . import evals
         return _exit_code(lambda: evals.main(argv[2:], prog="generalcontext evals run"))
+    if argv[:2] == ["evals", "check"]:
+        from . import evals
+        return _exit_code(lambda: evals.check_main(argv[2:], prog="generalcontext evals check"))
     parser = argparse.ArgumentParser(prog="generalcontext", description="General Context from the command line.")
     commands = parser.add_subparsers(dest="command", metavar="command")
     check = commands.add_parser("verify", help="check the key and that calls are arriving")
@@ -118,8 +122,8 @@ def main(argv=None):
     bench_commands = bench.add_subparsers(dest="action", metavar="action")
     pull = bench_commands.add_parser("pull", help="download the ready tasks")
     pull.add_argument("--out", default="benchmark.json")
-    run = commands.add_parser("evals", help="run the benchmark (generalcontext evals run --help)")
-    run.add_argument("action", choices=["run"])
+    run = commands.add_parser("evals", help="run the benchmark or check its graders (generalcontext evals run --help)")
+    run.add_argument("action", choices=["run", "check"])
     try:
         args = parser.parse_args(argv)
     except SystemExit as exit:

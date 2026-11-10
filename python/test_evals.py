@@ -3,6 +3,8 @@
     python -m unittest test_evals -v
 """
 
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -97,7 +99,8 @@ class Person(unittest.TestCase):
 
 
 class EndToEnd(unittest.TestCase):
-    def agent_model(self):
+    @staticmethod
+    def agent_model(self=None):
         # Turn 1: look up the ledger, then ask for the date. Turn 2: route a waiver and confirm by SMS.
         return scripted(
             {"text": "", "tool_calls": [{"id": "a", "name": "ledger__get", "arguments": {"unit": "303"}}]},
@@ -222,6 +225,245 @@ class Upload(unittest.TestCase):
 
     def test_console_script_entry_point_exists(self):
         self.assertTrue(callable(evals.cli))
+
+
+# The same task in the revised shape. TASK above stays in the older shape to prove both are read.
+NEW_TASK = {
+    "format": "generalcontext.task/v1", "id": "tst_2", "slug": "late-fee-new", "split": "held_out", "origin": "failure",
+    "tags": ["scope"], "prompt": TASK["scenario"]["opening"], "expected": TASK["expected"], "policies": TASK["policies"],
+    "agent": TASK["agent"],
+    "environment": {"kind": "replay", "channel": "sms", "context": TASK["scenario"]["context"],
+                    "person": TASK["scenario"]["requester"], "tools": TASK["world"]["tools"], "observations": TASK["world"]["observations"]},
+    "grader": {"kind": "rubric", **TASK["rubric"]},
+}
+CONTRACT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "contract")
+
+
+class Counter:
+    """A toy environment that is not a conversation: the agent increments a counter through a tool."""
+
+    def __init__(self, task):
+        self.count = task["environment"].get("start", 0)
+        self.tools = [{"name": "increment", "description": "Add one.", "parameters": {"type": "object", "properties": {}}}]
+        self.closed = False
+
+    def call(self, name, arguments):
+        if name != "increment":
+            raise KeyError(name)
+        self.count += 1
+        return {"count": self.count}
+
+    def start(self):
+        return "Increment the counter to 3."
+
+    def respond(self, said):
+        return None, True
+
+    def state(self):
+        return {"count": self.count}
+
+    def close(self):
+        self.closed = True
+
+
+def counter_check(task, episode):
+    target = task["grader"]["target"]
+    count = (episode.get("state") or {}).get("count")
+    if count is None:  # A reference run has no live state: count the increments it made.
+        count = sum(1 for call in episode["tool_calls"] if call["name"] == "increment")
+    return {"reward": 1.0 if count == target else 0.0, "passed": count == target, "note": f"count {count}"}
+
+
+def counting_agent(times):
+    def agent(messages, toolbox):
+        for _ in range(times):
+            toolbox.call("increment", {})
+        return "done"
+    return agent
+
+
+COUNTER_TASK = {"format": "generalcontext.task/v1", "id": "tst_c", "slug": "counter", "origin": "success", "split": "train",
+                "prompt": "Count to 3.", "environment": {"kind": "counter", "start": 0}, "grader": {"kind": "counter-check", "target": 3}}
+
+
+def all_pass_judge():
+    return lambda system, messages, tools: {"text": json.dumps({"criteria": [
+        {"id": item.split(":")[0].strip("- "), "passed": True, "reason": "ok"}
+        for item in messages[0]["content"].split("Criteria:\n")[1].splitlines()]}), "tool_calls": []}
+
+
+class TaskShape(unittest.TestCase):
+    def test_old_shape_maps_to_the_new_one(self):
+        view = evals._task_view(dict(TASK, set="fees", failure_modes=["scope"], status="requested"))
+        self.assertEqual(view["prompt"], "My late fee is wrong.")
+        self.assertEqual(view["environment"]["kind"], "replay")
+        self.assertEqual(view["environment"]["context"], TASK["scenario"]["context"])
+        self.assertEqual(view["environment"]["person"], TASK["scenario"]["requester"])
+        self.assertEqual(view["environment"]["observations"], TASK["world"]["observations"])
+        self.assertEqual(view["grader"], {"kind": "rubric", **TASK["rubric"]})
+        self.assertEqual(view["tags"], ["fees", "scope"])
+        self.assertEqual(view["status"], "building")
+        self.assertNotIn("scenario", view)
+
+    def test_new_shape_keeps_unknown_fields(self):
+        view = evals._task_view(COUNTER_TASK)
+        self.assertEqual(view["environment"], {"kind": "counter", "start": 0})
+        self.assertEqual(view["grader"]["target"], 3)
+
+    def test_contract_tasks_validate(self):
+        for name in ("task-replay.json", "task-custom.json"):
+            with open(os.path.join(CONTRACT, name)) as handle:
+                task = json.load(handle)
+            view = evals._task_view(task)
+            self.assertEqual(view["format"], evals.TASK_FORMAT)
+            self.assertIn(view["origin"], ("failure", "success"))
+            self.assertTrue(view["prompt"])
+            self.assertTrue(view["reference"])
+            self.assertIn(view["reference"][0]["expect"], ("pass", "fail"))
+
+
+class NewShape(unittest.TestCase):
+    def test_new_shape_replay_task_end_to_end(self):
+        person = scripted({"text": "", "tool_calls": [{"id": "1", "name": "reply", "arguments": {"message": "The 5th."}}]},
+                          {"text": "", "tool_calls": [{"id": "2", "name": "leave", "arguments": {"message": "Thanks."}}]})
+        judge = all_pass_judge()
+        result = evals.run_task(NEW_TASK, evals.reference_agent(EndToEnd.agent_model(None), NEW_TASK), person, judge)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["origin"], "failure")
+        self.assertEqual(result["fidelity"]["unrecorded_reads"], 0)
+        self.assertEqual(result["transcript"][0], {"from": "person", "text": "My late fee is wrong."})
+
+    def test_positional_signature_is_unchanged(self):
+        person = scripted({"text": "", "tool_calls": [{"id": "1", "name": "leave", "arguments": {"message": "bye"}}]})
+        result = evals.run_task(TASK, lambda messages, toolbox: "Hello", person, all_pass_judge(), 2)
+        self.assertTrue(result["passed"])
+        self.assertIsNone(result["origin"])
+        for key in ("passed", "reward", "criteria", "transcript", "tool_calls", "fidelity", "error", "origin"):
+            self.assertIn(key, result)
+
+    def test_custom_environment_and_grader(self):
+        envs = []
+
+        def make(task):
+            envs.append(Counter(task))
+            return envs[-1]
+        good = evals.run_task(COUNTER_TASK, counting_agent(3), None, None, environment=make, grader=counter_check)
+        self.assertTrue(good["passed"])
+        self.assertEqual(good["reward"], 1.0)
+        self.assertEqual(good["state"], {"count": 3})
+        self.assertIsNone(good["fidelity"])
+        self.assertEqual(good["origin"], "success")
+        self.assertEqual([c["name"] for c in good["tool_calls"]], ["increment"] * 3)
+        self.assertTrue(envs[-1].closed)
+        self.assertIn("count 3", evals.note(good))
+        bad = evals.run_task(COUNTER_TASK, counting_agent(2), None, None, environment=make, grader=counter_check)
+        self.assertFalse(bad["passed"])
+        self.assertEqual(bad["reward"], 0.0)
+
+    def test_custom_env_tools_offered_to_agents(self):
+        seen = {}
+
+        def agent(messages, toolbox):
+            seen["openai"] = toolbox.openai_tools()
+            seen["anthropic"] = toolbox.anthropic_tools()
+            seen["error"] = toolbox.call("missing", {})
+            return ""
+        evals.run_task(COUNTER_TASK, agent, None, None, environment=Counter, grader=counter_check)
+        self.assertEqual(seen["openai"][0]["function"]["name"], "increment")
+        self.assertEqual(seen["anthropic"][0]["name"], "increment")
+        self.assertIn("KeyError", seen["error"]["error"])
+
+    def test_a_kind_without_code_is_skipped(self):
+        with self.assertRaises(evals.SkipTask) as raised:
+            evals.run_task(COUNTER_TASK, counting_agent(3), None, None)
+        self.assertIn("'counter'", str(raised.exception))
+        with self.assertRaises(evals.SkipTask) as raised:
+            evals.run_task(COUNTER_TASK, counting_agent(3), None, None, environment=Counter)
+        self.assertIn("'counter-check'", str(raised.exception))
+
+    def test_cli_skips_unknown_kinds_and_filters_by_origin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "bench.json")
+            with open(path, "w") as handle:
+                json.dump({"format": evals.BENCHMARK_FORMAT, "tasks": [NEW_TASK, COUNTER_TASK]}, handle)
+            output = io.StringIO()
+            with unittest.mock.patch.object(evals, "model", lambda spec: all_pass_judge()), \
+                    contextlib.redirect_stdout(output):
+                evals.main([path, "--agent", "openai:a", "--out", directory])
+            with open(os.path.join(directory, "runs.json")) as handle:
+                runs = json.load(handle)["runs"]
+            self.assertIn("SKIP  counter  environment kind 'counter' needs --environment", output.getvalue())
+            self.assertEqual([(r["task"], r["origin"]) for r in runs], [("tst_2", "failure")])
+            with unittest.mock.patch.object(evals, "model", lambda spec: all_pass_judge()), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                evals.main([path, "--agent", "openai:a", "--out", directory, "--origin", "success"])
+            with open(os.path.join(directory, "runs.json")) as handle:
+                self.assertEqual(json.load(handle)["runs"], [])
+
+
+class Check(unittest.TestCase):
+    def write(self, directory, tasks):
+        path = os.path.join(directory, "bench.json")
+        with open(path, "w") as handle:
+            json.dump({"format": evals.BENCHMARK_FORMAT, "tasks": tasks}, handle)
+        return path
+
+    def test_check_agrees_with_a_custom_grader(self):
+        task = dict(COUNTER_TASK, reference=[
+            {"label": "good", "expect": "pass", "tool_calls": [{"name": "increment"}] * 3},
+            {"label": "short", "expect": "fail", "tool_calls": [{"name": "increment"}]}])
+        rows = evals.check([task], grader=counter_check)
+        self.assertEqual([row["agrees"] for row in rows], [True, True])
+        self.assertIn("SKIP", "SKIP" if evals.check([task])[0]["skipped"] else "")
+
+    def test_check_reports_a_failure_reference_the_judge_passes(self):
+        task = dict(NEW_TASK, reference=[{"label": "production", "expect": "fail", "transcript": [
+            {"from": "person", "text": "My late fee is wrong."}, {"from": "agent", "text": "Removed it."}], "tool_calls": []}])
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, [task])
+            output = io.StringIO()
+            with unittest.mock.patch.object(evals, "model", lambda spec: all_pass_judge()), contextlib.redirect_stdout(output):
+                self.assertEqual(evals.main(["check", path]), 1)
+            self.assertIn("DISAGREE", output.getvalue())
+            strict = scripted({"text": '{"criteria": [{"id": "asks-date", "passed": false, "reason": "no"}]}', "tool_calls": []})
+            with unittest.mock.patch.object(evals, "model", lambda spec: strict), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(evals.main(["check", path]), 0)
+
+    def test_cli_delegates_check(self):
+        from generalcontext import cli
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, [dict(COUNTER_TASK, reference=[{"expect": "pass", "tool_calls": [{"name": "increment"}] * 3}])])
+            with unittest.mock.patch.object(evals, "load_callable", lambda spec, what: counter_check), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main(["evals", "check", path, "--grader", "x:y"]), 0)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main(["evals", "check", path]), 0)  # skipped, not a disagreement
+
+
+class Contract(unittest.TestCase):
+    def test_contract_benchmark_runs_both_tasks(self):
+        tasks = evals.load_tasks(os.path.join(CONTRACT, "benchmark.json"))
+        with open(os.path.join(CONTRACT, "benchmark.json")) as handle:
+            summary = json.load(handle)["summary"]
+        self.assertEqual(set(summary), {"tasks", "by_origin", "by_split", "by_environment", "by_grader", "by_tag"})
+        self.assertEqual(summary["tasks"], len(tasks))
+        replay, custom = tasks
+        person = scripted({"text": "", "tool_calls": [{"id": "1", "name": "leave", "arguments": {"message": "Thanks."}}]})
+        result = evals.run_task(replay, lambda messages, toolbox: (toolbox.call("ledger__get", {"unit": "303"}), "When did you try to pay?")[1],
+                                person, all_pass_judge())
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["origin"], "failure")
+        self.assertEqual(result["fidelity"]["exact"], 1)
+        result = evals.run_task(custom, counting_agent(3), None, None, environment=Counter, grader=counter_check)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["origin"], "success")
+        self.assertEqual([row["agrees"] for row in evals.check([custom], grader=counter_check)], [True])
+
+    def test_contract_runs_carry_origin(self):
+        with open(os.path.join(CONTRACT, "runs.json")) as handle:
+            runs = json.load(handle)
+        self.assertEqual(runs["format"], evals.RUNS_FORMAT)
+        self.assertEqual({run["origin"] for run in runs["runs"]}, {"failure", "success"})
 
 
 if __name__ == "__main__":
