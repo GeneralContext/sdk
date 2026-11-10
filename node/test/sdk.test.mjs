@@ -6,6 +6,13 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
+import { AzureOpenAI } from 'openai';
+
+const optional = async name => { try { return await import(name); } catch { return null; } };
+const genai = await optional('@google/genai');
+const bedrock = await optional('@aws-sdk/client-bedrock-runtime');
+const anthropicBedrock = await optional('@anthropic-ai/bedrock-sdk');
+const anthropicVertex = await optional('@anthropic-ai/vertex-sdk');
 
 const childPosts = new Map(); // keyed by request path
 const collected = { calls: [], outcomes: [], events: [], batches: [] };
@@ -40,6 +47,51 @@ const anthropicSSE = [
   event({ type: 'message_stop' }),
 ];
 
+const responsesJSON = { id: 'r1', object: 'response', created_at: 1, model: 'gpt-x', status: 'completed', output: [{ type: 'message', id: 'msg1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '{"unit":"4B"}', annotations: [] }] }], usage: { input_tokens: 2, output_tokens: 3, total_tokens: 5 } };
+const responsesSSE = [
+  event({ type: 'response.created', sequence_number: 0, response: { ...responsesJSON, status: 'in_progress', output: [] } }),
+  event({ type: 'response.output_item.added', sequence_number: 1, output_index: 0, item: { type: 'message', id: 'msg1', role: 'assistant', status: 'in_progress', content: [] } }),
+  event({ type: 'response.content_part.added', sequence_number: 2, output_index: 0, item_id: 'msg1', content_index: 0, part: { type: 'output_text', text: '', annotations: [] } }),
+  event({ type: 'response.output_text.delta', sequence_number: 3, output_index: 0, item_id: 'msg1', content_index: 0, delta: '{"unit":"4B"}' }),
+  event({ type: 'response.output_text.done', sequence_number: 4, output_index: 0, item_id: 'msg1', content_index: 0, text: '{"unit":"4B"}' }),
+  event({ type: 'response.content_part.done', sequence_number: 5, output_index: 0, item_id: 'msg1', content_index: 0, part: { type: 'output_text', text: '{"unit":"4B"}', annotations: [] } }),
+  event({ type: 'response.output_item.done', sequence_number: 6, output_index: 0, item: responsesJSON.output[0] }),
+  event({ type: 'response.completed', sequence_number: 7, response: responsesJSON }),
+];
+const geminiJSON = { candidates: [{ content: { role: 'model', parts: [{ text: 'hello' }] }, finishReason: 'STOP', index: 0 }], usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 1, totalTokenCount: 5 }, modelVersion: 'gemini-x' };
+const geminiSSE = [
+  data({ candidates: [{ content: { role: 'model', parts: [{ text: 'Let me ' }] }, index: 0 }], modelVersion: 'gemini-x' }),
+  data({ candidates: [{ content: { role: 'model', parts: [{ text: 'check.' }] }, index: 0 }], modelVersion: 'gemini-x' }),
+  data({ candidates: [{ content: { role: 'model', parts: [{ functionCall: { name: 'get_unit', args: { unit: '4B' } } }] }, finishReason: 'STOP', index: 0 }], usageMetadata: { promptTokenCount: 6, candidatesTokenCount: 8, totalTokenCount: 14 }, modelVersion: 'gemini-x' }),
+];
+const converseJSON = { output: { message: { role: 'assistant', content: [{ text: 'hello' }] } }, stopReason: 'end_turn', usage: { inputTokens: 3, outputTokens: 1, totalTokens: 4 }, metrics: { latencyMs: 5 } };
+const converseEvents = [
+  ['messageStart', { role: 'assistant' }],
+  ['contentBlockDelta', { contentBlockIndex: 0, delta: { text: 'Checking' } }],
+  ['contentBlockStop', { contentBlockIndex: 0 }],
+  ['contentBlockStart', { contentBlockIndex: 1, start: { toolUse: { toolUseId: 'tu_1', name: 'get_unit' } } }],
+  ['contentBlockDelta', { contentBlockIndex: 1, delta: { toolUse: { input: '{"unit":' } } }],
+  ['contentBlockDelta', { contentBlockIndex: 1, delta: { toolUse: { input: '"4B"}' } } }],
+  ['contentBlockStop', { contentBlockIndex: 1 }],
+  ['messageStop', { stopReason: 'tool_use' }],
+  ['metadata', { usage: { inputTokens: 9, outputTokens: 11, totalTokens: 20 }, metrics: { latencyMs: 7 } }],
+];
+// AWS event stream framing: prelude (total, headers length, crc), headers, payload, message crc.
+const CRC = Array.from({ length: 256 }, (_, n) => { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
+const crc32 = buf => { let c = 0xffffffff; for (const b of buf) c = CRC[(c ^ b) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+function awsEvent(type, payload) {
+  const header = (name, value) => { const n = Buffer.from(name), v = Buffer.from(value); const h = Buffer.alloc(1 + n.length + 1 + 2 + v.length); h[0] = n.length; n.copy(h, 1); h[1 + n.length] = 7; h.writeUInt16BE(v.length, 2 + n.length); v.copy(h, 4 + n.length); return h; };
+  const headers = Buffer.concat([header(':event-type', type), header(':content-type', 'application/json'), header(':message-type', 'event')]);
+  const body = Buffer.from(JSON.stringify(payload));
+  const total = 12 + headers.length + body.length + 4;
+  const prelude = Buffer.alloc(8); prelude.writeUInt32BE(total, 0); prelude.writeUInt32BE(headers.length, 4);
+  const pc = Buffer.alloc(4); pc.writeUInt32BE(crc32(prelude), 0);
+  const msg = Buffer.concat([prelude, pc, headers, body]);
+  const mc = Buffer.alloc(4); mc.writeUInt32BE(crc32(msg), 0);
+  return Buffer.concat([msg, mc]);
+}
+const lastRequests = [];
+
 let server, base;
 before(async () => {
   server = http.createServer(async (req, res) => {
@@ -47,6 +99,7 @@ before(async () => {
     for await (const chunk of req) body += chunk;
     const json = body ? JSON.parse(body) : {};
     const reply = (status, obj) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
+    lastRequests.push({ url: req.url, body: json });
     if (req.url.startsWith('/child/')) {
       if (!childPosts.has(req.url)) childPosts.set(req.url, []);
       childPosts.get(req.url).push({ auth: req.headers.authorization, body: json });
@@ -55,11 +108,21 @@ before(async () => {
     if (req.url === '/api/platform-collect/sdk') { collected.batches.push(json); collected.calls.push(...json.calls); return reply(200, { ok: true }); }
     if (req.url === '/api/platform-collect/outcomes') { collected.outcomes.push({ auth: req.headers.authorization, ...json }); return reply(200, { ok: true }); }
     if (req.url === '/api/platform-collect/events') { collected.events.push(json); return reply(200, { ingested: 1, skipped: 0, failures: [] }); }
-    if (req.url.endsWith('/chat/completions')) {
+    if (req.url.split('?')[0].endsWith('/chat/completions')) {
       if (json.model === 'bad') return reply(400, { error: { message: 'bad model' } });
       return json.stream ? sse(res, chatSSE) : reply(200, chatJSON);
     }
-    if (req.url.endsWith('/messages')) return json.stream ? sse(res, anthropicSSE) : reply(200, anthropicJSON);
+    if (req.url.endsWith('/responses')) return json.stream ? sse(res, responsesSSE) : reply(200, responsesJSON);
+    if (req.url.includes(':generateContent')) return json.contents?.[0]?.parts?.[0]?.text === 'bad' ? reply(400, { error: { code: 400, message: 'bad request', status: 'INVALID_ARGUMENT' } }) : reply(200, geminiJSON);
+    if (req.url.includes(':streamGenerateContent')) return sse(res, geminiSSE);
+    if (req.url.endsWith('/converse')) return reply(200, converseJSON);
+    if (req.url.endsWith('/converse-stream')) {
+      res.writeHead(200, { 'content-type': 'application/vnd.amazon.eventstream' });
+      for (const [type, payload] of converseEvents) res.write(awsEvent(type, payload));
+      return res.end();
+    }
+    if (req.url.endsWith('/invoke')) return reply(200, { ok: 1 });
+    if (req.url.endsWith('/messages') || req.url.includes('/messages?')) return json.stream ? sse(res, anthropicSSE) : reply(200, anthropicJSON);
     reply(404, {});
   });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
@@ -82,7 +145,7 @@ test('initialize patches instances created before and after', async () => {
   early.openai = openai();
   early.anthropic = anthropic();
   process.env.GENERALCONTEXT_REDACT_SALT = 'salt';
-  sdk.initialize({ apiKey: 'gc_key', baseUrl: base, appName: 'test-app', redact: true, instrumentFetch: true, instrumentModules: { openAI: OpenAI, anthropic: Anthropic } });
+  sdk.initialize({ apiKey: 'gc_key', baseUrl: base, appName: 'test-app', redact: true, instrumentFetch: true, instrumentModules: { openAI: OpenAI, anthropic: Anthropic, googleGenAI: genai ?? undefined, bedrockRuntime: bedrock ?? undefined } });
   const warnings = [];
   const warn = console.warn; console.warn = m => warnings.push(m);
   sdk.initialize({ apiKey: 'other' });
@@ -378,4 +441,168 @@ test('wrap redact applies to that client only', async () => {
     await new Promise(r => setTimeout(r, 30)); await flush();`, { GENERALCONTEXT_REDACT_SALT: 's' });
   assert.equal(out.code, 0, out.stderr);
   assert.deepEqual(recorded('wrap').map(c => c.request.messages[0].content.startsWith('<email:')), [true, false]);
+});
+
+// ---- 0.3.0 coverage ----
+
+test('Anthropic beta messages: create, parse, stream and threads record each call once', async () => {
+  const client = anthropic();
+  await client.beta.messages.create({ model: 'claude-x', max_tokens: 5, messages: [{ role: 'user', content: 'a' }] });
+  await client.beta.messages.parse({ model: 'claude-x', max_tokens: 5, messages: [{ role: 'user', content: 'b' }] });
+  const final = await client.beta.messages.stream({ model: 'claude-x', max_tokens: 5, messages: [{ role: 'user', content: 'c' }] }).finalMessage();
+  assert.deepEqual(final.content[1].input, { unit: '4B' });
+  const calls = await drain();
+  assert.deepEqual(calls.map(c => c.api), ['anthropic', 'anthropic', 'anthropic']);
+  assert.deepEqual(calls.map(c => c.request.messages[0].content), ['a', 'b', 'c']);
+  assert.equal(calls[0].response.content[0].text, 'hello');
+  assert.deepEqual(calls[2].response.content[1].input, { unit: '4B' });
+});
+
+test('Anthropic beta toolRunner records each turn once', async () => {
+  const client = anthropic();
+  const runner = client.beta.messages.toolRunner({ model: 'claude-x', max_tokens: 5, max_iterations: 1, messages: [{ role: 'user', content: 'go' }], tools: [] , thread: false });
+  let turns = 0;
+  for await (const _ of runner) turns++;
+  const calls = await drain();
+  assert.ok(turns >= 1);
+  assert.equal(calls.length, turns);
+  assert.ok(calls.every(c => c.api === 'anthropic'));
+});
+
+test('AnthropicBedrock and AnthropicVertex share the patched Messages class', { skip: (!anthropicBedrock || !anthropicVertex) && 'bedrock/vertex sdk not installed' }, () => {
+  const b = new anthropicBedrock.AnthropicBedrock({ awsRegion: 'us-east-1', awsAccessKey: 'x', awsSecretKey: 'y' });
+  const v = new anthropicVertex.AnthropicVertex({ region: 'us-east5', projectId: 'p', accessToken: 't' });
+  assert.ok(b.messages.create[Symbol.for('generalcontext.recorded')]);
+  assert.ok(v.messages.create[Symbol.for('generalcontext.recorded')]);
+});
+
+test('OpenAI chat.completions.parse and stream record once', async () => {
+  const client = openai();
+  const parsed = await client.chat.completions.parse({ model: 'gpt-x', messages: [{ role: 'user', content: 'p' }] });
+  assert.equal(parsed.choices[0].message.content, 'hi');
+  const stream = client.chat.completions.stream({ model: 'gpt-x', messages: [{ role: 'user', content: 's' }] });
+  for await (const _ of stream) { /* drain */ }
+  await stream.finalChatCompletion();
+  const calls = await drain();
+  assert.deepEqual(calls.map(c => [c.api, c.request.messages[0].content]), [['openai-chat', 'p'], ['openai-chat', 's']]);
+  assert.equal(calls[1].response.choices[0].message.content, 'Let me check.');
+});
+
+test('OpenAI responses.create, parse and stream record once each', async () => {
+  const client = openai();
+  await client.responses.create({ model: 'gpt-x', input: 'c' });
+  const parsed = await client.responses.parse({ model: 'gpt-x', input: 'p' });
+  assert.equal(parsed.output_text, '{"unit":"4B"}');
+  const stream = client.responses.stream({ model: 'gpt-x', input: 's' });
+  for await (const _ of stream) { /* drain */ }
+  await stream.finalResponse();
+  const calls = await drain();
+  assert.deepEqual(calls.map(c => [c.api, c.request.input]), [['openai-responses', 'c'], ['openai-responses', 'p'], ['openai-responses', 's']]);
+  assert.equal(calls[2].response.id, 'r1');
+});
+
+test('AzureOpenAI clients are recorded', async () => {
+  const az = new AzureOpenAI({ apiKey: 'k', endpoint: base, apiVersion: '2024-10-21', deployment: 'dep', maxRetries: 0 });
+  const out = await az.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'azure' }] });
+  assert.equal(out.choices[0].message.content, 'hi');
+  const calls = await drain();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].api, 'openai-chat');
+  assert.ok(lastRequests.some(r => r.url.startsWith('/openai/deployments/dep/chat/completions')));
+});
+
+const gemini = () => new genai.GoogleGenAI({ apiKey: 'k', httpOptions: { baseUrl: base } });
+
+test('Gemini generateContent records request and plain response', { skip: !genai && '@google/genai not installed' }, async () => {
+  const config = { systemInstruction: 'be brief', tools: [{ functionDeclarations: [{ name: 'get_unit', description: 'd', parameters: { type: 'OBJECT', properties: {} } }] }] };
+  const res = await gemini().models.generateContent({ model: 'gemini-x', contents: 'hello there', config });
+  assert.equal(res.text, 'hello');
+  const [call] = await drain();
+  assert.equal(call.api, 'gemini');
+  assert.deepEqual(call.request, { model: 'gemini-x', contents: 'hello there', config });
+  assert.equal(call.response.candidates[0].content.parts[0].text, 'hello');
+  assert.equal(call.response.usageMetadata.promptTokenCount, 4);
+  assert.equal(call.response.modelVersion, 'gemini-x');
+  assert.equal(call.response.sdkHttpResponse, undefined);
+});
+
+test('Gemini errors are recorded and rethrown', { skip: !genai && '@google/genai not installed' }, async () => {
+  await assert.rejects(gemini().models.generateContent({ model: 'gemini-x', contents: [{ role: 'user', parts: [{ text: 'bad' }] }] }));
+  const [call] = await drain();
+  assert.equal(call.response, null);
+  assert.match(call.error, /bad request|400/);
+});
+
+test('Gemini generateContentStream passes chunks through and records one assembled response', { skip: !genai && '@google/genai not installed' }, async () => {
+  const stream = await gemini().models.generateContentStream({ model: 'gemini-x', contents: 'go' });
+  const texts = [];
+  for await (const chunk of stream) texts.push(chunk.text ?? null);
+  assert.equal(texts.length, 3);
+  const calls = await drain();
+  assert.equal(calls.length, 1);
+  const r = calls[0].response;
+  assert.deepEqual(r.candidates[0].content.parts, [{ text: 'Let me check.' }, { functionCall: { name: 'get_unit', args: { unit: '4B' } } }]);
+  assert.equal(r.candidates[0].finishReason, 'STOP');
+  assert.equal(r.usageMetadata.candidatesTokenCount, 8);
+});
+
+const { NodeHttpHandler } = await optional('@smithy/node-http-handler') ?? {};
+const bedrockClient = () => new bedrock.BedrockRuntimeClient({ region: 'us-east-1', endpoint: base, requestHandler: new NodeHttpHandler(), credentials: { accessKeyId: 'AKIDFAKE', secretAccessKey: 'fake' }, maxAttempts: 1 });
+
+test('Bedrock Converse records input with bytes omitted and output without $metadata', { skip: !bedrock && '@aws-sdk/client-bedrock-runtime not installed' }, async () => {
+  const input = { modelId: 'anthropic.claude-x', system: [{ text: 'be brief' }], messages: [{ role: 'user', content: [{ text: 'hi' }, { image: { format: 'png', source: { bytes: new Uint8Array([1, 2, 3]) } } }] }], inferenceConfig: { maxTokens: 5 } };
+  const out = await bedrockClient().send(new bedrock.ConverseCommand(input));
+  assert.equal(out.output.message.content[0].text, 'hello');
+  assert.ok(out.$metadata);
+  const [call] = await drain();
+  assert.equal(call.api, 'bedrock-converse');
+  assert.deepEqual(call.request.messages[0].content[1].image.source.bytes, { omitted: 'bytes' });
+  assert.equal(call.request.modelId, 'anthropic.claude-x');
+  assert.equal(call.response.$metadata, undefined);
+  assert.equal(call.response.stopReason, 'end_turn');
+  assert.equal(call.response.usage.inputTokens, 3);
+});
+
+test('Bedrock ConverseStream passes events through and records one assembled response', { skip: !bedrock && '@aws-sdk/client-bedrock-runtime not installed' }, async () => {
+  const out = await bedrockClient().send(new bedrock.ConverseStreamCommand({ modelId: 'm', messages: [{ role: 'user', content: [{ text: 'go' }] }] }));
+  const seen = [];
+  for await (const e of out.stream) seen.push(Object.keys(e)[0]);
+  assert.deepEqual(seen, converseEvents.map(([t]) => t));
+  const calls = await drain();
+  assert.equal(calls.length, 1);
+  const r = calls[0].response;
+  assert.deepEqual(r.output.message, { role: 'assistant', content: [{ text: 'Checking' }, { toolUse: { toolUseId: 'tu_1', name: 'get_unit', input: { unit: '4B' } } }] });
+  assert.equal(r.stopReason, 'tool_use');
+  assert.equal(r.usage.outputTokens, 11);
+});
+
+test('Bedrock InvokeModel and other commands are not recorded', { skip: !bedrock && '@aws-sdk/client-bedrock-runtime not installed' }, async () => {
+  await bedrockClient().send(new bedrock.InvokeModelCommand({ modelId: 'm', body: new TextEncoder().encode('{}'), contentType: 'application/json' }));
+  assert.equal((await drain()).length, 0);
+});
+
+test('wrap supports Gemini and Bedrock clients', { skip: (!genai || !bedrock) && 'optional SDKs not installed' }, async () => {
+  const out = await child(`
+    process.env.GENERALCONTEXT_API_KEY = 'k'; process.env.GENERALCONTEXT_BASE_URL = BASE + '/child/wrap2';
+    const { GoogleGenAI } = await import('@google/genai');
+    const br = await import('@aws-sdk/client-bedrock-runtime');
+    const g = wrap(new GoogleGenAI({ apiKey: 'k', httpOptions: { baseUrl: BASE } }));
+    await g.models.generateContent({ model: 'gemini-x', contents: 'hi' });
+    const b = wrap(new br.BedrockRuntimeClient({ region: 'us-east-1', endpoint: BASE, requestHandler: new (await import('@smithy/node-http-handler')).NodeHttpHandler(), credentials: { accessKeyId: 'a', secretAccessKey: 'b' } }));
+    await b.send(new br.ConverseCommand({ modelId: 'm', messages: [{ role: 'user', content: [{ text: 'x' }] }] }));
+    await new Promise(r => setTimeout(r, 30)); await flush();`);
+  assert.equal(out.code, 0, out.stderr);
+  assert.deepEqual(recorded('wrap2').map(c => c.api), ['gemini', 'bedrock-converse']);
+});
+
+test('autoload finds @google/genai and the Bedrock runtime', { skip: (!genai || !bedrock) && 'optional SDKs not installed' }, async () => {
+  const out = await child(`
+    initialize({ apiKey: 'k', baseUrl: BASE + '/child/auto' });
+    const { GoogleGenAI } = await import('@google/genai');
+    const br = await import('@aws-sdk/client-bedrock-runtime');
+    await new GoogleGenAI({ apiKey: 'k', httpOptions: { baseUrl: BASE } }).models.generateContent({ model: 'gemini-x', contents: 'hi' });
+    await new br.BedrockRuntimeClient({ region: 'us-east-1', endpoint: BASE, requestHandler: new (await import('@smithy/node-http-handler')).NodeHttpHandler(), credentials: { accessKeyId: 'a', secretAccessKey: 'b' } }).send(new br.ConverseCommand({ modelId: 'm', messages: [] }));
+    await new Promise(r => setTimeout(r, 30)); await flush();`);
+  assert.equal(out.code, 0, out.stderr);
+  assert.deepEqual(recorded('auto').map(c => c.api), ['gemini', 'bedrock-converse']);
 });

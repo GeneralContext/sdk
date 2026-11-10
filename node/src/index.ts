@@ -30,7 +30,7 @@ const EXIT_FLUSH_MS = 2_000;
 type Metadata = Record<string, string | number | boolean>;
 export type Session = { sessionId: string; userId?: string; channel?: string; product?: string; metadata?: Metadata };
 type Tags = { id: string; user_id?: string; channel?: string; product?: string; metadata?: Metadata };
-type Api = 'openai-chat' | 'openai-responses' | 'anthropic';
+type Api = 'openai-chat' | 'openai-responses' | 'anthropic' | 'gemini' | 'bedrock-converse';
 export type Call = {
   api: Api; conversation: Tags | null; task: string | null; request: unknown; response: unknown;
   started_at: string; ended_at: string; error: string | null;
@@ -50,13 +50,18 @@ export type InitializeOptions = {
   redact?: boolean | Scrub;
   /** Runs at send time on each call, before redaction. Return the call to send, or null to drop it. */
   beforeSend?: BeforeSend;
-  /** SDK classes or modules to patch, e.g. { openAI: OpenAI, anthropic: Anthropic }. */
-  instrumentModules?: { openAI?: unknown; anthropic?: unknown };
+  /**
+   * SDK classes or modules to patch, e.g. { openAI: OpenAI, anthropic: Anthropic }. Also accepts
+   * googleGenAI (the '@google/genai' module) and bedrockRuntime (the '@aws-sdk/client-bedrock-runtime' module).
+   */
+  instrumentModules?: Modules;
   /** Also record raw fetch POSTs to any URL ending /chat/completions. Default false. */
   instrumentFetch?: boolean;
   /** Send each call right away instead of batching. */
   disableBatch?: boolean;
 };
+
+type Modules = { openAI?: unknown; anthropic?: unknown; googleGenAI?: unknown; bedrockRuntime?: unknown };
 
 const DEFAULT_BASE_URL = 'https://generalcontextlabs.com';
 const config = {
@@ -118,16 +123,26 @@ export function initialize(options: InitializeOptions = {}): void {
   if (!secureUrl(baseUrl())) warn(`baseUrl ${baseUrl()} is not https; nothing will be sent`);
 
   const modules = options.instrumentModules ?? autoload();
+  // @google/genai ships separate CommonJS and ES module builds with their own classes. require() above found the
+  // CommonJS one, so also patch the ES module build. Starting the import here means it settles before the app's own.
+  if (!options.instrumentModules && modules.googleGenAI) {
+    import('@google/genai' as string).then(patchGemini, () => {});
+  }
   if (modules.openAI) patchOpenAI(modules.openAI);
   if (modules.anthropic) patchAnthropic(modules.anthropic);
+  if (modules.googleGenAI) patchGemini(modules.googleGenAI);
+  if (modules.bedrockRuntime) patchBedrock(modules.bedrockRuntime);
   if (options.instrumentFetch ?? false) patchFetch();
 }
 
 // Load installed SDKs when the caller did not pass them. Bundlers can hide these; pass instrumentModules there.
-function autoload(): { openAI?: unknown; anthropic?: unknown } {
+function autoload(): Modules {
   const require = createRequire(import.meta.url);
   const load = (name: string) => { try { return require(name); } catch { return undefined; } };
-  return { openAI: load('openai'), anthropic: load('@anthropic-ai/sdk') };
+  return {
+    openAI: load('openai'), anthropic: load('@anthropic-ai/sdk'),
+    googleGenAI: load('@google/genai'), bedrockRuntime: load('@aws-sdk/client-bedrock-runtime'),
+  };
 }
 
 // Accept a module namespace, its default export, or the client class itself.
@@ -147,6 +162,42 @@ function patchAnthropic(value: unknown) {
   const Anthropic = clientClass(value, 'Anthropic');
   // messages.stream() calls messages.create({ stream: true }) internally, so it is covered too.
   patchMethod(Anthropic?.Messages?.prototype, 'create', 'anthropic');
+  // client.beta.messages: create, parse, stream, toolRunner and threads all post through beta.messages.create.
+  patchMethod(Anthropic?.Beta?.Messages?.prototype, 'create', 'anthropic');
+}
+
+const exported = (value: unknown, name: string): any => {
+  const v = value as any;
+  return v?.[name] ?? v?.default?.[name] ?? (typeof v === 'function' && v.name === name ? v : undefined);
+};
+
+// @google/genai assigns generateContent and generateContentStream as instance properties in the Models
+// constructor. A setter on the prototype sees that assignment and stores the recording version instead.
+function patchGemini(value: unknown) {
+  const proto = exported(value, 'Models')?.prototype;
+  if (!proto) return;
+  const wrappers: Record<string, (fn: any) => any> = {
+    generateContent: fn => recording(fn, 'gemini'),
+    generateContentStream: fn => geminiStreamRecording(fn),
+  };
+  for (const [name, wrapFn] of Object.entries(wrappers)) {
+    const existing = Object.getOwnPropertyDescriptor(proto, name);
+    if (existing?.set && (existing.set as any)[MARK]) continue;
+    if (typeof existing?.value === 'function') { patchMethod(proto, name, 'gemini'); continue; }
+    const set = function (this: object, fn: unknown) {
+      const v = typeof fn === 'function' && !(fn as any)[MARK] ? wrapFn(fn) : fn;
+      Object.defineProperty(this, name, { value: v, writable: true, configurable: true, enumerable: true });
+    };
+    (set as any)[MARK] = true;
+    Object.defineProperty(proto, name, { get: () => undefined, set, configurable: true });
+  }
+}
+
+function patchBedrock(value: unknown) {
+  const proto = exported(value, 'BedrockRuntimeClient')?.prototype;
+  const original = proto?.send;
+  if (typeof original !== 'function' || original[MARK]) return;
+  proto.send = bedrockRecording(original);
 }
 
 const MARK = Symbol.for('generalcontext.recorded');
@@ -310,10 +361,11 @@ export async function logEvent(event: AppEvent): Promise<boolean> {
     if (!apiKey()) { warnLimited('no-key', 'GENERALCONTEXT_API_KEY is not set; event not logged'); return false; }
     await flush();
     const timestamp = event.timestamp instanceof Date ? event.timestamp.toISOString() : event.timestamp ?? new Date().toISOString();
+    const sessionId = scrubText(String(event.sessionId));
     const properties = Object.fromEntries(Object.entries(event.properties ?? {}).map(([k, v]) => [k, typeof v === 'string' ? scrubText(v) : v]));
     const body = { events: [{
       event_id: event.eventId ?? randomUUID(), event_type: scrubText(event.eventType), timestamp,
-      session_id: scrubText(String(event.sessionId)), properties,
+      session_id: sessionId, properties,
     }] };
     const response = await post('/api/platform-collect/events', JSON.stringify(body), DIRECT_TIMEOUT_MS);
     return Boolean(response?.ok);
@@ -329,8 +381,40 @@ function recording(create: (...args: unknown[]) => unknown, api: Api, scrub?: Sc
     // Mark the call so the fetch patch does not record it a second time.
     const reply = scope.run({ ...at, inSdkCall: true }, () => create.apply(this, args));
     if (!reply || typeof (reply as { then?: unknown }).then !== 'function') return reply;
+    // The SDKs' APIPromise reads the body inside parseResponse. Helpers such as parse() build a new promise that
+    // calls it again, so keep the first result: the body is read once and both sides get the same object.
+    const api_ = reply as { parseResponse?: (...a: any[]) => any; _thenUnwrap?: (t: (...a: any[]) => any) => any };
+    if (typeof api_.parseResponse === 'function') {
+      try {
+        const parseOnce = api_.parseResponse;
+        const seen = new WeakMap<object, unknown>();
+        const parse = function (this: unknown, ...a: unknown[]) {
+          const key = a[1];
+          if (!key || typeof key !== 'object') return parseOnce.apply(this, a);
+          if (!seen.has(key)) seen.set(key, parseOnce.apply(this, a));
+          return seen.get(key);
+        };
+        api_.parseResponse = parse;
+        const thenUnwrap = api_._thenUnwrap;
+        if (typeof thenUnwrap === 'function') {
+          api_._thenUnwrap = function (this: unknown, transform) {
+            const next = thenUnwrap.call(this, transform);
+            if (next && typeof next.parseResponse === 'function') {
+              next.parseResponse = async (client: unknown, props: any) => {
+                const parsed = await parse.call(reply, client, props);
+                const out = transform(parsed, props);
+                const id = (parsed as any)?._request_id;
+                if (id && out && typeof out === 'object' && !('_request_id' in out)) Object.defineProperty(out, '_request_id', { value: id, enumerable: false });
+                return out;
+              };
+            }
+            return next;
+          };
+        }
+      } catch { /* leave the SDK promise as it was */ }
+    }
     (reply as Promise<unknown>).then(response => {
-      const done = (result: unknown) => record({ api, request, response: result, started_at: started, ended_at: new Date().toISOString(), error: null }, at, scrub);
+      const done = (result: unknown) => record({ api, request, response: api === 'gemini' ? plainGemini(result) : result, started_at: started, ended_at: new Date().toISOString(), error: null }, at, scrub);
       if (request?.stream && isStream(response)) observeStream(response, api, done);
       else done(response);
     }, error => {
@@ -466,6 +550,156 @@ function assembleSSE(text: string): unknown {
   return assemble.result();
 }
 
+// generateContentStream resolves to an async generator. Hand the caller a generator that yields the same chunks.
+function geminiStreamRecording(create: (...args: unknown[]) => unknown, scrub?: Scrub | null) {
+  const wrapped = function (this: unknown, ...args: unknown[]): unknown {
+    const started = new Date().toISOString();
+    const at = scope.getStore();
+    const request = args[0];
+    const reply = scope.run({ ...at, inSdkCall: true }, () => create.apply(this, args));
+    if (!reply || typeof (reply as Promise<unknown>).then !== 'function') return reply;
+    const fail = (error: unknown) => record({ api: 'gemini', request, response: null, started_at: started, ended_at: new Date().toISOString(), error: String((error as Error)?.message ?? error) }, at, scrub);
+    return (reply as Promise<AsyncIterable<unknown>>).then(source => {
+      if (!source || typeof (source as any)[Symbol.asyncIterator] !== 'function') return source;
+      return (async function* () {
+        const assemble = geminiAssembler();
+        let finished = false;
+        try {
+          for await (const chunk of source) {
+            try { assemble.add(chunk); } catch { /* never break the caller's stream */ }
+            yield chunk;
+          }
+          finished = true;
+        } catch (error) { fail(error); throw error; } finally {
+          if (finished) record({ api: 'gemini', request, response: assemble.result(), started_at: started, ended_at: new Date().toISOString(), error: null }, at, scrub);
+        }
+      })();
+    }, error => { fail(error); throw error; });
+  };
+  (wrapped as any)[MARK] = true;
+  return wrapped;
+}
+
+// The response as plain JSON, without the raw HTTP headers the SDK attaches.
+function plainGemini(response: unknown): unknown {
+  if (!response || typeof response !== 'object') return response;
+  const { sdkHttpResponse, ...rest } = response as Record<string, unknown>;
+  return rest;
+}
+
+function geminiAssembler(): Assembler {
+  const out: any = { candidates: [] };
+  const parts: any[] = [];
+  let candidate: any = null;
+  return {
+    add(chunk) {
+      const c = plainGemini(chunk) as any;
+      if (c.usageMetadata) out.usageMetadata = c.usageMetadata;
+      if (c.modelVersion) out.modelVersion = c.modelVersion;
+      if (c.responseId) out.responseId = c.responseId;
+      const first = c.candidates?.[0];
+      if (!first) return;
+      candidate ??= { content: { role: 'model', parts } };
+      if (first.content?.role) candidate.content.role = first.content.role;
+      if (first.finishReason) candidate.finishReason = first.finishReason;
+      for (const part of first.content?.parts ?? []) {
+        const last = parts[parts.length - 1];
+        if (typeof part.text === 'string' && last && typeof last.text === 'string' && Boolean(last.thought) === Boolean(part.thought) && Object.keys(part).every(k => k === 'text' || k === 'thought')) last.text += part.text;
+        else parts.push({ ...part });
+      }
+    },
+    result: () => ({ ...out, candidates: candidate ? [candidate] : [] }),
+  };
+}
+
+// Images and documents arrive as bytes. Send a marker in their place, never the bytes.
+function omitBytes(value: unknown, depth = 0): unknown {
+  if (value instanceof Uint8Array || value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return { omitted: 'bytes' };
+  if (depth > 32 || value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(item => omitBytes(item, depth + 1));
+  return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, omitBytes(v, depth + 1)]));
+}
+
+const CONVERSE = new Set(['ConverseCommand', 'ConverseStreamCommand']);
+
+function bedrockRecording(send: (...args: unknown[]) => unknown, scrub?: Scrub | null) {
+  const wrapped = function (this: unknown, ...args: unknown[]): unknown {
+    const command = args[0] as { input?: any; constructor?: { name?: string } } | undefined;
+    const name = command?.constructor?.name ?? '';
+    const input = command?.input;
+    // By class name, or by input shape when a bundler renamed the classes. InvokeModel has a body, not messages.
+    const converse = CONVERSE.has(name) || (typeof input?.modelId === 'string' && Array.isArray(input?.messages) && !('body' in input));
+    if (!converse) return send.apply(this, args);
+    const started = new Date().toISOString();
+    const at = scope.getStore();
+    let request: unknown = null;
+    try { request = omitBytes(command?.input); } catch { /* record without the request */ }
+    const reply = scope.run({ ...at, inSdkCall: true }, () => send.apply(this, args));
+    if (!reply || typeof (reply as Promise<unknown>).then !== 'function') return reply;
+    const done = (response: unknown, error: string | null) => record({ api: 'bedrock-converse', request, response, started_at: started, ended_at: new Date().toISOString(), error }, at, scrub);
+    (reply as Promise<any>).then(output => {
+      try {
+        const { $metadata, ...rest } = output ?? {};
+        const stream = rest.stream;
+        if (stream && typeof stream[Symbol.asyncIterator] === 'function') {
+          output.stream = (async function* () {
+            const assemble = converseAssembler();
+            let finished = false;
+            try {
+              for await (const event of stream) {
+                try { assemble.add(event); } catch { /* never break the caller's stream */ }
+                yield event;
+              }
+              finished = true;
+            } catch (error) { done(null, String((error as Error)?.message ?? error)); throw error; } finally {
+              if (finished) done(assemble.result(), null);
+            }
+          })();
+        } else done(omitBytes(rest), null);
+      } catch (error) { warnLimited('record', `could not record a model call: ${(error as Error).message}`); }
+    }, error => done(null, String((error as Error)?.message ?? error)));
+    return reply;
+  };
+  (wrapped as any)[MARK] = true;
+  return wrapped;
+}
+
+function converseAssembler(): Assembler {
+  const content: any[] = [];
+  const json: string[] = [];
+  const out: any = { output: { message: { role: 'assistant', content } }, stopReason: null };
+  return {
+    add(event) {
+      if (event.messageStart?.role) out.output.message.role = event.messageStart.role;
+      const start = event.contentBlockStart;
+      if (start) {
+        const tool = start.start?.toolUse;
+        content[start.contentBlockIndex ?? content.length] = tool ? { toolUse: { toolUseId: tool.toolUseId, name: tool.name, input: {} } } : {};
+      }
+      const delta = event.contentBlockDelta;
+      if (delta) {
+        const i = delta.contentBlockIndex ?? 0, d = delta.delta ?? {};
+        const block = content[i] ??= {};
+        if (typeof d.text === 'string') block.text = (block.text ?? '') + d.text;
+        if (d.toolUse) { block.toolUse ??= { input: {} }; json[i] = (json[i] ?? '') + (d.toolUse.input ?? ''); }
+        if (d.reasoningContent) {
+          const r = block.reasoningContent ??= { reasoningText: { text: '' } };
+          if (d.reasoningContent.text) r.reasoningText.text += d.reasoningContent.text;
+          if (d.reasoningContent.signature) r.reasoningText.signature = d.reasoningContent.signature;
+        }
+      }
+      const stop = event.contentBlockStop;
+      if (stop && json[stop.contentBlockIndex] && content[stop.contentBlockIndex]?.toolUse) {
+        try { content[stop.contentBlockIndex].toolUse.input = JSON.parse(json[stop.contentBlockIndex]); } catch { content[stop.contentBlockIndex].toolUse.input = json[stop.contentBlockIndex]; }
+      }
+      if (event.messageStop) out.stopReason = event.messageStop.stopReason ?? null;
+      if (event.metadata?.usage) out.usage = event.metadata.usage;
+      if (event.metadata?.metrics) out.metrics = event.metadata.metrics;
+    },
+    result: () => ({ ...out, output: { message: { ...out.output.message, content: content.filter(Boolean) } } }),
+  };
+}
+
 const PATTERNS: [string, RegExp][] = [
   // Bounded repeats and a token-start lookbehind keep this linear on adversarial input.
   ['email', /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}/g],
@@ -510,9 +744,16 @@ export function wrap<C extends object>(client: C, options: { redact?: boolean | 
   if (target.chat?.completions?.create) owners.push([target.chat.completions, 'openai-chat']);
   if (target.responses?.create) owners.push([target.responses, 'openai-responses']);
   if (!target.chat && target.messages?.create) owners.push([target.messages, 'anthropic']);
-  if (!owners.length) throw new TypeError('wrap expects an OpenAI or Anthropic client');
+  if (!target.chat && target.beta?.messages?.create) owners.push([target.beta.messages, 'anthropic']);
+  const models = target.models;
+  const gemini = typeof models?.generateContent === 'function';
+  const bedrock = typeof target.send === 'function' && target.config && !gemini && !owners.length;
+  if (!owners.length && !gemini && !bedrock) throw new TypeError('wrap expects an OpenAI, Anthropic, Google Gen AI or Bedrock Runtime client');
   for (const [owner, api] of owners) {
     if (!owner.create[MARK]) owner.create = recording(owner.create.bind(owner), api, scrub);
   }
+  if (gemini && !models.generateContent[MARK]) models.generateContent = recording(models.generateContent.bind(models), 'gemini', scrub);
+  if (gemini && typeof models.generateContentStream === 'function' && !models.generateContentStream[MARK]) models.generateContentStream = geminiStreamRecording(models.generateContentStream.bind(models), scrub);
+  if (bedrock && !target.send[MARK]) target.send = bedrockRecording(target.send.bind(target), scrub);
   return client;
 }

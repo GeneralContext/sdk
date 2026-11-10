@@ -1,15 +1,31 @@
 {
   "name": "generalcontext",
   "version": "0.2.0",
-  "description": "Record your agent's OpenAI and Anthropic calls for General Context review and testing.",
+  "description": "Record your agent's model calls (OpenAI, Azure OpenAI, Anthropic, Google Gemini, AWS Bedrock) for General Context review and testing.",
   "license": "Apache-2.0",
   "author": "General Context Labs <research@generalcontextlabs.com>",
   "homepage": "https://generalcontextlabs.com/docs/sdk",
   "bugs": "https://github.com/GeneralContext/sdk/issues",
-  "keywords": ["llm", "agents", "observability", "evaluation", "openai", "anthropic", "opentelemetry"],
+  "keywords": [
+    "llm",
+    "agents",
+    "observability",
+    "evaluation",
+    "openai",
+    "azure-openai",
+    "anthropic",
+    "gemini",
+    "google-genai",
+    "bedrock",
+    "aws-bedrock",
+    "opentelemetry"
+  ],
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "generalcontext": "dist/cli.js"
+  },
   "files": [
     "dist",
     "LICENSE",
@@ -27,7 +43,12 @@
     "access": "public"
   },
   "devDependencies": {
+    "@anthropic-ai/bedrock-sdk": "^1.1.1",
     "@anthropic-ai/sdk": "^1.6.0",
+    "@anthropic-ai/vertex-sdk": "^1.1.2",
+    "@aws-sdk/client-bedrock-runtime": "^3.1165.0",
+    "@google/genai": "^3.0.0",
+    "@smithy/node-http-handler": "^4.14.2",
     "@types/node": "^22.20.5",
     "openai": "^7.53.0",
     "typescript": "^5.9.3"
