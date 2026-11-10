@@ -445,6 +445,27 @@ test('wrap redact applies to that client only', async () => {
 
 // ---- 0.3.0 coverage ----
 
+test('streams without an iterator field (openai before 4.15) are recorded assembled, chunks unchanged', async () => {
+  // Regression: only Stream#iterator was observed, so these streams were recorded as {} with no reply.
+  class LegacyStream {
+    constructor(chunks) { this.chunks = chunks; this.controller = new AbortController(); }
+    async *[Symbol.asyncIterator]() { for (const c of this.chunks) yield c; }
+  }
+  const chunks = chatSSE.filter(e => !e.includes('[DONE]')).map(e => JSON.parse(e.slice(6)));
+  const client = { chat: { completions: { create: async () => new LegacyStream(chunks) } } };
+  sdk.wrap(client);
+  const stream = await sdk.withSession('legacy', () => client.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'old' }], stream: true }));
+  assert.ok(stream instanceof LegacyStream);
+  const seen = [];
+  for await (const chunk of stream) seen.push(chunk);
+  assert.deepEqual(seen, chunks);
+  const [call] = await drain();
+  assert.equal(call.conversation.id, 'legacy');
+  assert.equal(call.response.choices[0].message.content, 'Let me check.');
+  assert.equal(call.response.choices[0].message.tool_calls[0].function.arguments, '{"unit":"4B"}');
+  assert.equal(call.response.usage.total_tokens, 12);
+});
+
 test('Anthropic beta messages: create, parse, stream and threads record each call once', async () => {
   const client = anthropic();
   await client.beta.messages.create({ model: 'claude-x', max_tokens: 5, messages: [{ role: 'user', content: 'a' }] });

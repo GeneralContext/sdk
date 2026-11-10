@@ -415,7 +415,7 @@ function recording(create: (...args: unknown[]) => unknown, api: Api, scrub?: Sc
     }
     (reply as Promise<unknown>).then(response => {
       const done = (result: unknown) => record({ api, request, response: api === 'gemini' ? plainGemini(result) : result, started_at: started, ended_at: new Date().toISOString(), error: null }, at, scrub);
-      if (request?.stream && isStream(response)) observeStream(response, api, done);
+      if (request?.stream && (isStream(response) || isLegacyStream(response))) observeStream(response, api, done);
       else done(response);
     }, error => {
       record({ api, request, response: null, started_at: started, ended_at: new Date().toISOString(), error: String((error as Error)?.message ?? error) }, at, scrub);
@@ -427,13 +427,18 @@ function recording(create: (...args: unknown[]) => unknown, api: Api, scrub?: Sc
 }
 
 type SdkStream = { iterator: () => AsyncIterator<unknown> };
+type LegacyStream = { [Symbol.asyncIterator]: () => AsyncIterator<unknown> };
 const isStream = (value: unknown): value is SdkStream => typeof (value as SdkStream)?.iterator === 'function';
+// openai before 4.15 has no `iterator` field: the Stream class only defines [Symbol.asyncIterator].
+const isLegacyStream = (value: unknown): value is LegacyStream =>
+  !!value && typeof value === 'object' && typeof (value as LegacyStream)[Symbol.asyncIterator] === 'function';
 
 // Both SDKs' Stream classes read chunks through `this.iterator`, including tee() and toReadableStream().
 // Replacing it keeps the object, its type and its methods, and lets us see each chunk once.
-function observeStream(stream: SdkStream, api: Api, done: (response: unknown) => void) {
-  const source = stream.iterator.bind(stream);
-  stream.iterator = async function* () {
+function observeStream(stream: SdkStream | LegacyStream, api: Api, done: (response: unknown) => void) {
+  const legacy = !isStream(stream);
+  const source = legacy ? (stream as LegacyStream)[Symbol.asyncIterator].bind(stream) : (stream as SdkStream).iterator.bind(stream);
+  const observed = async function* () {
     const assemble = api === 'anthropic' ? anthropicAssembler() : openAIAssembler();
     let finished = false;
     try {
@@ -446,6 +451,9 @@ function observeStream(stream: SdkStream, api: Api, done: (response: unknown) =>
       if (finished) done(assemble.result());
     }
   };
+  // An own property shadows the class method on this instance only.
+  if (legacy) Object.defineProperty(stream, Symbol.asyncIterator, { value: observed, writable: true, configurable: true });
+  else (stream as SdkStream).iterator = observed;
 }
 
 type Assembler = { add: (chunk: any) => void; result: () => unknown };
