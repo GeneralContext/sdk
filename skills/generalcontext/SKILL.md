@@ -11,7 +11,7 @@ description: Connect an AI agent to General Context: install the generalcontext 
 > mkdir -p .claude/skills/generalcontext && curl -fsSL https://generalcontextlabs.com/docs/agents.md -o .claude/skills/generalcontext/SKILL.md
 > ```
 
-General Context turns an AI agent's production workflows into RL and eval tasks. The SDK records every OpenAI (including Azure), Anthropic (including Bedrock, Vertex and beta clients), Google Gemini and AWS Bedrock Converse model call your process makes (the request, the reply, tool calls and results, timing, usage) and sends it in the background; General Context rebuilds each **conversation** from those calls. General Context reads conversations against the company's policies, repeated failures become **issues**, and each confirmed issue becomes a **task** built from the conversation: an environment that answers with what the agent's tools returned, a simulated person and a grader. The tasks together are the company's benchmark. Recording quality directly determines task quality: a tool result the agent never passed back to a model is not recorded, and a conversation split across ids, or missing the calls a worker made, cannot be judged or rebuilt.
+General Context turns an AI agent's production workflows into RL and eval tasks. The SDK records every OpenAI (including Azure), Anthropic (including Bedrock, Vertex and beta clients), Google Gemini and AWS Bedrock Converse model call your process makes (the request, the reply, tool calls and results, timing, usage) and sends it in the background; General Context rebuilds each **conversation** from those calls. General Context reads conversations against the company's policies, repeated failures become **issues**, and each confirmed issue becomes a **task** built from the conversation, as can a conversation the agent handled well. A task has an environment and a grader: by default, an environment that answers with what the agent's tools returned plus a simulated person, and a rubric grader. The tasks together are the company's benchmark. Recording quality directly determines task quality: a tool result the agent never passed back to a model is not recorded, and a conversation split across ids, or missing the calls a worker made, cannot be judged or rebuilt.
 
 ## Prerequisites
 
@@ -31,7 +31,7 @@ npm install generalcontext
 
 Three rules make recording reliable:
 
-1. **`initialize()` once per process, before the agent makes model calls.** It patches the client classes, so clients created before it are recorded too, but calls made before it are not.
+1. **`initialize()` once per process, before the agent makes model calls.** It patches the client classes, so clients created before it are recorded too, but calls made before it are not. Without `instrumentModules`, it finds `openai` and `@anthropic-ai/sdk` itself, both their CommonJS and ES module builds; the ES module ones load a moment later, so `await ready()` after `initialize()` when the first model call can come right away.
 2. **Bundled apps (Next.js, esbuild, webpack, Vite SSR) must pass the client classes via `instrumentModules`.** A bundler can inline its own copy of `openai` that the auto-detection never sees; calls then vanish with no warning. In Next.js, initialize from `instrumentation.ts` and keep the SDKs external so every route shares the copy that was patched: `serverExternalPackages: ["openai", "@anthropic-ai/sdk", "generalcontext"]` in `next.config` (Next 15+).
 3. **The Edge runtime is not supported.** Any route that makes model calls needs `export const runtime = "nodejs"`.
 
@@ -167,6 +167,8 @@ Without `--session` it shows the workspace, what the key can do, and when traffi
 ## Run the benchmark in CI
 
 Once the workspace has ready tasks, CI can run them with a key that can run the benchmark (on **API keys**, check **Run the benchmark**; send-only keys get `403`): `generalcontext benchmark pull --out benchmark.json`, then `generalcontext evals run benchmark.json --agent my_agent:handle --trials 3 --upload`. `--upload` sends the `generalcontext.runs/v1` results to your workspace, so each agent's scores show on **Tasks**.
+
+Each task names an environment kind and a grader kind. `replay` and `rubric` are built in. A task of another kind (for example a coding or game-building agent's own workspace and play check) runs only with the company's code named on the command line: `--environment module:function` and `--grader module:function`; such a task is skipped with the reason otherwise. Before spending on a model, `generalcontext evals check benchmark.json` grades each task's reference runs (the production run, which must fail a task built from a failure and pass one built from a success) and exits 1 if a grader disagrees.
 
 ## Common issues
 
