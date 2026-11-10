@@ -315,10 +315,83 @@ class SdkTest(unittest.TestCase):
 
     def test_oversized_call_is_dropped(self):
         client = generalcontext.wrap(Client({}))
-        client.chat.completions.create(messages=[{"role": "user", "content": "x" * (generalcontext.MAX_CALL_BYTES + 1)}])
+        # Many strings under the clipping threshold, so compaction cannot bring the call under the limit.
+        client.chat.completions.create(messages=[{"role": "user", "content": "x" * 150_000}] * 30)
         client.chat.completions.create(messages=[{"role": "user", "content": "small"}])
         calls = self.calls()
         self.assertEqual([c["request"]["messages"][0]["content"] for c in calls], ["small"])
+
+    def test_long_text_is_clipped_and_inline_binary_omitted_without_touching_the_request(self):
+        import base64
+        data = base64.b64encode(b"\x07" * 450_000).decode()
+        request = {"messages": [
+            {"role": "user", "content": "s" * 4_100_000},
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": data}},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + data}},
+                {"type": "input_audio", "input_audio": {"format": "wav", "data": data}}]}]}
+        before = json.loads(json.dumps(request))
+        client = generalcontext.wrap(Client({"output": [{"type": "image_generation_call", "id": "ig", "result": data}]}))
+        client.chat.completions.create(**request)
+        self.assertEqual(request, before)
+        [call] = self.calls()
+        text, parts = call["request"]["messages"]
+        self.assertEqual(len(text["content"]), 120_000 + len("\n[... clipped 3980000 characters ...]\n"))
+        self.assertIn("\n[... clipped 3980000 characters ...]\n", text["content"])
+        image, url, audio = parts["content"]
+        self.assertEqual(image["source"]["media_type"], "image/jpeg")
+        self.assertRegex(image["source"]["data"], r"^\[omitted 600000 bytes sha256:[0-9a-f]{12}\]$")
+        self.assertRegex(url["image_url"]["url"], r"^data:image/png;base64,\[omitted 600000 bytes sha256:[0-9a-f]{12}\]$")
+        self.assertRegex(audio["input_audio"]["data"], r"^\[omitted 600000 bytes")
+        self.assertRegex(call["response"]["output"][0]["result"], r"^\[omitted 600000 bytes")
+        gemini = generalcontext.compact_for_recording({"inline_data": {"mime_type": "image/png", "data": data}})
+        self.assertEqual(gemini["inline_data"]["mime_type"], "image/png")
+        self.assertTrue(gemini["inline_data"]["data"].startswith("[omitted"))
+        self.assertEqual(generalcontext.compact_for_recording({"id": "call_1", "name": "run"}), {"id": "call_1", "name": "run"})
+
+    @unittest.skipUnless(HAS_OPENAI, "openai is not installed")
+    def test_a_growing_responses_agent_loop_records_every_call_under_the_limit(self):
+        import base64
+        client = self.openai()
+        image = lambda n: "data:image/png;base64," + base64.b64encode(b"\x01" * n).decode()
+        history = [{"role": "user", "content": [
+            {"type": "input_text", "text": "src " * 375_000},
+            {"type": "input_image", "image_url": image(450_000)},
+            {"type": "input_image", "image_url": image(450_003)}]}]
+        for turn in range(20):
+            request = {"model": "gpt-test", "input": json.loads(json.dumps(history)), "stream": True, "store": False}
+            before = json.loads(json.dumps(request))
+            for _ in client.responses.create(**request):
+                pass
+            self.assertEqual(request, before)
+            history += [{"type": "function_call", "call_id": f"c{turn}", "name": "run", "arguments": "{}"},
+                        {"type": "function_call_output", "call_id": f"c{turn}", "output": "ok"},
+                        {"role": "user", "content": [{"type": "input_image", "image_url": image(300_000 + turn)}]}]
+        calls = self.calls()
+        self.assertEqual(len(calls), 20)
+        for turn, call in enumerate(calls):
+            self.assertLess(len(json.dumps(call)), generalcontext.MAX_CALL_BYTES)
+            text, a, b = call["request"]["input"][0]["content"]
+            self.assertIn("\n[... clipped 1380000 characters ...]\n", text["text"])
+            self.assertRegex(a["image_url"], r"^data:image/png;base64,\[omitted 600000 bytes sha256:[0-9a-f]{12}\]$")
+            self.assertRegex(b["image_url"], r"^data:image/png;base64,\[omitted 600004 bytes")
+            self.assertEqual(len(call["request"]["input"]), 1 + 3 * turn)
+            self.assertIsNotNone(call["response"])
+
+    @unittest.skipUnless(HAS_ANTHROPIC, "anthropic is not installed")
+    def test_anthropic_base64_image_block_is_recorded_as_a_placeholder(self):
+        import anthropic, base64
+        data = base64.b64encode(b"\x02" * 300_000).decode()
+        messages = [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
+            {"type": "text", "text": "what?"}]}]
+        anthropic.Anthropic(api_key="sk-test", base_url=self.url, max_retries=0).messages.create(
+            model="claude-test", max_tokens=5, messages=messages)
+        self.assertEqual(messages[0]["content"][0]["source"]["data"], data)
+        [call] = self.calls()
+        source = call["request"]["messages"][0]["content"][0]["source"]
+        self.assertEqual(source["media_type"], "image/png")
+        self.assertRegex(source["data"], r"^\[omitted 400000 bytes sha256:[0-9a-f]{12}\]$")
 
     def test_nan_and_infinity_in_a_request_never_poison_the_batch(self):
         # The collector rejects NaN/Infinity (not JSON), which used to drop every call in the batch.
@@ -349,9 +422,9 @@ class SdkTest(unittest.TestCase):
 
     def test_batches_split_by_bytes(self):
         client = generalcontext.wrap(Client({}))
-        big = "y" * 1_500_000
+        big = [{"role": "user", "content": "y" * 150_000}] * 10
         for _ in range(4):
-            client.chat.completions.create(messages=[{"role": "user", "content": big}])
+            client.chat.completions.create(messages=big)
         self.assertEqual(len(self.calls()), 4)
         batches = [body for path, _, body in Server.received if path.endswith("/sdk")]
         self.assertGreaterEqual(len(batches), 2)

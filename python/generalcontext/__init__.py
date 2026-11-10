@@ -429,13 +429,65 @@ def log_event(session_id, event_type, properties=None, event_id=None, timestamp=
     return _send_after_flush("/api/platform-collect/events", {"events": [event]}, "event")
 
 
+CLIP_OVER = 200_000   # Strings longer than this many characters are clipped.
+CLIP_HEAD = 100_000
+CLIP_TAIL = 20_000
+_BINARY_MIN = 256     # Shorter base64 payloads are left alone.
+_BASE64 = re.compile(r"[A-Za-z0-9+/_-]+={0,2}")
+_DATA_URL = re.compile(r"data:[^,;]*(?:;[^,;]*)*;base64,")
+_BINARY_KEYS = ("data", "result", "b64_json")
+
+
+def _omitted(payload):
+    digest = hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+    return f"[omitted {len(payload)} bytes sha256:{digest}]"
+
+
+def compact_for_recording(value, key=None, depth=0):
+    """The copy of a call that is recorded. Never changes `value` or what the caller sends to the provider.
+
+    Agents resend the whole run on every call, so without this, later calls pass the per-call
+    limit and are lost.
+
+    - Inline binary becomes a placeholder that keeps the shape: a base64 data URL keeps its prefix
+      (`data:image/png;base64,[omitted N bytes sha256:ab12cd34ef56]`), and a base64 `data`, `result`
+      or `b64_json` field (Anthropic `source.data`, Gemini `inline_data.data`, OpenAI `input_audio.data`,
+      Responses `image_generation_call.result`) becomes `[omitted N bytes sha256:...]`. N is the length
+      of the base64 text and the hash is the first 12 hex digits of the sha256 of that text, so the same
+      image gets the same placeholder in every call. Media types stay. Binary is never recorded: it does
+      not help review and it is a privacy risk.
+    - Any string over 200,000 characters keeps its first 100,000 and last 20,000 characters around
+      `\\n[... clipped N characters ...]\\n`.
+
+    Runs before before_send and redaction. A call still over the limit afterwards is dropped.
+    """
+    if isinstance(value, str):
+        if len(value) > _BINARY_MIN:
+            url = _DATA_URL.match(value[:512])
+            if url:
+                return value[:url.end()] + _omitted(value[url.end():])
+            if key in _BINARY_KEYS and _BASE64.fullmatch(value):
+                return _omitted(value)
+        if len(value) > CLIP_OVER:
+            clipped = len(value) - CLIP_HEAD - CLIP_TAIL
+            return f"{value[:CLIP_HEAD]}\n[... clipped {clipped} characters ...]\n{value[-CLIP_TAIL:]}"
+        return value
+    if depth > 64:
+        return value
+    if isinstance(value, dict):
+        return {k: compact_for_recording(v, k, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [compact_for_recording(item, None, depth + 1) for item in value]
+    return value
+
+
 def _record(meta, response=None, error=None):
     """Snapshot and enqueue one finished call. Never raises."""
     try:
         call = dict(meta["call"], response=_plain(response) if response is not None else None,
                     ended_at=_now(), error=f"{type(error).__name__}: {error}" if error is not None
 else None)
-        _sender.put(call, meta["scrub"])
+        _sender.put(compact_for_recording(call), meta["scrub"])
     except Exception as failure:
         log.warning("General Context could not record a model call: %s", failure)
 
