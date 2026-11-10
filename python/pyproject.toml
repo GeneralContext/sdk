@@ -8,7 +8,7 @@ dependencies = []
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "General Context Labs", email = "research@generalcontextlabs.com" }]
-keywords = ["llm", "agents", "observability", "evaluation", "openai", "anthropic", "opentelemetry"]
+keywords = ["llm", "agents", "evals", "evaluation", "benchmark", "reinforcement-learning", "openai", "anthropic", "gemini", "bedrock", "opentelemetry"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
@@ -16,7 +16,7 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Topic :: Software Development :: Libraries",
-  "Topic :: System :: Monitoring",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
 [project.scripts]
@@ -24,7 +24,7 @@ generalcontext = "generalcontext.cli:console"
 generalcontext-evals = "generalcontext.evals:cli"
 
 [project.urls]
-Homepage = "https://generalcontextlabs.com/platform"
+Homepage = "https://generalcontextlabs.com/docs"
 Documentation = "https://generalcontextlabs.com/docs/sdk"
 Source = "https://github.com/GeneralContext/sdk/tree/main/python"
 Issues = "https://github.com/GeneralContext/sdk/issues"

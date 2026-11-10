@@ -9,8 +9,10 @@
   "keywords": [
     "llm",
     "agents",
-    "observability",
+    "evals",
     "evaluation",
+    "benchmark",
+    "reinforcement-learning",
     "openai",
     "azure-openai",
     "anthropic",
