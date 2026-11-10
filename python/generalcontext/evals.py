@@ -1,11 +1,11 @@
 # Copyright 2026 General Context Labs, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run an agent against tasks built from its own production traffic.
+"""Run an agent on RL and eval tasks built from its own production traffic.
 
     python -m generalcontext.evals benchmark.json --agent openai:gpt-6.1-terra --trials 3 --out runs
 
-A task (format generalcontext.task/v1, exported from the platform's Tests page) holds a real
+A task (format generalcontext.task/v1, exported from the platform's Tasks page) holds a real
 conversation, made anonymous: what the person wrote and knows, what the agent's tools returned,
 the policies, what the agent should have done, and a rubric. Three pieces turn it into an eval
 that runs anywhere, with no copy of your systems to build:
@@ -18,7 +18,9 @@ that runs anywhere, with no copy of your systems to build:
   the task, with an instruction to share `when_asked` facts only when the agent asks for them,
   so the agent has to ask. With no brief, the person's recorded replies are replayed in order.
 - **Judge.** A model grades each rubric criterion against the transcript, the agent's writes and
-  the task's ground-truth facts and policies. The task passes when every criterion does.
+  the task's ground-truth facts and policies. The reward is the share of criteria met, from 0 to
+  1, and the task passes when every criterion does. `run_task` runs one episode, so the same
+  harness serves as an RL environment: train on the `train` split only.
 
 The agent under test is either a reference agent (`openai:<model>`, `claude-code:<model>` through
 the local Claude Code CLI, or `anthropic:<model>` through the API, run on the instructions recorded
@@ -531,7 +533,7 @@ def load_tasks(path):
 
 
 def main(argv=None, prog="python -m generalcontext.evals"):
-    parser = argparse.ArgumentParser(prog=prog, description="Run an agent against tasks built from production traffic.")
+    parser = argparse.ArgumentParser(prog=prog, description="Run an agent on RL and eval tasks built from production traffic.")
     parser.add_argument("benchmark", help="a generalcontext.benchmark/v1 or task/v1 file")
     parser.add_argument("--agent", action="append", required=True, help="openai:<model>, claude-code:<model>, anthropic:<model>, or module:function (repeatable)")
     parser.add_argument("--person", default="openai:gpt-6.1-terra@none", help="model that plays the person")
@@ -570,7 +572,7 @@ def main(argv=None, prog="python -m generalcontext.evals"):
         mine = [run for run in runs if run["agent"] == agent_spec]
         print(f"{agent_spec}: {sum(run['passed'] for run in mine)}/{len(mine)} passed")
     if not args.upload:
-        print(f"Wrote {out / 'runs.json'}: import it on the platform's Tests page, or rerun with --upload.")
+        print(f"Wrote {out / 'runs.json'}: import it on the platform's Tasks page, or rerun with --upload.")
         return 0
     try:
         result = upload({"format": RUNS_FORMAT, "runs": runs})

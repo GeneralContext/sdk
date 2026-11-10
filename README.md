@@ -1,7 +1,7 @@
 # General Context SDK
 
-Record your AI agent's model calls so [General Context](https://generalcontextlabs.com/platform)
-can review its real conversations and turn the failures into tests it has to pass.
+Record your AI agent's model calls so [General Context](https://generalcontextlabs.com/docs)
+can turn its real conversations into RL and eval tasks, and those tasks into its benchmark.
 
 One call at startup records every OpenAI and Anthropic call in the process, streamed or not.
 Recording happens in the background: your agent never waits on us, and a failure on our side is

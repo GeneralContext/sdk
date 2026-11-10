@@ -1,7 +1,7 @@
 [project]
 name = "generalcontext"
 version = "0.2.0"
-description = "Record your agent's OpenAI and Anthropic calls for General Context review and testing."
+description = "Record your agent's model calls so General Context can turn them into RL and eval tasks, and run your benchmark."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []

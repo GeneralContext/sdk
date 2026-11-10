@@ -98,9 +98,9 @@ Tests: `cd python && python -m unittest test_sdk test_evals -v`.
 
 ## Run your benchmark
 
-Tasks built from your traffic run anywhere, with no copy of your systems: each carries what your
-tools returned in production, and the harness replays it. A model plays the person, and a judge
-grades the task's rubric.
+Tasks built from your traffic run anywhere, with no access to your systems: each carries what your
+tools returned in production, and the environment replays it. A model plays the person, and a
+judge grades the task's rubric for a reward from 0 to 1.
 
 ```bash
 pip install generalcontext openai anthropic
@@ -111,7 +111,7 @@ python -m generalcontext.evals benchmark.json --agent my_agent:handle --trials 3
 arguments)`, and returns its final text. `--agent openai:<model>`, `claude-code:<model>` (the
 local Claude Code CLI, on its signed-in plan) or `anthropic:<model>` (the API) runs a
 model on your agent's recorded instructions instead. Results land in `runs/runs.json`
-(`generalcontext.runs/v1`), ready for **Import results** on the Tests page. A lookup production
+(`generalcontext.runs/v1`), ready for **Import results** on the Tasks page. A lookup production
 never made is answered as unrecorded and counted in each run's note.
 
 Add `--upload` to also send the results to General Context. It uses `GENERALCONTEXT_API_KEY`

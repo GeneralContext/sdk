@@ -1,6 +1,6 @@
 ---
 name: generalcontext
-description: Connect an AI agent to General Context: install the generalcontext SDK (Node or Python), record every OpenAI, Anthropic, Gemini and Bedrock call, group calls into conversations with sessions and tasks, flush before exit, and report outcomes and events. Use when connecting an app to General Context or debugging missing conversations, calls, outcomes or events.
+description: Connect an AI agent to General Context: install the generalcontext SDK (Node or Python), record every OpenAI, Anthropic, Gemini and Bedrock call, group calls into conversations with sessions and named steps, flush before exit, and report outcomes and events. Use when connecting an app to General Context or debugging missing conversations, calls, outcomes or events.
 ---
 
 # General Context integration
@@ -11,7 +11,7 @@ description: Connect an AI agent to General Context: install the generalcontext 
 > mkdir -p .claude/skills/generalcontext && curl -fsSL https://generalcontextlabs.com/docs/agents.md -o .claude/skills/generalcontext/SKILL.md
 > ```
 
-General Context reviews an AI agent's real conversations and turns its failures into tests. The SDK records every OpenAI (including Azure), Anthropic (including Bedrock, Vertex and beta clients), Google Gemini and AWS Bedrock Converse model call your process makes (the request, the reply, tool calls and results, timing, usage) and sends it in the background; General Context rebuilds each **conversation** from those calls. Reviewers read conversations against the company's policies, repeated failures become **issues**, and confirmed issues become **tasks** in a replayable benchmark. Recording quality directly determines review quality: a conversation split across ids, or missing the calls a worker made, cannot be judged.
+General Context turns an AI agent's real production conversations into RL and eval tasks. The SDK records every OpenAI (including Azure), Anthropic (including Bedrock, Vertex and beta clients), Google Gemini and AWS Bedrock Converse model call your process makes (the request, the reply, tool calls and results, timing, usage) and sends it in the background; General Context rebuilds each **conversation** from those calls. General Context reads conversations against the company's policies, repeated failures become **issues**, and each confirmed issue becomes a **task**: a synthetic environment rebuilt from the recorded tool results, a simulated person and a grader. The tasks together are the company's benchmark. Recording quality directly determines task quality: a conversation split across ids, or missing the calls a worker made, cannot be judged or rebuilt.
 
 ## Prerequisites
 
@@ -57,9 +57,9 @@ export async function register() {
 }
 ```
 
-### Sessions and tasks (required for whole conversations)
+### Sessions and named steps (required for whole conversations)
 
-Wrap the handling of each conversation (a chat, a ticket, an SMS thread, an email chain, a call) in `withSession`, with the id the app already stores for it, so every model call in it is grouped. Optionally wrap distinct units of work in `task()` to see which part of the agent each call came from:
+Wrap the handling of each conversation (a chat, a ticket, an SMS thread, an email chain, a call) in `withSession`, with the id the app already stores for it, so every model call in it is grouped. Optionally wrap distinct units of work in `task()` to name the step each call came from (these name steps inside the agent; they are not benchmark tasks):
 
 ```ts
 import { withSession, task } from "generalcontext";
@@ -166,7 +166,7 @@ Without `--session` it shows the workspace, what the key can do, and when traffi
 
 ## Run the benchmark in CI
 
-Once the workspace has tests, use a key that can run the benchmark (on **API keys**, check **Run the benchmark**; send-only keys get `403`): `generalcontext benchmark pull --out benchmark.json`, then `generalcontext evals run benchmark.json --agent my_agent:handle --trials 3 --upload`. `--upload` sends the `generalcontext.runs/v1` results to your workspace, so pass rates show per agent on **Tests**.
+Once the workspace has ready tasks, use a key that can run the benchmark (on **API keys**, check **Run the benchmark**; send-only keys get `403`): `generalcontext benchmark pull --out benchmark.json`, then `generalcontext evals run benchmark.json --agent my_agent:handle --trials 3 --upload`. `--upload` sends the `generalcontext.runs/v1` results to your workspace, so each agent's scores show on **Tasks**.
 
 ## Common issues
 

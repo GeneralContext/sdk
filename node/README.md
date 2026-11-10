@@ -148,7 +148,7 @@ npx generalcontext verify --session conv-123   # did this conversation arrive? e
 npx generalcontext benchmark pull --out benchmark.json
 ```
 
-`--json` prints the raw status. `benchmark pull` needs a key that can run the benchmark. Running the benchmark and improving instructions are in the Python package: `pip install generalcontext && generalcontext evals run ...`. Exit codes: 0 success, 1 failed check, 2 usage or configuration error.
+`--json` prints the raw status. `benchmark pull` needs a key that can run the benchmark. Running the benchmark is in the Python package: `pip install generalcontext && generalcontext evals run ...`. Exit codes: 0 success, 1 failed check, 2 usage or configuration error.
 
 ## License
 
