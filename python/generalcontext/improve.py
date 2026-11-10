@@ -58,6 +58,8 @@ def evaluate(tasks, agent_model, instructions, person_model, judge_model, trials
                 print(f"SKIP  {task.get('slug') or task['id']}  #{trial}  harness error: {type(failure).__name__}: {failure}"[:400], flush=True)
                 continue
             results.append({"task": task, "trial": trial, "label": label, "result": result})
+            # One line per trial, so a long run shows progress (and CI logs show where time went).
+            print(f"{'PASS' if result['passed'] else 'FAIL'}  {task.get('slug') or task['id']}  #{trial}  {label}  {evals.note(result)}"[:300], flush=True)
     return summarize(results), results
 
 
