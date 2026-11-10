@@ -77,7 +77,25 @@ Values become stable placeholders (`<phone:3f2a1c>`) before anything leaves your
 Calls over 4 MB are dropped, and the in-memory queue is capped at 64 MB. A second `initialize()`
 is ignored. `wrap(client)` and `conversation(...)` from 0.1 still work.
 
-Tests: `cd python && python -m unittest test_sdk -v`.
+Tests: `cd python && python -m unittest test_sdk test_evals -v`.
+
+## Run your benchmark
+
+Tasks built from your traffic run anywhere, with no copy of your systems: each carries what your
+tools returned in production, and the harness replays it. A model plays the person, and a judge
+grades the task's rubric.
+
+```bash
+pip install generalcontext openai anthropic
+python -m generalcontext.evals benchmark.json --agent my_agent:handle --trials 3
+```
+
+`handle(messages, toolbox)` runs your agent loop, calls tools through `toolbox.call(name,
+arguments)`, and returns its final text. `--agent openai:<model>`, `claude-code:<model>` (the
+local Claude Code CLI, on its signed-in plan) or `anthropic:<model>` (the API) runs a
+model on your agent's recorded instructions instead. Results land in `runs/runs.json`
+(`generalcontext.runs/v1`), ready for **Import results** on the Tests page. A lookup production
+never made is answered as unrecorded and counted in each run's note.
 
 ## License
 
