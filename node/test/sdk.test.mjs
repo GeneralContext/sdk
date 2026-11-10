@@ -383,7 +383,9 @@ test('oversized calls are dropped with one warning', async () => {
   const out = await child(`
     initialize({ apiKey: 'k', baseUrl: BASE + '/child/big', instrumentModules: { openAI: OpenAI } });
     const o = record();
-    for (let i = 0; i < 2; i++) await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'x'.repeat(4_100_000) }] });
+    // Many strings under the clipping threshold, so compaction cannot bring the call under the limit.
+    const big = Array.from({ length: 30 }, () => ({ role: 'user', content: 'x'.repeat(150_000) }));
+    for (let i = 0; i < 2; i++) await o.chat.completions.create({ model: 'gpt-x', messages: big });
     ${callOnce} await new Promise(r => setTimeout(r, 30)); await flush();`);
   assert.equal(out.code, 0, out.stderr);
   assert.equal((out.stderr.match(/byte limit/g) ?? []).length, 1);
@@ -394,7 +396,7 @@ test('batches split by bytes as well as count', async () => {
   const out = await child(`
     initialize({ apiKey: 'k', baseUrl: BASE + '/child/split', instrumentModules: { openAI: OpenAI } });
     const o = record();
-    for (let i = 0; i < 5; i++) await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: String(i) + 'x'.repeat(1_500_000) }] });
+    for (let i = 0; i < 5; i++) await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: String(i) + 'x'.repeat(150_000) }, ...Array.from({ length: 9 }, () => ({ role: 'user', content: 'x'.repeat(150_000) }))] });
     await new Promise(r => setTimeout(r, 30)); await flush();`);
   assert.equal(out.code, 0, out.stderr);
   const posts = childPosts.get('/child/split/api/platform-collect/sdk');
@@ -677,4 +679,100 @@ test('autoload finds @google/genai and the Bedrock runtime', { skip: (!genai || 
     await new Promise(r => setTimeout(r, 30)); await flush();`);
   assert.equal(out.code, 0, out.stderr);
   assert.deepEqual(recorded('auto').map(c => c.api), ['gemini', 'bedrock-converse']);
+});
+
+const png = n => 'data:image/png;base64,' + Buffer.alloc(Math.ceil(n * 3 / 4), 7).toString('base64').slice(0, n);
+const placeholder = /^\[omitted (\d+) bytes sha256:[0-9a-f]{12}\]$/;
+
+test('a growing Responses agent loop with a 1.5 MB snapshot and images records every call under the limit', async () => {
+  const client = openai();
+  const snapshot = 'src '.repeat(375_000); // 1.5 MB
+  const input = [{ role: 'user', content: [
+    { type: 'input_text', text: snapshot },
+    { type: 'input_image', image_url: png(600_000) },
+    { type: 'input_image', image_url: png(600_001) },
+  ] }];
+  for (let turn = 0; turn < 20; turn++) {
+    const request = { model: 'gpt-x', input: structuredClone(input), stream: true, store: false };
+    const before = structuredClone(request);
+    const stream = await client.responses.create(request);
+    for await (const _ of stream) { /* consume */ }
+    assert.deepEqual(request, before, 'the caller request is unchanged');
+    input.push({ type: 'function_call', call_id: `c${turn}`, name: 'run', arguments: '{"cmd":"ls"}' });
+    input.push({ type: 'function_call_output', call_id: `c${turn}`, output: 'ok' });
+    input.push({ role: 'user', content: [{ type: 'input_image', image_url: png(300_000 + turn) }] });
+  }
+  const calls = await drain();
+  assert.equal(calls.length, 20);
+  for (const [turn, call] of calls.entries()) {
+    assert.ok(Buffer.byteLength(JSON.stringify(call)) < 4_000_000);
+    const [text, a, b] = call.request.input[0].content;
+    assert.equal(text.text.length, 100_000 + 20_000 + `\n[... clipped ${1_500_000 - 120_000} characters ...]\n`.length);
+    assert.ok(text.text.includes('\n[... clipped 1380000 characters ...]\n'));
+    assert.match(a.image_url, /^data:image\/png;base64,\[omitted 600000 bytes sha256:[0-9a-f]{12}\]$/);
+    assert.match(b.image_url, /^data:image\/png;base64,\[omitted 600001 bytes sha256:[0-9a-f]{12}\]$/);
+    assert.equal(call.request.input.length, 1 + turn * 3);
+    if (turn) assert.equal(call.request.input[1].call_id, 'c0');
+    assert.equal(call.response.status, 'completed');
+  }
+});
+
+test('Anthropic base64 image blocks and Responses image_generation results are replaced, media types kept', () => {
+  const data = Buffer.alloc(3000, 1).toString('base64');
+  const call = {
+    request: { messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } }] }],
+      contents: [{ parts: [{ inlineData: { mimeType: 'image/png', data } }, { inline_data: { mime_type: 'image/png', data } }] }] },
+    response: { output: [{ type: 'image_generation_call', id: 'ig', result: data }] },
+  };
+  const before = structuredClone(call);
+  const out = sdk.compactForRecording(call);
+  assert.deepEqual(call, before);
+  const source = out.request.messages[0].content[0].source;
+  assert.equal(source.media_type, 'image/jpeg');
+  assert.match(source.data, placeholder);
+  assert.equal(source.data.match(placeholder)[1], String(data.length));
+  assert.match(out.request.contents[0].parts[0].inlineData.data, placeholder);
+  assert.equal(out.request.contents[0].parts[0].inlineData.mimeType, 'image/png');
+  assert.match(out.request.contents[0].parts[1].inline_data.data, placeholder);
+  assert.match(out.response.output[0].result, placeholder);
+  assert.equal(out.response.output[0].id, 'ig');
+  assert.equal(sdk.compactForRecording('short'), 'short');
+});
+
+test('Anthropic image blocks are recorded as placeholders through the SDK', async () => {
+  const data = Buffer.alloc(900_000, 2).toString('base64');
+  const request = { model: 'claude-x', max_tokens: 5, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data } }, { type: 'text', text: 'what?' }] }] };
+  await anthropic().messages.create(request);
+  assert.equal(request.messages[0].content[0].source.data, data);
+  const [call] = await drain();
+  assert.match(call.request.messages[0].content[0].source.data, placeholder);
+});
+
+test('a call still over the limit after compaction is dropped with the warning', async () => {
+  const out = await child(`
+    initialize({ apiKey: 'k', baseUrl: BASE + '/child/stillbig', instrumentModules: { openAI: OpenAI } });
+    const o = record();
+    await o.chat.completions.create({ model: 'gpt-x', messages: Array.from({ length: 40 }, () => ({ role: 'user', content: 'y'.repeat(150_000) })) });
+    await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'x'.repeat(4_100_000) }] });
+    ${callOnce} await new Promise(r => setTimeout(r, 30)); await flush();`);
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal((out.stderr.match(/byte limit/g) ?? []).length, 1);
+  const calls = recorded('stillbig');
+  assert.equal(calls.length, 2); // the 4.1 MB string was clipped and kept, the 6 MB of short strings dropped
+  assert.match(calls[0].request.messages[0].content, /clipped 3980000 characters/);
+});
+
+test('a Responses stream the caller throws out of is recorded with what arrived and an error', async () => {
+  const stream = await openai().responses.create({ model: 'gpt-x', input: 'boom', stream: true });
+  const mine = new Error('caller bailed');
+  let seen = 0;
+  await assert.rejects(async () => {
+    for await (const event of stream) { seen++; if (event.type === 'response.output_item.done') throw mine; }
+  }, error => error === mine);
+  assert.ok(seen > 1);
+  const [call] = await drain();
+  assert.equal(call.request.input, 'boom');
+  assert.match(call.error, /ended early/);
+  assert.equal(call.response.id, 'r1');
+  assert.equal(call.response.output[0].content[0].text, '{"unit":"4B"}');
 });

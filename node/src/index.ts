@@ -14,7 +14,7 @@
 // logged and dropped, never thrown. No runtime dependencies.
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createHmac, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { createRequire } from 'node:module';
@@ -238,11 +238,53 @@ export function task<T>(name: string, run: () => T): T {
   return scope.run({ ...scope.getStore(), task: name }, run);
 }
 
+const CLIP_OVER = 200_000; // strings longer than this many characters are clipped
+const CLIP_HEAD = 100_000;
+const CLIP_TAIL = 20_000;
+const BINARY_MIN = 256; // shorter base64 payloads are left alone
+const BASE64 = /^[A-Za-z0-9+/_-]+={0,2}$/;
+const DATA_URL = /^data:([^,;]*)((?:;[^,;]*)*);base64,/;
+const omitted = (payload: string) => `[omitted ${payload.length} bytes sha256:${createHash('sha256').update(payload).digest('hex').slice(0, 12)}]`;
+
+/**
+ * The copy of a call that is recorded. Never changes `value`, and never touches what the caller sends to the provider.
+ * Agents resend the whole run on every call, so without this, later calls pass the per-call limit and are lost.
+ *
+ * - Inline binary becomes a placeholder that keeps the shape: a base64 data URL keeps its prefix
+ *   (`data:image/png;base64,[omitted N bytes sha256:ab12cd34ef56]`), and a base64 `data`, `result` or
+ *   `b64_json` field (Anthropic `source.data`, Gemini `inlineData.data`, OpenAI `input_audio.data`, Responses
+ *   `image_generation_call.result`) becomes `[omitted N bytes sha256:...]`. N is the length of the base64 text
+ *   and the hash is the first 12 hex digits of the sha256 of that text, so the same image gets the same placeholder
+ *   in every call. Media types stay. Binary is never recorded: it does not help review and it is a privacy risk.
+ * - Any string over 200,000 characters keeps its first 100,000 and last 20,000 characters around
+ *   `\n[... clipped N characters ...]\n`.
+ *
+ * Runs before beforeSend and redaction. A call still over the limit afterwards is dropped.
+ */
+export function compactForRecording(value: unknown, key?: string, depth = 0): unknown {
+  if (typeof value === 'string') {
+    if (value.length > BINARY_MIN) {
+      const url = DATA_URL.exec(value.slice(0, 512));
+      if (url) return value.slice(0, url[0].length) + omitted(value.slice(url[0].length));
+      if ((key === 'data' || key === 'result' || key === 'b64_json') && BASE64.test(value)) return omitted(value);
+    }
+    if (value.length > CLIP_OVER) return `${value.slice(0, CLIP_HEAD)}\n[... clipped ${value.length - CLIP_HEAD - CLIP_TAIL} characters ...]\n${value.slice(-CLIP_TAIL)}`;
+    return value;
+  }
+  if (value === null || typeof value !== 'object' || depth > 64) return value;
+  if (typeof (value as { toJSON?: unknown }).toJSON === 'function') value = (value as { toJSON: () => unknown }).toJSON();
+  if (value === null || typeof value !== 'object') return compactForRecording(value, key, depth + 1);
+  if (Array.isArray(value)) return value.map(item => compactForRecording(item, undefined, depth + 1));
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value)) out[k] = compactForRecording(v, k, depth + 1);
+  return out;
+}
+
 // Runs before the caller's await continues, so only take the snapshot here. Redaction and beforeSend run at send time.
 function record(call: Omit<Call, 'conversation' | 'task'>, at: Scope | undefined, scrub?: Scrub | null) {
   try {
     if (!apiKey()) { warnLimited('no-key', 'GENERALCONTEXT_API_KEY is not set; a model call was not recorded'); return; }
-    const json = JSON.stringify({ ...call, conversation: at?.tags ?? null, task: at?.task ?? null });
+    const json = JSON.stringify(compactForRecording({ ...call, conversation: at?.tags ?? null, task: at?.task ?? null }));
     const bytes = Buffer.byteLength(json);
     if (bytes > MAX_CALL_BYTES) { warnLimited('oversized', `a model call of ${bytes} bytes is over the ${MAX_CALL_BYTES} byte limit and was dropped`); return; }
     if (queue.length >= MAX_QUEUE || queuedBytes + bytes > MAX_QUEUE_BYTES) { warnLimited('queue-full', 'queue is full; a model call was dropped'); return; }
@@ -471,7 +513,7 @@ function recording(create: (...args: unknown[]) => unknown, api: Api, scrub?: Sc
       } catch { /* leave the SDK promise as it was */ }
     }
     (reply as Promise<unknown>).then(response => {
-      const done = (result: unknown) => record({ api, request, response: api === 'gemini' ? plainGemini(result) : result, started_at: started, ended_at: new Date().toISOString(), error: null }, at, scrub);
+      const done = (result: unknown, error: string | null = null) => record({ api, request, response: api === 'gemini' ? plainGemini(result) : result, started_at: started, ended_at: new Date().toISOString(), error }, at, scrub);
       if (request?.stream && (isStream(response) || isLegacyStream(response))) observeStream(response, api, done);
       else done(response);
     }, error => {
@@ -492,20 +534,27 @@ const isLegacyStream = (value: unknown): value is LegacyStream =>
 
 // Both SDKs' Stream classes read chunks through `this.iterator`, including tee() and toReadableStream().
 // Replacing it keeps the object, its type and its methods, and lets us see each chunk once.
-function observeStream(stream: SdkStream | LegacyStream, api: Api, done: (response: unknown) => void) {
+// A stream the caller stops early (break, return or a throw inside for await, which aborts the request) or
+// that fails is still recorded, with what was assembled so far and an error. The caller's exception is untouched.
+function observeStream(stream: SdkStream | LegacyStream, api: Api, done: (response: unknown, error?: string | null) => void) {
   const legacy = !isStream(stream);
   const source = legacy ? (stream as LegacyStream)[Symbol.asyncIterator].bind(stream) : (stream as SdkStream).iterator.bind(stream);
   const observed = async function* () {
     const assemble = api === 'anthropic' ? anthropicAssembler() : openAIAssembler();
-    let finished = false;
+    let error: string | null = 'stream ended early: the caller stopped reading before the response completed';
     try {
       for await (const chunk of { [Symbol.asyncIterator]: source }) {
         try { assemble.add(chunk); } catch { /* never break the caller's stream */ }
         yield chunk;
       }
-      finished = true;
+      error = null;
+    } catch (failure) {
+      error = String((failure as Error)?.message ?? failure);
+      throw failure;
     } finally {
-      if (finished) done(assemble.result());
+      let result: unknown = null;
+      try { result = assemble.result(); } catch { /* record the error alone */ }
+      done(result, error);
     }
   };
   // An own property shadows the class method on this instance only.
@@ -516,12 +565,19 @@ function observeStream(stream: SdkStream | LegacyStream, api: Api, done: (respon
 type Assembler = { add: (chunk: any) => void; result: () => unknown };
 
 function openAIAssembler(): Assembler {
-  let model: string | undefined, id: string | undefined, usage: unknown = null, final: unknown = null;
+  let model: string | undefined, id: string | undefined, usage: unknown = null, final: unknown = null, partial: any = null;
+  const items: unknown[] = [];
   const choices: { index: number; message: { role: string; content: string | null; tool_calls?: any[] }; finish_reason: string | null }[] = [];
   return {
     add(chunk) {
       // Responses API events: the final response arrives whole.
-      if (chunk.type) { if (chunk.type === 'response.completed') final = chunk.response; return; }
+      // Keep the latest snapshot and finished output items too, so a stream stopped early still records what arrived.
+      if (chunk.type) {
+        if (chunk.type === 'response.completed') final = chunk.response;
+        else if (chunk.response) partial = chunk.response;
+        else if (chunk.type === 'response.output_item.done' && chunk.item) items[chunk.output_index ?? items.length] = chunk.item;
+        return;
+      }
       model ??= chunk.model; id ??= chunk.id;
       if (chunk.usage) usage = chunk.usage;
       for (const c of chunk.choices ?? []) {
@@ -539,7 +595,7 @@ function openAIAssembler(): Assembler {
         if (c.finish_reason) choice.finish_reason = c.finish_reason;
       }
     },
-    result: () => final ?? ({ id, object: 'chat.completion', model, choices: choices.filter(Boolean), usage }),
+    result: () => final ?? (partial ? { ...partial, output: items.filter(Boolean) } : { id, object: 'chat.completion', model, choices: choices.filter(Boolean), usage }),
   };
 }
 
