@@ -22,6 +22,8 @@ Set `GENERALCONTEXT_API_KEY` to the key from your workspace's Connect page.
 
 Each call is recorded once, with the request as you passed it and the provider's reply. Streams pass through unchanged and are recorded as one assembled reply when they finish.
 
+Supported versions: Node 18 to 24 with `openai` >= 4.0.0, `@anthropic-ai/sdk` >= 0.20.0, `@google/genai` >= 1.0.0 and `@aws-sdk/client-bedrock-runtime` >= 3.587.0 (the first with `ConverseCommand`), up to the latest releases (tested: openai 7.54.0, @anthropic-ai/sdk 1.7.0, @google/genai 3.0.0, client-bedrock-runtime 3.1165.0; each package's own Node minimum still applies, for example openai 7 and @google/genai 3 need Node 22). See [stress/compat/RESULTS.md](https://github.com/GeneralContext/sdk/blob/main/stress/compat/RESULTS.md).
+
 ## Initialize
 
 Call once per process, before your agent makes model calls. Every client of a supported SDK is recorded, including ones created earlier.

@@ -5,3 +5,5 @@ build/
 *.egg-info/
 node_modules/
 .DS_Store
+stress/compat/*/results-*.json
+stress/compat/node/matrix-node-*.md

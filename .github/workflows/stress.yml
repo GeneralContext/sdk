@@ -1,0 +1,68 @@
+name: Stress
+# Long-running stress tests against local fakes only (no model API calls, no production collector).
+# Not on every push: run by hand or weekly. Each job is self-contained.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * 1' # Mondays 06:17 UTC
+permissions:
+  contents: read
+concurrency:
+  group: stress-${{ github.ref }}
+  cancel-in-progress: false
+
+# Actions are pinned to commit SHAs (the same ones as ci.yml and release.yml).
+jobs:
+  # Layer 1: real provider packages, oldest supported to latest, on every runtime we support.
+  compat:
+    name: compat (${{ matrix.lang }} ${{ matrix.runtime }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { lang: python, runtime: '3.9' }
+          - { lang: python, runtime: '3.10' }
+          - { lang: python, runtime: '3.11' }
+          - { lang: python, runtime: '3.12' }
+          - { lang: python, runtime: '3.13' }
+          - { lang: node, runtime: '18' }
+          - { lang: node, runtime: '20' }
+          - { lang: node, runtime: '22' }
+          - { lang: node, runtime: '24' }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The fake provider is Python for both languages.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.lang == 'python' && matrix.runtime || '3.12' }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: matrix.lang == 'node'
+        with:
+          node-version: ${{ matrix.runtime }}
+      - name: Python packages x Python ${{ matrix.runtime }}
+        if: matrix.lang == 'python'
+        env:
+          STRESS_SCRATCH: ${{ runner.temp }}
+        run: |
+          python -m pip install --quiet uv
+          python stress/compat/python/run.py --python "${{ matrix.runtime }}"
+      - name: Node packages x Node ${{ matrix.runtime }}
+        if: matrix.lang == 'node'
+        env:
+          STRESS_SCRATCH: ${{ runner.temp }}
+        run: |
+          (cd node && npm ci --ignore-scripts)
+          node stress/compat/node/run.mjs --current-node
+      - name: Matrix
+        if: always()
+        run: cat stress/compat/*/matrix-*.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: compat-${{ matrix.lang }}-${{ matrix.runtime }}
+          path: stress/compat/*/results-*.json
+          if-no-files-found: ignore

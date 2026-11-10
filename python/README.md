@@ -30,6 +30,13 @@ or not, from clients created before or after it:
 | Anything else | OpenTelemetry | Send GenAI spans to General Context's OTel endpoint |
 
 Streams reach your code unchanged, and each is recorded once as one assembled reply.
+
+Supported versions: Python 3.9 to 3.13 with `openai` >= 1.0.0, `anthropic` >= 0.20.0,
+`google-genai` >= 1.0.0 and `boto3` >= 1.34.116 (the first with Bedrock `converse`), up to the
+latest releases (tested: openai 3.48.0, anthropic 2.7.0, google-genai 3.0.0, boto3 1.43.127).
+Call styles a release does not have yet, such as `responses` in openai 1.0, are simply absent.
+See [stress/compat/RESULTS.md](https://github.com/GeneralContext/sdk/blob/main/stress/compat/RESULTS.md).
+
 Providers that are not installed are skipped. Raw `httpx` and `requests` POSTs to `/chat/completions`
 are recorded only with `instrument_http=True`. Call it in every process: queue workers and forked
 children do not inherit it.
