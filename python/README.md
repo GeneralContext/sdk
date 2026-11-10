@@ -111,6 +111,27 @@ Add `--upload` to also send the results to General Context. It uses `GENERALCONT
 and `GENERALCONTEXT_BASE_URL` (https only), like the SDK. `generalcontext-evals` is the same
 command as `python -m generalcontext.evals`.
 
+## Command line
+
+`pip install generalcontext` adds a `generalcontext` command. It reads `GENERALCONTEXT_API_KEY`
+and `GENERALCONTEXT_BASE_URL`, and exits 0 on success, 1 on a failed check, 2 on a usage or
+configuration error.
+
+```bash
+generalcontext verify                       # the key works, and when the last call arrived
+generalcontext verify --session chat:42     # that one conversation arrived (add --json for scripts)
+generalcontext benchmark pull               # writes benchmark.json (needs a key that runs the benchmark)
+generalcontext evals run benchmark.json --agent openai:gpt-6.1-terra --upload
+generalcontext improve benchmark.json --agent openai:gpt-6.1-terra --upload
+```
+
+`improve` proposes better instructions for your agent. It never edits your code. It runs the
+agent on the train tasks with your current instructions (`--instructions FILE`, or the ones
+recorded in the benchmark), asks a model for the smallest general change that fixes the
+failures, and keeps a change only if the pass rate rises. Held-out tasks are never shown to that
+model: they are run at the end, before and after, so you can trust the comparison. Review
+`improve/instructions.diff`, then apply it yourself. `report.json` and `runs.json` sit next to it.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

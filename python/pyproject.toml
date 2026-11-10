@@ -20,6 +20,7 @@ classifiers = [
 ]
 
 [project.scripts]
+generalcontext = "generalcontext.cli:console"
 generalcontext-evals = "generalcontext.evals:cli"
 
 [project.urls]
@@ -33,7 +34,7 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.sdist]
-include = ["generalcontext", "README.md", "LICENSE", "NOTICE", "test_sdk.py", "test_evals.py"]
+include = ["generalcontext", "README.md", "LICENSE", "NOTICE", "test_sdk.py", "test_evals.py", "test_cli.py"]
 exclude = ["**/__pycache__"]
 
 [tool.hatch.build.targets.wheel]

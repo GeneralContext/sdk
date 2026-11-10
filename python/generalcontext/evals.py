@@ -435,9 +435,13 @@ REFERENCE = """You are the AI agent described below, handling one real conversat
 things up and to act. Messages from the person arrive as user messages."""
 
 
-def reference_agent(model_call, task):
-    """A model on the instructions recorded from the customer's agent, or a plain brief without them."""
-    instructions = (task.get("agent") or {}).get("instructions") or ""
+def reference_agent(model_call, task, instructions=None):
+    """A model on the instructions recorded from the customer's agent, or a plain brief without them.
+
+    `instructions` replaces the recorded instructions (used by `generalcontext improve`).
+    """
+    if instructions is None:
+        instructions = (task.get("agent") or {}).get("instructions") or ""
     system = instructions or REFERENCE
 
     def agent(messages, toolbox):
@@ -526,8 +530,8 @@ def load_tasks(path):
     raise ValueError(f"{path} is not a {BENCHMARK_FORMAT} or {TASK_FORMAT} file")
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(prog="python -m generalcontext.evals", description="Run an agent against tasks built from production traffic.")
+def main(argv=None, prog="python -m generalcontext.evals"):
+    parser = argparse.ArgumentParser(prog=prog, description="Run an agent against tasks built from production traffic.")
     parser.add_argument("benchmark", help="a generalcontext.benchmark/v1 or task/v1 file")
     parser.add_argument("--agent", action="append", required=True, help="openai:<model>, claude-code:<model>, anthropic:<model>, or module:function (repeatable)")
     parser.add_argument("--person", default="openai:gpt-6.1-terra@none", help="model that plays the person")
