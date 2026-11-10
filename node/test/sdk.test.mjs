@@ -2,6 +2,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import OpenAI from 'openai';
@@ -337,13 +338,29 @@ test('explicit baseUrl wins over GENERALCONTEXT_BASE_URL, which wins over the de
 
 test('refuses to send the key over plain http to a non-local host', async () => {
   const out = await child(`
-    globalThis.fetch = new Proxy(globalThis.fetch, { apply(t, s, a) { if (String(a[0]).includes('example.com')) process.exit(9); return Reflect.apply(t, s, a); } });
     initialize({ apiKey: 'k', baseUrl: 'http://collector.example.com', instrumentModules: { openAI: OpenAI } });
     ${callOnce} ${callOnce}
     await new Promise(r => setTimeout(r, 30)); await flush();
     if (await reportOutcome('s', 'fail') !== false) process.exit(2);`);
   assert.equal(out.code, 0, out.stderr);
   assert.equal((out.stderr.match(/refusing to send/g) ?? []).length, 1);
+  // Nothing was attempted: a real attempt to an unresolvable host would warn "could not reach".
+  assert.doesNotMatch(out.stderr, /could not reach/);
+});
+
+test('a collector that accepts and never answers does not keep a finished process alive', async () => {
+  const sockets = new Set();
+  const blackhole = net.createServer(socket => { sockets.add(socket); socket.on('error', () => {}); });
+  await new Promise(r => blackhole.listen(0, '127.0.0.1', r));
+  try {
+    const started = Date.now();
+    const out = await child(`
+      initialize({ apiKey: 'k', baseUrl: 'http://127.0.0.1:${blackhole.address().port}', instrumentModules: { openAI: OpenAI } });
+      for (let i = 0; i < 25; i++) { ${callOnce} }`);
+    assert.equal(out.code, 0, out.stderr);
+    // The exit flush is capped at 2 s; before the fix the open socket held the process for the 15 s send timeout.
+    assert.ok(Date.now() - started < 6000, `process took ${Date.now() - started} ms to exit`);
+  } finally { for (const s of sockets) s.destroy(); blackhole.close(); }
 });
 
 test('redirects are not followed and the key never reaches the redirect target', async () => {

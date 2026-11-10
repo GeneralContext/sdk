@@ -15,6 +15,8 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { createRequire } from 'node:module';
 
 export const VERSION = '0.2.0';
@@ -277,7 +279,45 @@ function prepare(entry: Entry): string | null {
   return JSON.stringify(scrubbed(call, entry.scrub === undefined ? config.scrub : entry.scrub));
 }
 
-async function post(path: string, body: string, timeoutMs: number): Promise<Response | null> {
+type Reply = { ok: boolean; status: number };
+
+// While a caller awaits flush(), reportOutcome() or logEvent(), our sockets keep the process alive
+// so the await can finish. Otherwise they are unref'd: background sending never keeps a finished
+// process alive, even against a collector that accepts and never answers.
+let waiters = 0;
+const sockets = new Set<{ ref(): unknown; unref(): unknown }>();
+function holdOpen<T>(work: Promise<T>): Promise<T> {
+  if (waiters++ === 0) for (const socket of sockets) socket.ref();
+  return work.finally(() => { if (--waiters === 0) for (const socket of sockets) socket.unref(); });
+}
+
+/**
+ * POST to the collector with node:http(s), not fetch, so the socket can be unref'd (see above).
+ * Redirects are never followed (node:http does not follow them), so the key never reaches another host.
+ */
+function postRaw(url: string, body: string, signal: AbortSignal): Promise<Reply> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const send = target.protocol === 'https:' ? httpsRequest : httpRequest;
+    const req = send(target, {
+      method: 'POST', signal, agent: false,
+      headers: { Authorization: `Bearer ${apiKey()}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, res => {
+      res.resume(); // drain, so the socket is freed
+      res.on('end', () => resolve({ ok: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300, status: res.statusCode ?? 0 }));
+      res.on('error', reject);
+    });
+    req.on('socket', socket => {
+      sockets.add(socket);
+      socket.once('close', () => sockets.delete(socket));
+      if (waiters === 0) socket.unref();
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+async function post(path: string, body: string, timeoutMs: number): Promise<Reply | null> {
   const url = `${baseUrl()}${path}`;
   if (!secureUrl(url)) { warnLimited('insecure', `refusing to send to ${baseUrl()}: baseUrl must be https`); return null; }
   if (stopped) return null;
@@ -286,13 +326,7 @@ async function post(path: string, body: string, timeoutMs: number): Promise<Resp
   timeout.unref?.();
   inflight.add(controller);
   try {
-    return await originalFetch(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey()}`, 'Content-Type': 'application/json' },
-      body,
-      redirect: 'error', // never forward the API key to another host
-      signal: controller.signal,
-    });
+    return await postRaw(url, body, controller.signal);
   } catch (error) {
     warnLimited(`send:${path}`, `could not reach ${path}: ${(error as Error).message}`);
     return null;
@@ -357,8 +391,9 @@ export async function flush(timeoutMs = FLUSH_TIMEOUT_MS): Promise<boolean> {
   let deadline: ReturnType<typeof setTimeout> | undefined;
   try {
     const sent = send().then(() => queue.length === 0, () => false);
-    const late = new Promise<boolean>(resolve => { deadline = setTimeout(() => resolve(false), Math.max(0, timeoutMs)); deadline.unref?.(); });
-    return await Promise.race([sent, late]);
+    // The deadline timer stays referenced: an awaited flush() must be able to finish and report.
+    const late = new Promise<boolean>(resolve => { deadline = setTimeout(() => resolve(false), Math.max(0, timeoutMs)); });
+    return await holdOpen(Promise.race([sent, late]));
   } catch { return false; } finally { clearTimeout(deadline); }
 }
 
@@ -370,7 +405,7 @@ export async function reportOutcome(sessionId: string, outcome: 'success' | 'fai
     if (!apiKey()) { warnLimited('no-key', 'GENERALCONTEXT_API_KEY is not set; outcome not reported'); return false; }
     await flush();
     const body = { session_id: scrubText(String(sessionId)), outcome, note: note == null ? null : scrubText(note) };
-    const response = await post('/api/platform-collect/outcomes', JSON.stringify(body), DIRECT_TIMEOUT_MS);
+    const response = await holdOpen(post('/api/platform-collect/outcomes', JSON.stringify(body), DIRECT_TIMEOUT_MS));
     return Boolean(response?.ok);
   } catch { return false; }
 }
@@ -389,7 +424,7 @@ export async function logEvent(event: AppEvent): Promise<boolean> {
       event_id: event.eventId ?? randomUUID(), event_type: scrubText(event.eventType), timestamp,
       session_id: sessionId, properties,
     }] };
-    const response = await post('/api/platform-collect/events', JSON.stringify(body), DIRECT_TIMEOUT_MS);
+    const response = await holdOpen(post('/api/platform-collect/events', JSON.stringify(body), DIRECT_TIMEOUT_MS));
     return Boolean(response?.ok);
   } catch { return false; }
 }
