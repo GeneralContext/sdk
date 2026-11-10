@@ -19,6 +19,9 @@ classifiers = [
   "Topic :: System :: Monitoring",
 ]
 
+[project.scripts]
+generalcontext-evals = "generalcontext.evals:cli"
+
 [project.urls]
 Homepage = "https://generalcontextlabs.com/platform"
 Documentation = "https://generalcontextlabs.com/platform/docs/sdk"

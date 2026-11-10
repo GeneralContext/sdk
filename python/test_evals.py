@@ -178,5 +178,51 @@ class ClaudeCode(unittest.TestCase):
         self.assertEqual([(c["name"], c["arguments"]) for c in reply["tool_calls"]], [("ledger__get", {"unit": "303"})])
 
 
+class Upload(unittest.TestCase):
+    def test_upload_posts_runs_with_the_key_and_refuses_plain_http(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append((self.path, self.headers.get("Authorization"), json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                data = b'{"recorded": 1, "unknown": []}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        body = {"format": evals.RUNS_FORMAT, "runs": [{"task": "tst_1", "passed": True}]}
+        env = {"GENERALCONTEXT_API_KEY": "gck_test", "GENERALCONTEXT_BASE_URL": f"http://127.0.0.1:{server.server_port}"}
+        with unittest.mock.patch.dict(os.environ, env):
+            self.assertEqual(evals.upload(body), {"recorded": 1, "unknown": []})
+        self.assertEqual(seen, [("/api/platform-collect/runs", "Bearer gck_test", body)])
+        with self.assertRaises(ValueError):
+            evals.upload(body, api_key="k", base_url="http://example.com")
+
+    def test_the_cli_uploads_with_upload_and_needs_the_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "bench.json")
+            with open(path, "w") as handle:
+                json.dump({"format": evals.BENCHMARK_FORMAT, "tasks": [TASK]}, handle)
+            args = [path, "--agent", "openai:agent", "--task", "none", "--out", directory, "--upload"]
+            with unittest.mock.patch.dict(os.environ, {"GENERALCONTEXT_API_KEY": ""}), self.assertRaises(SystemExit):
+                evals.main(args)
+            with unittest.mock.patch.dict(os.environ, {"GENERALCONTEXT_API_KEY": "gck_test"}), \
+                    unittest.mock.patch.object(evals, "model", lambda spec: None), \
+                    unittest.mock.patch.object(evals, "upload", return_value={"recorded": 0}) as upload:
+                self.assertEqual(evals.main(args), 0)
+            upload.assert_called_once_with({"format": evals.RUNS_FORMAT, "runs": []})
+
+    def test_console_script_entry_point_exists(self):
+        self.assertTrue(callable(evals.cli))
+
+
 if __name__ == "__main__":
     unittest.main()

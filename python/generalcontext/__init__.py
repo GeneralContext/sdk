@@ -9,9 +9,17 @@
     with generalcontext.session(conversation_id, user_id="u_42"):
         client.chat.completions.create(...)   # any OpenAI or Anthropic client, anywhere
 
-`initialize()` patches the installed `openai` and `anthropic` client classes, so every
-client is recorded: chat.completions, responses and messages, sync and async, streamed or
-not. Raw `httpx` and `requests` POSTs to `/chat/completions` are recorded only with
+`initialize()` patches the installed client classes, so every client is recorded, sync and
+async, streamed or not:
+
+- OpenAI (also AzureOpenAI): chat.completions create, parse and stream, responses create,
+  parse and stream.
+- Anthropic (also AnthropicBedrock and AnthropicVertex): messages and beta.messages create,
+  parse and stream.
+- Google Gen AI (`google-genai`): models.generate_content and generate_content_stream.
+- AWS Bedrock (boto3 `bedrock-runtime`): converse and converse_stream.
+
+Raw `httpx` and `requests` POSTs to `/chat/completions` are recorded only with
 `instrument_http=True`. Calls are sent from a background thread. Your agent never waits on
 General Context, and a failure on our side is logged and dropped, never raised.
 
@@ -100,28 +108,41 @@ def initialize(api_key=None, base_url=None, app_name=None, redact=False, before_
         _warn_insecure()
     atexit.register(_flush_at_exit)
     _patch_sdks()
+    _patch_gemini()
+    _patch_bedrock()
     if instrument_http:
         _patch_http()
 
 
 def _patch_sdks():
+    # `stream` helpers of OpenAI call self.create, so create records them. `parse` posts directly.
+    # Anthropic's `stream` helpers post directly too, so they are wrapped on their own.
     targets = [
-        ("openai.resources.chat.completions", "Completions", "AsyncCompletions", "openai-chat"),
-        ("openai.resources.responses", "Responses", "AsyncResponses", "openai-responses"),
-        ("anthropic.resources.messages", "Messages", "AsyncMessages", "anthropic"),
+        ("openai.resources.chat.completions", "Completions", "AsyncCompletions", "openai-chat", ()),
+        ("openai.resources.responses", "Responses", "AsyncResponses", "openai-responses", ()),
+        ("anthropic.resources.messages", "Messages", "AsyncMessages", "anthropic", ("stream",)),
+        ("anthropic.resources.beta.messages.messages", "Messages", "AsyncMessages", "anthropic", ("stream",)),
+        # AnthropicBedrock and AnthropicVertex beta copy the first party methods at import.
+        ("anthropic.lib.bedrock._beta_messages", "Messages", "AsyncMessages", "anthropic", ("stream",)),
+        ("anthropic.lib.vertex._beta_messages", "Messages", "AsyncMessages", "anthropic", ("stream",)),
     ]
-    for module_name, sync_name, async_name, api in targets:
+    for module_name, sync_name, async_name, api, managers in targets:
         try:
             module = __import__(module_name, fromlist=[sync_name])
         except Exception:
             continue  # Package not installed.
         for name, is_async in ((sync_name, False), (async_name, True)):
             cls = getattr(module, name, None)
-            if cls is None or getattr(cls.create, "_generalcontext", False):
+            if cls is None:
                 continue
-            cls.create = _recording(cls.create, api, is_async)
-            if api == "anthropic" and hasattr(cls, "stream"):
-                cls.stream = _recording_stream_manager(cls.stream, is_async)
+            for method in ("create", "parse"):
+                original = vars(cls).get(method)
+                if original is not None and not getattr(original, "_generalcontext", False):
+                    setattr(cls, method, _recording(original, api, is_async))
+            for method in managers:
+                original = vars(cls).get(method)
+                if original is not None and not getattr(original, "_generalcontext", False):
+                    setattr(cls, method, _recording_stream_manager(original, is_async, api))
 
 
 def wrap(client, *, redact=False):
@@ -230,7 +251,6 @@ class _Sender:
         self.lock = threading.Lock()
         self.bytes = 0
         self.thread = None
-
     def put(self, call, scrub):
         """Runs on the caller's thread, so it only measures and enqueues."""
         if not _api_key():
@@ -409,7 +429,8 @@ def _record(meta, response=None, error=None):
     """Snapshot and enqueue one finished call. Never raises."""
     try:
         call = dict(meta["call"], response=_plain(response) if response is not None else None,
-                    ended_at=_now(), error=f"{type(error).__name__}: {error}" if error is not None else None)
+                    ended_at=_now(), error=f"{type(error).__name__}: {error}" if error is not None
+else None)
         _sender.put(call, meta["scrub"])
     except Exception as failure:
         log.warning("General Context could not record a model call: %s", failure)
@@ -546,7 +567,11 @@ class _AsyncStream(_StreamBase):
 
     async def close(self):
         try:
-            await self._inner.close()
+            close = getattr(self._inner, "close", None) or getattr(self._inner, "aclose", None)
+            if close is not None:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
         finally:
             self._finish()
 
@@ -557,12 +582,14 @@ class _AsyncStream(_StreamBase):
         await self.close()
 
 
-def _recording_stream_manager(stream, is_async):
+def _recording_stream_manager(stream, is_async, api="anthropic"):
     """Wrap Anthropic `messages.stream(...)`: record the SDK's final message snapshot on exit."""
 
     @functools.wraps(stream)
     def wrapped(*args, **kwargs):
-        meta = _safe_start("anthropic", dict(kwargs, stream=True))
+        if _inside.get():
+            return stream(*args, **kwargs)
+        meta = _safe_start(api, dict(kwargs, stream=True))
         inner = stream(*args, **kwargs)
         return inner if meta is None else _StreamManager(inner, meta)
     wrapped._generalcontext = True
@@ -581,7 +608,14 @@ class _StreamManager:
         _record(self._meta, snapshot, error)
 
     def __enter__(self):
-        self._stream = self._inner.__enter__()
+        token = _inside.set(True)
+        try:
+            self._stream = self._inner.__enter__()
+        except Exception as error:
+            _record(self._meta, error=error)
+            raise
+        finally:
+            _inside.reset(token)
         return self._stream
 
     def __exit__(self, kind, error, trace):
@@ -589,7 +623,14 @@ class _StreamManager:
         return self._inner.__exit__(kind, error, trace)
 
     async def __aenter__(self):
-        self._stream = await self._inner.__aenter__()
+        token = _inside.set(True)
+        try:
+            self._stream = await self._inner.__aenter__()
+        except Exception as error:
+            _record(self._meta, error=error)
+            raise
+        finally:
+            _inside.reset(token)
         return self._stream
 
     async def __aexit__(self, kind, error, trace):
@@ -603,6 +644,10 @@ def _assemble(api, chunks):
         return _assemble_chat(chunks)
     if api == "anthropic":
         return _assemble_anthropic(chunks)
+    if api == "gemini":
+        return _assemble_gemini(chunks)
+    if api == "bedrock-converse":
+        return _assemble_converse(chunks)
     finals = [c["response"] for c in chunks if isinstance(c, dict) and c.get("type") in
               ("response.completed", "response.incomplete", "response.failed")]
     return finals[-1] if finals else {"events": chunks}
@@ -659,6 +704,216 @@ def _assemble_anthropic(events):
                 block["input"] = raw
     message["content"] = [blocks[index] for index in sorted(blocks)]
     return message
+
+
+# ---- Google Gen AI and AWS Bedrock -----------------------------------------------------------
+
+def _assemble_gemini(chunks):
+    """Streamed GenerateContentResponse chunks as one response: text of candidate 0 joined in order."""
+    parts, finish, usage, version, role = [], None, None, None, "model"
+    for chunk in chunks:
+        usage = chunk.get("usage_metadata") or usage
+        version = chunk.get("model_version") or version
+        for candidate in chunk.get("candidates") or []:
+            if candidate.get("index", 0) != 0:
+                continue
+            finish = candidate.get("finish_reason") or finish
+            content = candidate.get("content") or {}
+            role = content.get("role") or role
+            for part in content.get("parts") or []:
+                if set(part) == {"text"} and parts and set(parts[-1]) == {"text"}:
+                    parts[-1] = {"text": parts[-1]["text"] + part["text"]}
+                else:
+                    parts.append(dict(part))
+    candidate = {"content": {"role": role, "parts": parts}, "index": 0}
+    if finish:
+        candidate["finish_reason"] = finish
+    response = {"candidates": [candidate]}
+    if usage:
+        response["usage_metadata"] = usage
+    if version:
+        response["model_version"] = version
+    return response
+
+
+def _patch_gemini():
+    try:
+        from google.genai import models
+    except Exception:
+        return  # google-genai is not installed.
+    for cls, is_async in ((getattr(models, "Models", None), False), (getattr(models, "AsyncModels", None), True)):
+        if cls is None:
+            continue
+        original = vars(cls).get("generate_content")
+        if original is not None and not getattr(original, "_generalcontext", False):
+            cls.generate_content = _recording(original, "gemini", is_async)
+        original = vars(cls).get("generate_content_stream")
+        if original is not None and not getattr(original, "_generalcontext", False):
+            cls.generate_content_stream = _recording_iterator(original, "gemini", is_async)
+
+
+def _recording_iterator(method, api, is_async):
+    """Wrap a method that returns (or, async, resolves to) an iterator of chunks."""
+    if is_async:
+        @functools.wraps(method)
+        async def wrapped(*args, **kwargs):
+            if _inside.get():
+                return await method(*args, **kwargs)
+            meta = _safe_start(api, kwargs)
+            if meta is None:
+                return await method(*args, **kwargs)
+            token = _inside.set(True)
+            try:
+                inner = await method(*args, **kwargs)
+            except Exception as error:
+                _record(meta, error=error)
+                raise
+            finally:
+                _inside.reset(token)
+            return _AsyncStream(inner, meta)
+    else:
+        @functools.wraps(method)
+        def wrapped(*args, **kwargs):
+            if _inside.get():
+                return method(*args, **kwargs)
+            meta = _safe_start(api, kwargs)
+            if meta is None:
+                return method(*args, **kwargs)
+            try:
+                inner = method(*args, **kwargs)
+            except Exception as error:
+                _record(meta, error=error)
+                raise
+            return _SyncStream(_inside_iterator(inner), meta)
+    wrapped._generalcontext = True
+    return wrapped
+
+
+def _inside_iterator(inner):
+    """Iterate a lazy generator with _inside set, so its internal calls are not recorded twice."""
+    iterator = iter(inner)
+    while True:
+        token = _inside.set(True)
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        finally:
+            _inside.reset(token)
+        yield item
+
+
+def _no_bytes(value, depth=0):
+    """Bedrock params with images and documents replaced by {"omitted": "bytes"}."""
+    if depth > 40:
+        return None
+    if isinstance(value, (bytes, bytearray, memoryview)) or hasattr(value, "read"):
+        return {"omitted": "bytes"}
+    if isinstance(value, dict):
+        return {key: _no_bytes(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_no_bytes(item, depth + 1) for item in value]
+    return value
+
+
+def _patch_bedrock():
+    try:
+        from botocore.client import BaseClient
+    except Exception:
+        return  # boto3 is not installed.
+    original = BaseClient._make_api_call
+    if getattr(original, "_generalcontext", False):
+        return
+
+    def _make_api_call(self, operation_name, api_params):
+        if operation_name not in ("Converse", "ConverseStream") or _inside.get():
+            return original(self, operation_name, api_params)
+        meta = _safe_start("bedrock-converse", _no_bytes(api_params))
+        if meta is None:
+            return original(self, operation_name, api_params)
+        token = _inside.set(True)
+        try:
+            result = original(self, operation_name, api_params)
+        except Exception as error:
+            _record(meta, error=error)
+            raise
+        finally:
+            _inside.reset(token)
+        if operation_name == "Converse":
+            try:
+                reply = {key: value for key, value in result.items() if key != "ResponseMetadata"}
+            except Exception:
+                reply = result
+            _record(meta, _no_bytes(reply))
+            return result
+        try:
+            if isinstance(result, dict) and result.get("stream") is not None:
+                return dict(result, stream=_ConverseStream(result["stream"], meta))
+        except Exception as error:
+            _warn("bedrock", "General Context could not follow a Bedrock stream: %s", error)
+        return result
+
+    _make_api_call._generalcontext = True
+    BaseClient._make_api_call = _make_api_call
+
+
+class _ConverseStream(_SyncStream):
+    """Passes Bedrock ConverseStream events through and records them assembled."""
+
+    def _keep(self, chunk):
+        try:
+            self._chunks.append(_no_bytes(chunk))
+        except Exception:
+            pass
+        return chunk
+
+
+def _assemble_converse(events):
+    """ConverseStream events as the response Converse would have returned."""
+    role, blocks, stop, usage, metrics = "assistant", {}, None, None, None
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if "messageStart" in event:
+            role = (event["messageStart"] or {}).get("role") or role
+        elif "contentBlockStart" in event:
+            start = event["contentBlockStart"]
+            tool = (start.get("start") or {}).get("toolUse")
+            if tool:
+                blocks[start.get("contentBlockIndex", 0)] = {"toolUse": dict(tool, _input="")}
+        elif "contentBlockDelta" in event:
+            body = event["contentBlockDelta"]
+            index, delta = body.get("contentBlockIndex", 0), body.get("delta") or {}
+            if "text" in delta:
+                block = blocks.setdefault(index, {"text": ""})
+                block["text"] = block.get("text", "") + delta["text"]
+            elif "toolUse" in delta:
+                block = blocks.setdefault(index, {"toolUse": {"_input": ""}})
+                block["toolUse"]["_input"] += (delta["toolUse"] or {}).get("input") or ""
+            elif "reasoningContent" in delta:
+                block = blocks.setdefault(index, {"reasoningContent": {"reasoningText": {"text": ""}}})
+                text = block["reasoningContent"].setdefault("reasoningText", {"text": ""})
+                text["text"] = text.get("text", "") + ((delta["reasoningContent"] or {}).get("text") or "")
+        elif "messageStop" in event:
+            stop = (event["messageStop"] or {}).get("stopReason") or stop
+        elif "metadata" in event:
+            usage = (event["metadata"] or {}).get("usage") or usage
+            metrics = (event["metadata"] or {}).get("metrics") or metrics
+    for block in blocks.values():
+        tool = block.get("toolUse")
+        if tool is not None and "_input" in tool:
+            raw = tool.pop("_input")
+            try:
+                tool["input"] = json.loads(raw) if raw else {}
+            except ValueError:
+                tool["input"] = raw
+    response = {"output": {"message": {"role": role, "content": [blocks[index] for index in sorted(blocks)]}},
+                "stopReason": stop}
+    if usage:
+        response["usage"] = usage
+    if metrics:
+        response["metrics"] = metrics
+    return response
 
 
 # ---- Raw HTTP capture ----------------------------------------------------------------------

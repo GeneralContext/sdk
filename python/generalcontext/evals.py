@@ -27,7 +27,9 @@ called as `fn(messages, toolbox) -> str`: run your loop, call tools through `too
 arguments)`, return the final text. `toolbox.openai_tools()` and `toolbox.anthropic_tools()` give
 the tool definitions in each provider's format.
 
-Results are written as generalcontext.runs/v1, for the platform's "Import results".
+Results are written as generalcontext.runs/v1, for the platform's "Import results". With
+`--upload` they are also sent to General Context with GENERALCONTEXT_API_KEY (and
+GENERALCONTEXT_BASE_URL, https only). `generalcontext-evals` is the same command.
 Standard library only; the `openai` or `anthropic` package is needed for the models you name.
 """
 
@@ -534,7 +536,10 @@ def main(argv=None):
     parser.add_argument("--task", action="append", help="only these task ids or slugs")
     parser.add_argument("--split", choices=["train", "held_out"], help="only this split")
     parser.add_argument("--out", default="runs", help="directory for trial files and runs.json")
+    parser.add_argument("--upload", action="store_true", help="send runs.json to General Context (needs GENERALCONTEXT_API_KEY)")
     args = parser.parse_args(argv)
+    if args.upload and not os.environ.get("GENERALCONTEXT_API_KEY"):
+        parser.error("--upload needs GENERALCONTEXT_API_KEY")
 
     tasks = [task for task in load_tasks(args.benchmark)
              if (not args.task or task.get("id") in args.task or task.get("slug") in args.task)
@@ -560,8 +565,39 @@ def main(argv=None):
     for agent_spec in args.agent:
         mine = [run for run in runs if run["agent"] == agent_spec]
         print(f"{agent_spec}: {sum(run['passed'] for run in mine)}/{len(mine)} passed")
-    print(f"Wrote {out / 'runs.json'}: import it on the platform's Tests page.")
+    if not args.upload:
+        print(f"Wrote {out / 'runs.json'}: import it on the platform's Tests page, or rerun with --upload.")
+        return 0
+    try:
+        result = upload({"format": RUNS_FORMAT, "runs": runs})
+    except Exception as failure:
+        print(f"Wrote {out / 'runs.json'}, but the upload failed: {type(failure).__name__}: {failure}", file=sys.stderr)
+        return 1
+    unknown = result.get("unknown") or []
+    print(f"Uploaded {result.get('recorded', 0)} runs to General Context" + (f" ({len(unknown)} for unknown tasks: {', '.join(map(str, unknown))})" if unknown else "."))
     return 0
+
+
+def upload(body, api_key=None, base_url=None, timeout=60):
+    """POST a generalcontext.runs/v1 body to /api/platform-collect/runs. Returns the parsed reply."""
+    import generalcontext
+    import urllib.request
+    api_key = api_key or os.environ.get("GENERALCONTEXT_API_KEY")
+    base_url = (base_url or os.environ.get("GENERALCONTEXT_BASE_URL") or generalcontext.DEFAULT_BASE_URL).rstrip("/")
+    if not api_key:
+        raise ValueError("GENERALCONTEXT_API_KEY is not set")
+    url = base_url + "/api/platform-collect/runs"
+    if not generalcontext._secure(url):
+        raise ValueError(f"refusing to send to {base_url}: use https")
+    request = urllib.request.Request(url, data=json.dumps(body).encode(), headers={
+        "Authorization": "Bearer " + api_key, "Content-Type": "application/json"})
+    with generalcontext._opener.open(request, timeout=timeout) as response:
+        return json.loads(response.read() or b"{}")
+
+
+def cli():
+    """Entry point of the `generalcontext-evals` command."""
+    sys.exit(main())
 
 
 if __name__ == "__main__":

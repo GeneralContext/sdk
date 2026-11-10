@@ -18,9 +18,19 @@ with generalcontext.session(conversation_id, user_id=customer_id, channel="chat"
         reply = client.chat.completions.create(...)   # any OpenAI or Anthropic client
 ```
 
-`initialize()` records every OpenAI (`chat.completions`, `responses`) and Anthropic (`messages`)
-call in the process, sync and async, streamed or not, from clients created before or after it.
-SDK clients are always recorded. Raw `httpx` and `requests` POSTs to `/chat/completions`
+`initialize()` records every call in the process from these providers, sync and async, streamed
+or not, from clients created before or after it:
+
+| Provider | Client | Recorded |
+| --- | --- | --- |
+| OpenAI, including Azure OpenAI | `openai.OpenAI`, `AzureOpenAI` and async versions | `chat.completions` create, parse and stream; `responses` create, parse and stream |
+| Anthropic, including Bedrock and Vertex | `anthropic.Anthropic`, `AnthropicBedrock`, `AnthropicVertex` and async versions | `messages` and `beta.messages` create, parse and stream |
+| Google Gemini | `google-genai` (`google.genai.Client`) | `models.generate_content` and `generate_content_stream`, also under `client.aio` |
+| AWS Bedrock Converse | boto3 `bedrock-runtime` | `converse` and `converse_stream` (images and documents are sent as `{"omitted": "bytes"}`) |
+| Anything else | OpenTelemetry | Send GenAI spans to General Context's OTel endpoint |
+
+Streams reach your code unchanged, and each is recorded once as one assembled reply.
+Providers that are not installed are skipped. Raw `httpx` and `requests` POSTs to `/chat/completions`
 are recorded only with `instrument_http=True`. Call it in every process: queue workers and forked
 children do not inherit it.
 
@@ -96,6 +106,10 @@ local Claude Code CLI, on its signed-in plan) or `anthropic:<model>` (the API) r
 model on your agent's recorded instructions instead. Results land in `runs/runs.json`
 (`generalcontext.runs/v1`), ready for **Import results** on the Tests page. A lookup production
 never made is answered as unrecorded and counted in each run's note.
+
+Add `--upload` to also send the results to General Context. It uses `GENERALCONTEXT_API_KEY`
+and `GENERALCONTEXT_BASE_URL` (https only), like the SDK. `generalcontext-evals` is the same
+command as `python -m generalcontext.evals`.
 
 ## License
 

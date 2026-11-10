@@ -21,6 +21,11 @@ import generalcontext
 HAS_OPENAI = importlib.util.find_spec("openai") is not None
 HAS_ANTHROPIC = importlib.util.find_spec("anthropic") is not None
 HAS_HTTPX = importlib.util.find_spec("httpx") is not None
+try:
+    HAS_GENAI = importlib.util.find_spec("google.genai") is not None
+except ModuleNotFoundError:
+    HAS_GENAI = False
+HAS_BOTO3 = importlib.util.find_spec("boto3") is not None
 KEY = "gck_" + "a" * 48
 
 if HAS_OPENAI:
@@ -56,23 +61,50 @@ MESSAGE_EVENTS = [
     {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 9}},
     {"type": "message_stop"},
 ]
+RESPONSE = {"id": "r1", "object": "response", "created_at": 1, "model": "gpt-test", "status": "completed",
+            "output": [{"type": "message", "id": "msg1", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": "Hi there.", "annotations": []}]}],
+            "parallel_tool_calls": False, "tool_choice": "auto", "tools": []}
+RESPONSE_EVENTS = [
+    {"type": "response.created", "sequence_number": 0, "response": dict(RESPONSE, status="in_progress", output=[])},
+    {"type": "response.completed", "sequence_number": 1, "response": RESPONSE},
+]
+GEMINI_CHUNKS = [
+    {"candidates": [{"content": {"role": "model", "parts": [{"text": "Unit 402 "}]}, "index": 0}], "modelVersion": "gemini-test"},
+    {"candidates": [{"content": {"role": "model", "parts": [{"text": "is open."}]}, "index": 0}], "modelVersion": "gemini-test"},
+    {"candidates": [{"content": {"role": "model", "parts": [{"functionCall": {"name": "book", "args": {"day": "mon"}}}]},
+                     "finishReason": "STOP", "index": 0}],
+     "usageMetadata": {"promptTokenCount": 6, "candidatesTokenCount": 5, "totalTokenCount": 11}, "modelVersion": "gemini-test"},
+]
+GEMINI = {"candidates": [{"content": {"role": "model", "parts": [{"text": "Tours run daily."}]}, "finishReason": "STOP", "index": 0}],
+          "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 4, "totalTokenCount": 7}, "modelVersion": "gemini-test"}
 
 
 class Server(BaseHTTPRequestHandler):
     received = []  # (path, authorization, body) for collector requests
     status = 200
+    providers = []   # Paths of model provider requests
 
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or b"{}")
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
         if self.path.startswith("/api/platform-collect"):
             Server.received.append((self.path, self.headers.get("Authorization"), body))
-            return self.reply(Server.status, {})
-        if body.get("model") == "bad":
+            return self.reply(Server.status, {"recorded": len(body.get("runs") or []), "unknown": []}
+                              if self.path.endswith("/runs") else {})
+        Server.providers.append(self.path)
+        path = self.path.split("?")[0]
+        if body.get("model") == "bad" or "/models/missing:" in path:
             return self.reply(400, {"error": {"message": "bad model", "type": "invalid_request_error"}})
-        if self.path.endswith("/chat/completions"):
+        if path.endswith("/chat/completions"):
             return self.sse([("", c) for c in CHAT_CHUNKS], done=True) if body.get("stream") else self.reply(200, CHAT)
-        if self.path.endswith("/messages"):
+        if path.endswith("/messages"):
             return self.sse([(e["type"], e) for e in MESSAGE_EVENTS]) if body.get("stream") else self.reply(200, MESSAGE)
+        if path.endswith("/responses"):
+            return self.sse([(e["type"], e) for e in RESPONSE_EVENTS]) if body.get("stream") else self.reply(200, RESPONSE)
+        if path.endswith(":streamGenerateContent"):
+            return self.sse([("", c) for c in GEMINI_CHUNKS])
+        if path.endswith(":generateContent"):
+            return self.reply(200, GEMINI)
         self.reply(404, {})
 
     def reply(self, status, body):
@@ -125,7 +157,9 @@ class SdkTest(unittest.TestCase):
         cls.server.shutdown()
 
     def setUp(self):
+        self.assertTrue(generalcontext.flush(5))
         Server.received.clear()
+        Server.providers.clear()
         Server.status = 200
 
     def calls(self):
@@ -147,7 +181,7 @@ class SdkTest(unittest.TestCase):
         self.assertTrue(generalcontext.flush(5))
         path, authorization, body = Server.received[0]
         self.assertEqual((path, authorization), ("/api/platform-collect/sdk", "Bearer " + KEY))
-        self.assertEqual((body["sdk"], body["app"]), ("python/0.2.0", "support-bot"))
+        self.assertEqual((body["sdk"], body["app"]), ("python/" + generalcontext.__version__, "support-bot"))
         call = body["calls"][0]
         self.assertEqual(call["api"], "openai-chat")
         self.assertEqual(call["conversation"], {"id": "chat:thread-1", "user_id": "u1", "channel": "chat", "product": "support"})
@@ -472,6 +506,223 @@ class SdkTest(unittest.TestCase):
         plain, sse = self.calls()
         self.assertEqual((plain["api"], plain["task"], plain["response"]["id"]), ("openai-chat", "raw", "c1"))
         self.assertEqual(sse["response"]["choices"][0]["message"]["content"], "Checking units.")
+
+    # More OpenAI and Anthropic entry points.
+
+    @unittest.skipUnless(HAS_OPENAI, "openai is not installed")
+    def test_openai_parse_and_stream_helpers_are_recorded_once_each(self):
+        client = self.openai()
+        parsed = client.chat.completions.parse(model="gpt-test", messages=[{"role": "user", "content": "parse"}])
+        with client.chat.completions.stream(model="gpt-test", messages=[{"role": "user", "content": "stream"}]) as stream:
+            final = stream.get_final_completion()
+        response = client.responses.parse(model="gpt-test", input="rparse")
+        with client.responses.stream(model="gpt-test", input="rstream") as rstream:
+            rfinal = rstream.get_final_response()
+        self.assertEqual(parsed.choices[0].message.content, "Unit 402 is open.")
+        self.assertEqual(final.choices[0].message.content, "Checking units.")
+        self.assertEqual((response.output_text, rfinal.output_text), ("Hi there.", "Hi there."))
+        calls = self.calls()
+        self.assertEqual([c["api"] for c in calls], ["openai-chat", "openai-chat", "openai-responses", "openai-responses"])
+        self.assertEqual(calls[0]["request"]["messages"][0]["content"], "parse")
+        self.assertEqual(calls[1]["response"]["choices"][0]["message"]["content"], "Checking units.")
+        self.assertEqual([c["request"]["input"] for c in calls[2:]], ["rparse", "rstream"])
+        self.assertEqual(calls[3]["response"]["id"], "r1")
+        self.assertEqual(len(Server.providers), 4)
+
+    @unittest.skipUnless(HAS_OPENAI, "openai is not installed")
+    def test_async_openai_parse_is_recorded(self):
+        async def run():
+            client = self.openai("AsyncOpenAI")
+            return await client.chat.completions.parse(model="gpt-test", messages=[])
+        self.assertEqual(asyncio.run(run()).model, "gpt-test")
+        self.assertEqual([c["api"] for c in self.calls()], ["openai-chat"])
+
+    @unittest.skipUnless(HAS_OPENAI, "openai is not installed")
+    def test_azure_openai_client_is_recorded(self):
+        client = openai.AzureOpenAI(api_key="sk-test", api_version="2024-10-21", azure_endpoint=self.url, max_retries=0)
+        reply = client.chat.completions.create(model="my-deployment", messages=[{"role": "user", "content": "azure"}])
+        self.assertEqual(reply.choices[0].message.content, "Unit 402 is open.")
+        self.assertIn("/openai/deployments/my-deployment/", Server.providers[0])
+        (call,) = self.calls()
+        self.assertEqual((call["api"], call["request"]["messages"][0]["content"]), ("openai-chat", "azure"))
+
+    @unittest.skipUnless(HAS_ANTHROPIC, "anthropic is not installed")
+    def test_anthropic_parse_and_beta_create_parse_stream(self):
+        import anthropic
+        client = anthropic.Anthropic(api_key="sk-test", base_url=self.url, max_retries=0)
+        kwargs = dict(model="claude-test", max_tokens=10)
+        parsed = client.messages.parse(messages=[{"role": "user", "content": "parse"}], **kwargs)
+        beta = client.beta.messages.create(messages=[{"role": "user", "content": "beta"}], **kwargs)
+        beta_parsed = client.beta.messages.parse(messages=[{"role": "user", "content": "bparse"}], **kwargs)
+        with client.beta.messages.stream(messages=[{"role": "user", "content": "bstream"}], **kwargs) as stream:
+            text = "".join(stream.text_stream)
+        self.assertEqual((parsed.content[0].text, beta.content[0].text, beta_parsed.content[0].text),
+                         ("Tours run daily.",) * 3)
+        self.assertEqual(text, "Booking now.")
+        calls = self.calls()
+        self.assertEqual([c["api"] for c in calls], ["anthropic"] * 4)
+        self.assertEqual([c["request"]["messages"][0]["content"] for c in calls], ["parse", "beta", "bparse", "bstream"])
+        self.assertEqual(calls[3]["response"]["content"][0]["text"], "Booking now.")
+        self.assertEqual(calls[3]["response"]["content"][1]["input"], {"day": "mon"})
+        self.assertEqual(len(Server.providers), 4)
+
+    @unittest.skipUnless(HAS_ANTHROPIC, "anthropic is not installed")
+    def test_async_anthropic_parse_and_beta_stream(self):
+        import anthropic
+
+        async def run():
+            client = anthropic.AsyncAnthropic(api_key="sk-test", base_url=self.url, max_retries=0)
+            parsed = await client.messages.parse(model="claude-test", max_tokens=10, messages=[])
+            beta = await client.beta.messages.parse(model="claude-test", max_tokens=10, messages=[])
+            async with client.beta.messages.stream(model="claude-test", max_tokens=10, messages=[]) as stream:
+                text = "".join([t async for t in stream.text_stream])
+            return parsed, beta, text
+        parsed, beta, text = asyncio.run(run())
+        self.assertEqual((parsed.content[0].text, beta.content[0].text, text), ("Tours run daily.", "Tours run daily.", "Booking now."))
+        calls = self.calls()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[2]["response"]["content"][0]["text"], "Booking now.")
+
+    @unittest.skipUnless(HAS_ANTHROPIC, "anthropic is not installed")
+    def test_anthropic_bedrock_and_vertex_use_the_patched_classes(self):
+        import anthropic
+        from anthropic.resources.messages import Messages
+        from anthropic.resources.beta.messages.messages import Messages as BetaMessages
+        clients = [anthropic.AnthropicVertex(region="us-east5", project_id="p", access_token="t", base_url=self.url)]
+        if HAS_BOTO3:
+            clients.append(anthropic.AnthropicBedrock(aws_access_key="a", aws_secret_key="s", aws_region="us-east-1",
+                                                      base_url=self.url))
+        for client in clients:
+            self.assertIsInstance(client.messages, Messages)
+            self.assertTrue(getattr(client.beta.messages.create, "_generalcontext", False))
+        for cls in (Messages, BetaMessages):
+            for method in ("create", "parse", "stream"):
+                self.assertTrue(getattr(getattr(cls, method), "_generalcontext", False), (cls, method))
+
+    # Google Gen AI.
+
+    def gemini(self):
+        from google import genai
+        return genai.Client(api_key="test-key", http_options={"base_url": self.url, "api_version": "v1beta"})
+
+    @unittest.skipUnless(HAS_GENAI, "google-genai is not installed")
+    def test_gemini_generate_content_plain_and_streamed(self):
+        from google.genai import types
+        client = self.gemini()
+        config = types.GenerateContentConfig(system_instruction="Be brief.", temperature=0)
+        with generalcontext.session("gem-1"):
+            reply = client.models.generate_content(model="gemini-test", contents="hi", config=config)
+            chunks = list(client.models.generate_content_stream(model="gemini-test", contents=["a", "b"]))
+        self.assertEqual(reply.text, "Tours run daily.")
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(chunks[0].text, "Unit 402 ")
+        plain, streamed = self.calls()
+        self.assertEqual((plain["api"], plain["conversation"]["id"]), ("gemini", "gem-1"))
+        self.assertEqual(plain["request"]["model"], "gemini-test")
+        self.assertEqual(plain["request"]["contents"], "hi")
+        self.assertEqual(plain["request"]["config"]["system_instruction"], "Be brief.")
+        self.assertEqual(plain["response"]["candidates"][0]["content"]["parts"], [{"text": "Tours run daily."}])
+        self.assertEqual(plain["response"]["usage_metadata"]["prompt_token_count"], 3)
+        response = streamed["response"]
+        self.assertEqual(response["candidates"][0]["content"]["parts"],
+                         [{"text": "Unit 402 is open."}, {"function_call": {"name": "book", "args": {"day": "mon"}}}])
+        self.assertEqual(response["candidates"][0]["finish_reason"], "STOP")
+        self.assertEqual(response["usage_metadata"]["candidates_token_count"], 5)
+        self.assertEqual(response["model_version"], "gemini-test")
+        self.assertEqual(len(Server.providers), 2)
+
+    @unittest.skipUnless(HAS_GENAI, "google-genai is not installed")
+    def test_async_gemini_plain_and_streamed(self):
+        async def run():
+            client = self.gemini()
+            reply = await client.aio.models.generate_content(model="gemini-test", contents="hi")
+            stream = await client.aio.models.generate_content_stream(model="gemini-test", contents="hi")
+            return reply, [chunk async for chunk in stream]
+        reply, chunks = asyncio.run(run())
+        self.assertEqual((reply.text, len(chunks)), ("Tours run daily.", 3))
+        plain, streamed = self.calls()
+        self.assertEqual(streamed["response"]["candidates"][0]["content"]["parts"][0], {"text": "Unit 402 is open."})
+
+    @unittest.skipUnless(HAS_GENAI, "google-genai is not installed")
+    def test_gemini_error_is_recorded_and_reraised(self):
+        from google.genai import errors
+        with self.assertRaises(errors.APIError):
+            client = self.gemini()
+            client.models.generate_content(model="missing", contents="hi")
+        (call,) = self.calls()
+        self.assertEqual(call["api"], "gemini")
+        self.assertIsNotNone(call["error"])
+
+    # AWS Bedrock Converse.
+
+    def bedrock(self):
+        import boto3
+        return boto3.client("bedrock-runtime", region_name="us-east-1", aws_access_key_id="test",
+                            aws_secret_access_key="test")
+
+    @unittest.skipUnless(HAS_BOTO3, "boto3 is not installed")
+    def test_bedrock_converse_is_recorded_with_bytes_omitted(self):
+        from botocore.stub import Stubber
+        client = self.bedrock()
+        reply = {"output": {"message": {"role": "assistant", "content": [{"text": "Tours run daily."}]}},
+                 "stopReason": "end_turn", "usage": {"inputTokens": 3, "outputTokens": 4, "totalTokens": 7},
+                 "metrics": {"latencyMs": 5}}
+        messages = [{"role": "user", "content": [{"text": "hi"}, {"image": {"format": "png", "source": {"bytes": b"\x89PNG"}}}]}]
+        with Stubber(client) as stub, generalcontext.task("bedrock"):
+            stub.add_response("converse", reply, {"modelId": "anthropic.claude-test", "messages": messages})
+            result = client.converse(modelId="anthropic.claude-test", messages=messages)
+        self.assertEqual(result["output"], reply["output"])
+        (call,) = self.calls()
+        self.assertEqual((call["api"], call["task"]), ("bedrock-converse", "bedrock"))
+        self.assertEqual(call["request"]["modelId"], "anthropic.claude-test")
+        self.assertEqual(call["request"]["messages"][0]["content"][1]["image"]["source"]["bytes"], {"omitted": "bytes"})
+        self.assertEqual(call["response"]["output"]["message"]["content"], [{"text": "Tours run daily."}])
+        self.assertEqual(call["response"]["usage"]["outputTokens"], 4)
+        self.assertNotIn("ResponseMetadata", call["response"])
+
+    @unittest.skipUnless(HAS_BOTO3, "boto3 is not installed")
+    def test_bedrock_converse_stream_passes_events_and_records_one_response(self):
+        from botocore.stub import Stubber
+        client = self.bedrock()
+        events = [
+            {"messageStart": {"role": "assistant"}},
+            {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "Booking "}}},
+            {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "now."}}},
+            {"contentBlockStop": {"contentBlockIndex": 0}},
+            {"contentBlockStart": {"contentBlockIndex": 1, "start": {"toolUse": {"toolUseId": "t1", "name": "book"}}}},
+            {"contentBlockDelta": {"contentBlockIndex": 1, "delta": {"toolUse": {"input": "{\"day\": "}}}},
+            {"contentBlockDelta": {"contentBlockIndex": 1, "delta": {"toolUse": {"input": "\"mon\"}"}}}},
+            {"messageStop": {"stopReason": "tool_use"}},
+            {"metadata": {"usage": {"inputTokens": 3, "outputTokens": 9, "totalTokens": 12}, "metrics": {"latencyMs": 5}}},
+        ]
+        with Stubber(client) as stub:
+            stub._validate_operation_response = lambda *args: None  # The stubbed stream is a plain list of events.
+            stub.add_response("converse_stream", {"stream": events})
+            result = client.converse_stream(modelId="m", messages=[{"role": "user", "content": [{"text": "book"}]}])
+            seen = list(result["stream"])
+        self.assertEqual(seen, events)
+        (call,) = self.calls()
+        self.assertEqual(call["api"], "bedrock-converse")
+        self.assertEqual(call["response"], {
+            "output": {"message": {"role": "assistant", "content": [
+                {"text": "Booking now."}, {"toolUse": {"toolUseId": "t1", "name": "book", "input": {"day": "mon"}}}]}},
+            "stopReason": "tool_use", "usage": {"inputTokens": 3, "outputTokens": 9, "totalTokens": 12},
+            "metrics": {"latencyMs": 5}})
+
+    @unittest.skipUnless(HAS_BOTO3, "boto3 is not installed")
+    def test_other_boto3_operations_are_not_recorded_and_errors_are(self):
+        from botocore.stub import Stubber
+        client = self.bedrock()
+        with Stubber(client) as stub:
+            stub.add_client_error("converse", "ValidationException", "bad model")
+            with self.assertRaises(client.exceptions.ValidationException):
+                client.converse(modelId="bad", messages=[])
+            stub._validate_operation_response = lambda *args: None
+            stub.add_response("apply_guardrail", {"action": "NONE", "outputs": [], "assessments": []})
+            client.apply_guardrail(guardrailIdentifier="g", guardrailVersion="1", source="INPUT", content=[])
+        (call,) = self.calls()
+        self.assertTrue(call["error"].startswith("ClientError") or "ValidationException" in call["error"])
+
 
 
 if __name__ == "__main__":
