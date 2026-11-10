@@ -444,7 +444,10 @@ class Contract(unittest.TestCase):
     def test_contract_benchmark_runs_both_tasks(self):
         tasks = evals.load_tasks(os.path.join(CONTRACT, "benchmark.json"))
         with open(os.path.join(CONTRACT, "benchmark.json")) as handle:
-            summary = json.load(handle)["summary"]
+            file = json.load(handle)
+        summary = file["summary"]
+        # The platform's export: these keys, and nothing the SDK has to guess.
+        self.assertEqual(set(file), {"format", "workspace", "name", "exported_at", "exported_by", "summary", "tasks"})
         self.assertEqual(set(summary), {"tasks", "by_origin", "by_split", "by_environment", "by_grader", "by_tag"})
         self.assertEqual(summary["tasks"], len(tasks))
         replay, custom = tasks

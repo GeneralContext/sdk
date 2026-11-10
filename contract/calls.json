@@ -4,7 +4,11 @@
   "calls": [
     {
       "api": "openai-responses",
-      "conversation": "conv_contract_1",
+      "conversation": {
+        "id": "conv_contract_1",
+        "channel": "chat",
+        "product": "leasing"
+      },
       "task": null,
       "started_at": "2026-11-10T00:00:00Z",
       "request": {

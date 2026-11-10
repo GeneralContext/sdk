@@ -1,6 +1,9 @@
 {
   "format": "generalcontext.benchmark/v1",
-  "generated_at": "2026-11-10T00:00:00Z",
+  "workspace": "elise",
+  "name": "EliseAI benchmark",
+  "exported_at": "2026-11-10T00:00:00Z",
+  "exported_by": "key:ci",
   "summary": {
     "tasks": 2,
     "by_origin": {

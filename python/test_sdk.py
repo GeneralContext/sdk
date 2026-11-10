@@ -188,6 +188,13 @@ class SdkTest(unittest.TestCase):
         self.assertEqual(call["task"], "qualify")
         self.assertEqual(call["request"]["messages"][0]["content"], "2 beds?")
         self.assertEqual((call["response"], call["error"]), (reply, None))
+        # The shared contract fixture has the shape this SDK sends, field for field.
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "contract", "calls.json")) as handle:
+            fixture = json.load(handle)
+        self.assertEqual(set(fixture), set(body))
+        for example in fixture["calls"]:
+            self.assertEqual(set(example), set(call))
+            self.assertTrue(example["conversation"] is None or set(example["conversation"]) <= {"id", "user_id", "channel", "product", "metadata"})
 
     def test_conversation_is_an_alias_of_session(self):
         self.assertIs(generalcontext.conversation, generalcontext.session)
