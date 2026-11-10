@@ -128,16 +128,33 @@ export function initialize(options: InitializeOptions = {}): void {
   if (!secureUrl(baseUrl())) warn(`baseUrl ${baseUrl()} is not https; nothing will be sent`);
 
   const modules = options.instrumentModules ?? autoload();
-  // @google/genai ships separate CommonJS and ES module builds with their own classes. require() above found the
-  // CommonJS one, so also patch the ES module build. Starting the import here means it settles before the app's own.
-  if (!options.instrumentModules && modules.googleGenAI) {
-    import('@google/genai' as string).then(patchGemini, () => {});
+  // openai, @anthropic-ai/sdk and @google/genai ship separate CommonJS and ES module builds with their own classes.
+  // require() above found the CommonJS ones, which is what a CommonJS app uses. An ES module app (import OpenAI
+  // from 'openai') gets the other build, so patch that too. patchMethod skips a method already patched.
+  // The imports settle a few ticks after initialize() returns, before an app's own `await import(...)` of the
+  // same module resumes. A call made synchronously right after initialize(), before any await, can run
+  // unrecorded: await ready() first in that case.
+  if (!options.instrumentModules) {
+    const esm: [string, (m: unknown) => void][] = [['openai', patchOpenAI], ['@anthropic-ai/sdk', patchAnthropic]];
+    if (modules.googleGenAI) esm.push(['@google/genai', patchGemini]);
+    // @aws-sdk/client-bedrock-runtime resolves to one class from both require() and import(), so it needs nothing here.
+    pending = Promise.all(esm.map(([name, patch]) => import(name as string).then(patch, () => {}))).then(() => {});
   }
   if (modules.openAI) patchOpenAI(modules.openAI);
   if (modules.anthropic) patchAnthropic(modules.anthropic);
   if (modules.googleGenAI) patchGemini(modules.googleGenAI);
   if (modules.bedrockRuntime) patchBedrock(modules.bedrockRuntime);
   if (options.instrumentFetch ?? false) patchFetch();
+}
+
+let pending: Promise<void> = Promise.resolve();
+
+/**
+ * Resolves once initialize() has patched every SDK build it found, including the ES module builds it loads
+ * asynchronously. Await it when a model call may run before the app's next await after initialize(). Never rejects.
+ */
+export function ready(): Promise<void> {
+  return pending;
 }
 
 // Load installed SDKs when the caller did not pass them. Bundlers can hide these; pass instrumentModules there.

@@ -776,3 +776,37 @@ test('a Responses stream the caller throws out of is recorded with what arrived 
   assert.equal(call.response.id, 'r1');
   assert.equal(call.response.output[0].content[0].text, '{"unit":"4B"}');
 });
+
+test('plain initialize() records ES module and CommonJS builds of openai and @anthropic-ai/sdk', async () => {
+  // Regression: autoload used require() only, which patches the CommonJS classes. An ES module app imports
+  // different classes, so nothing was recorded and nothing warned.
+  const out = await child(`
+    initialize({ apiKey: 'k', baseUrl: BASE + '/child/esm' });
+    const { default: EsmOpenAI } = await import('openai');
+    const { default: EsmAnthropic } = await import('@anthropic-ai/sdk');
+    const { createRequire } = await import('node:module');
+    const require = createRequire(import.meta.url);
+    const CjsOpenAI = require('openai').OpenAI;
+    if (CjsOpenAI === EsmOpenAI) throw new Error('expected separate builds');
+    const esm = new EsmOpenAI({ apiKey: 'k', baseURL: BASE + '/v1', maxRetries: 0 });
+    await esm.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'esm chat' }] });
+    await esm.responses.create({ model: 'gpt-x', input: 'esm responses' });
+    await new EsmAnthropic({ apiKey: 'k', baseURL: BASE, maxRetries: 0 }).messages.create({ model: 'claude-x', max_tokens: 5, messages: [{ role: 'user', content: 'esm anthropic' }] });
+    await new CjsOpenAI({ apiKey: 'k', baseURL: BASE + '/v1', maxRetries: 0 }).chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'cjs chat' }] });
+    await new Promise(r => setTimeout(r, 30)); await flush();`);
+  assert.equal(out.code, 0, out.stderr);
+  const calls = recorded('esm').map(c => [c.api, c.request.input ?? (c.request.messages[0].content)]);
+  assert.deepEqual(calls, [['openai-chat', 'esm chat'], ['openai-responses', 'esm responses'], ['anthropic', 'esm anthropic'], ['openai-chat', 'cjs chat']]);
+});
+
+test('await ready() makes a call right after initialize() safe', async () => {
+  const out = await child(`
+    initialize({ apiKey: 'k', baseUrl: BASE + '/child/ready' });
+    const { ready } = await import(${JSON.stringify(dist)});
+    await ready();
+    const o = record();
+    await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'hello' }] });
+    await new Promise(r => setTimeout(r, 30)); await flush();`);
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(recorded('ready').length, 1);
+});
