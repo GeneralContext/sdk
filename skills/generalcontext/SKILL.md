@@ -86,7 +86,7 @@ return Response.json(result);
 
 ### Report outcomes and events (ground truth)
 
-When the app knows whether a conversation actually worked (the order refunded, the tour booked, the customer came back angry, a person had to step in), report it. We see it next to the transcript, and a conversation that sounded fine but booked nothing is caught.
+When the app knows whether a conversation actually worked (the order refunded, the tour booked, the customer came back angry, a person had to step in), report it. Reviewers see it next to the transcript, and a conversation that sounded fine but booked nothing is caught.
 
 ```ts
 import { reportOutcome, logEvent } from "generalcontext";
@@ -152,7 +152,7 @@ Both context managers follow `await`, so they work in `async def` bodies. They d
 
 1. Run one real conversation through the app inside a session, then `flush()`.
 2. On the workspace's **Connect** page, step 4 (**Verify**) turns green within seconds of the first call, and the conversation appears under **Conversations**, grouped under the session id you passed.
-3. Open it: every model call, tool call and reply should be there in order, with the agent's instructions and tools under "What the agent was given". If a step you know happened is missing, a call site was missed: go back to the inventory.
+3. Open it: the timeline shows the conversation's main thread, and **Every model call** lists each call in order, with side calls (a classifier, a summary, a worker) marked and named by their `task`. The agent's instructions and tools are under "What the agent was given". If a call you know happened is missing from that list, a call site was missed: go back to the inventory.
 4. If the app reports outcomes, the conversation shows **Your outcome**; events show under **What happened in your systems**.
 
 A quick check of the key and collector from the shell (expect `{"accepted":0,"rejected":[]}`):
