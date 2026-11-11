@@ -36,8 +36,8 @@ class Collector(BaseHTTPRequestHandler):
         if self.path.startswith("/api/platform-collect/status"):
             session = None
             if "session=" in self.path:
-                found = "session=chat%3A1" in self.path
-                session = {"id": "chat:1", "found": found, "calls": 3 if found else 0,
+                found = "session=chat%3A1" in self.path or "session=chat%3A3" in self.path
+                session = {"id": "chat:1", "found": found, "calls": (1 if "chat%3A3" in self.path else 3) if found else 0,
                            "models": ["gpt-test"] if found else [], "received_at": None}
             return self.reply(200, {"workspace": "elise", "key": {"label": "ci", "scopes": ["evals"] if key == EVALS_KEY else ["ingest"]},
                                     "last_call_at": "2026-11-09T00:00:00Z", "last_source": "sdk", "session": session})
@@ -85,13 +85,15 @@ class CliTest(unittest.TestCase):
     def test_verify_prints_workspace_scopes_and_last_call(self):
         code, out, _ = self.run_cli("verify", key=INGEST_KEY)
         self.assertEqual(code, 0)
-        self.assertIn("Workspace elise: key ci (sends traffic).", out)
+        self.assertIn('Workspace elise. Key "ci" sends traffic.', out)
         self.assertIn("from sdk", out)
 
     def test_verify_session_found_and_not_found(self):
         code, out, _ = self.run_cli("verify", "--session", "chat:1")
         self.assertEqual(code, 0)
         self.assertIn("Conversation chat:1: arrived, 3 calls (gpt-test).", out)
+        code, out, _ = self.run_cli("verify", "--session", "chat:3")
+        self.assertIn("Conversation chat:3: arrived, 1 call (gpt-test).", out)
         code, out, _ = self.run_cli("verify", "--session", "chat:2")
         self.assertEqual(code, 1)
         self.assertIn("Conversation chat:2: not found yet.", out)

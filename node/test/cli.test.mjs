@@ -23,6 +23,7 @@ before(async () => {
       const id = url.searchParams.get('session');
       const session = id == null ? null : id === 'conv-1'
         ? { id, found: true, calls: 3, models: ['gpt-x', 'claude-x'], received_at: '2026-11-10T00:00:00Z' }
+        : id === 'conv-one' ? { id, found: true, calls: 1, models: ['gpt-x'], received_at: '2026-11-10T00:00:00Z' }
         : { id, found: false, calls: 0, models: [], received_at: null };
       return reply(200, { workspace: 'elise', key: { label: 'prod', scopes: ['ingest'] }, last_call_at: '2026-11-10T00:00:00Z', last_source: 'sdk', session });
     }
@@ -63,6 +64,8 @@ test('verify --session found exits 0, not found exits 1', async () => {
   let out = await run(['verify', '--session', 'conv-1']);
   assert.equal(out.code, 0, out.stderr);
   assert.match(out.stdout, /Conversation conv-1: arrived, 3 calls \(gpt-x, claude-x\)\./);
+  out = await run(['verify', '--session', 'conv-one']);
+  assert.match(out.stdout, /Conversation conv-one: arrived, 1 call \(gpt-x\)\./);
   out = await run(['verify', '--session=nope']);
   assert.equal(out.code, 1);
   assert.match(out.stdout, /Conversation nope: not found yet\./);

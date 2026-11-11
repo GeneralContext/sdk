@@ -75,16 +75,18 @@ def verify(args):
         print(json.dumps(status))
         return 1 if args.session and not (session or {}).get("found") else 0
     key = status.get("key") or {}
-    scopes = ", ".join(SCOPES.get(s, s) for s in key.get("scopes") or []) or "no scopes"
-    print(f"Workspace {status.get('workspace')}: key {key.get('label') or '(unnamed)'} ({scopes}).")
+    scopes = " and ".join(SCOPES.get(s, s) for s in key.get("scopes") or []) or "has no scopes"
+    label = f' "{key["label"]}"' if key.get("label") else ""
+    print(f"Workspace {status.get('workspace')}. Key{label} {scopes}.")
     if status.get("last_call_at"):
         print(f"Last call arrived {status['last_call_at']} from {status.get('last_source') or 'unknown'}.")
     else:
         print("No calls have arrived yet.")
     if args.session:
         if session and session.get("found"):
-            models = ", ".join(session.get("models") or []) or "no model"
-            print(f"Conversation {args.session}: arrived, {session.get('calls', 0)} calls ({models}).")
+            calls = session.get("calls") or 0
+            models = ", ".join(session.get("models") or [])
+            print(f"Conversation {args.session}: arrived, {calls} call{'' if calls == 1 else 's'}{f' ({models})' if models else ''}.")
         else:
             print(f"Conversation {args.session}: not found yet.")
             return 1
