@@ -1034,7 +1034,13 @@ function rtServerEvent(state: RtState, event: any) {
       break;
     case 'response.output_audio.delta': case 'response.audio.delta': {
       const r = rtResponseFor(state, event.response_id);
-      if (r && !r.voice.first_audio_at) { r.voice.first_audio_at = now; r.firstAudioMs = Date.now(); }
+      if (r && !r.voice.first_audio_at) {
+        r.voice.first_audio_at = now; r.firstAudioMs = Date.now();
+        // The caller has been waiting since they stopped speaking, through any silent response before
+        // this one (a tool call): the wait ends at the first audio they hear.
+        if (state.speechStoppedAt) r.voice.speech_stopped_at = state.speechStoppedAt;
+        state.speechStoppedAt = null;
+      }
       if (r && typeof event.delta === 'string') r.audioBytes += Math.floor(event.delta.length * 3 / 4);
       break;
     }
@@ -1105,7 +1111,6 @@ function rtStart(state: RtState, id: unknown, now: string): RtResponse {
     voice: { speech_stopped_at: state.speechStoppedAt, first_audio_at: null, interrupted: false },
   };
   if (state.next) { r.instructions = state.next.instructions; r.tools = state.next.tools; state.next = undefined; }
-  state.speechStoppedAt = null;
   rtLive.add(state);
   return r;
 }

@@ -1320,6 +1320,11 @@ class _RealtimeState:
             if r is not None:
                 if r.voice["first_audio_at"] is None:
                     r.voice["first_audio_at"], r.first_audio = _now(), time.monotonic()
+                    # The caller has been waiting since they stopped speaking, through any silent response
+                    # before this one (a tool call): the wait ends at the first audio they hear.
+                    if self.speech_stopped_at is not None:
+                        r.voice["speech_stopped_at"] = self.speech_stopped_at
+                    self.speech_stopped_at = None
                 delta = event.get("delta")
                 if isinstance(delta, str):
                     r.audio_bytes += len(delta) * 3 // 4
@@ -1390,7 +1395,6 @@ class _RealtimeState:
             r.instructions, r.tools = self.next
             r.has_overrides = True
             self.next = None
-        self.speech_stopped_at = None
         _live_realtime.add(self)
         return r
 

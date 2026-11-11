@@ -1051,6 +1051,45 @@ test('OpenAI Realtime: an error event and a socket closed mid-response are recor
   assert.doesNotMatch(JSON.stringify(calls), LONG_BASE64);
 });
 
+test('OpenAI Realtime: the wait before a reply counts from the caller, through a silent tool call first', async () => {
+  // A caller stops speaking, the model calls a tool (no audio), then speaks after the result. The caller
+  // waited the whole time, so the spoken reply's latency starts at speech_stopped, not at its own response.
+  const mod = await optional('openai/realtime/websocket');
+  if (!mod) return;
+  await drain();
+  const Real = globalThis.WebSocket;
+  class FakeSocket extends EventTarget {
+    constructor(url) { super(); this.url = url; this.readyState = 1; }
+    send() {}
+    close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
+    server(e) { const m = new Event('message'); m.data = JSON.stringify(e); this.dispatchEvent(m); }
+  }
+  globalThis.WebSocket = FakeSocket;
+  let rt;
+  try {
+    const client = new OpenAI({ apiKey: 'k', baseURL: 'http://127.0.0.1:9/v1', dangerouslyAllowBrowser: true });
+    rt = sdk.withSession('call-4', () => new mod.OpenAIRealtimeWebSocket({ model: 'gpt-realtime', dangerouslyAllowBrowser: true }, client));
+  } finally { globalThis.WebSocket = Real; }
+  const s = rt.socket;
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  s.server({ type: 'input_audio_buffer.speech_stopped', audio_end_ms: 900, item_id: 'u1' });
+  s.server({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'u1', content_index: 0, transcript: 'Any two bedrooms?' });
+  s.server({ type: 'response.created', response: { id: 'r1' } });
+  s.server({ type: 'response.output_item.done', response_id: 'r1', item: { id: 'fc', type: 'function_call', call_id: 'c1', name: 'units', arguments: '{}' } });
+  s.server({ type: 'response.done', response: { id: 'r1', status: 'completed', output: [], usage: null } });
+  await wait(120);
+  s.server({ type: 'response.created', response: { id: 'r2' } });
+  s.server({ type: 'response.output_audio.delta', response_id: 'r2', item_id: 'a2', delta: 'AAAA' });
+  s.server({ type: 'response.output_audio_transcript.done', response_id: 'r2', item_id: 'a2', transcript: 'Yes, unit 204.' });
+  s.server({ type: 'response.done', response: { id: 'r2', status: 'completed', output: [], usage: null } });
+  rt.close();
+  const [toolCall, spoken] = (await drain()).filter(c => c.api === 'openai-realtime');
+  assert.equal(toolCall.voice.first_audio_at, null);
+  assert.match(spoken.voice.speech_stopped_at, /^\d{4}-/);
+  const reply = spoken.response.output.find(item => item.role === 'assistant');
+  assert.ok(reply.voice.latency_ms >= 100, `latency ${reply.voice.latency_ms} includes the tool call`);
+});
+
 test('OpenAI Realtime: OpenAIRealtimeWebSocket is patched too, and state keeps at most 200 items', async () => {
   // Node's global WebSocket needs a real wss:// server, so this drives the patched class through a stand-in
   // global WebSocket instead of the network. The observer and the app's listeners are the same code path.

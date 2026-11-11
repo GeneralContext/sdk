@@ -1116,6 +1116,38 @@ class RealtimeTest(unittest.TestCase):
         self.assertRegex(calls[0]["error"], "overloaded")
         self.assertEqual(calls[0]["request"]["instructions"], "Be brief.")
 
+    def test_the_wait_before_a_reply_counts_from_the_caller_through_a_silent_tool_call(self):
+        # The caller stops speaking, the model calls a tool (no audio), then speaks after the result. The
+        # caller waited the whole time, so the spoken reply's latency starts at speech_stopped.
+        def handler(ws):
+            for message in ws:
+                e = json.loads(message)
+                if e["type"] == "response.create":
+                    send = lambda event: ws.send(json.dumps(event))
+                    send({"type": "input_audio_buffer.speech_stopped", "event_id": "e0", "audio_end_ms": 900, "item_id": "u1"})
+                    send({"type": "conversation.item.input_audio_transcription.completed", "event_id": "e1", "item_id": "u1", "content_index": 0, "transcript": "Any two bedrooms?"})
+                    send({"type": "response.created", "event_id": "e2", "response": {"id": "r1", "status": "in_progress", "output": []}})
+                    send({"type": "response.output_item.done", "event_id": "e3", "response_id": "r1", "output_index": 0, "item": {"id": "fc", "type": "function_call", "call_id": "c1", "name": "units", "arguments": "{}"}})
+                    send({"type": "response.done", "event_id": "e4", "response": {"id": "r1", "status": "completed", "output": [], "usage": None}})
+                    time.sleep(0.12)
+                    send({"type": "response.created", "event_id": "e5", "response": {"id": "r2", "status": "in_progress", "output": []}})
+                    send({"type": "response.output_audio.delta", "event_id": "e6", "response_id": "r2", "item_id": "a2", "output_index": 0, "content_index": 0, "delta": "AAAA"})
+                    send({"type": "response.output_audio_transcript.done", "event_id": "e7", "response_id": "r2", "item_id": "a2", "output_index": 0, "content_index": 0, "transcript": "Yes, unit 204."})
+                    send({"type": "response.done", "event_id": "e8", "response": {"id": "r2", "status": "completed", "output": [], "usage": None}})
+                    ws.close()
+                    return
+        client = self.serve(handler)
+        with generalcontext.session("call-4"):
+            with client.realtime.connect(model="gpt-realtime") as connection:
+                connection.response.create()
+                for _ in connection:
+                    pass
+        tool_call, spoken = self.realtime_calls()
+        self.assertIsNone(tool_call["voice"]["first_audio_at"])
+        self.assertRegex(spoken["voice"]["speech_stopped_at"], r"^\d{4}-")
+        reply = next(item for item in spoken["response"]["output"] if item.get("role") == "assistant")
+        self.assertGreaterEqual(reply["voice"]["latency_ms"], 100)
+
     def test_async_connection_and_bounded_state(self):
         def handler(ws):
             count = 0
