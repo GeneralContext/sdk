@@ -23,8 +23,9 @@ before(async () => {
       const id = url.searchParams.get('session');
       const session = id == null ? null : id === 'conv-1'
         ? { id, found: true, calls: 3, models: ['gpt-x', 'claude-x'], received_at: '2026-11-10T00:00:00Z' }
+        : id === 'conv-one' ? { id, found: true, calls: 1, models: ['gpt-x'], received_at: '2026-11-10T00:00:00Z' }
         : { id, found: false, calls: 0, models: [], received_at: null };
-      return reply(200, { workspace: 'elise', key: { label: 'prod', scopes: ['ingest'] }, last_call_at: '2026-11-10T00:00:00Z', last_source: 'sdk', session });
+      return reply(200, { workspace: 'acme', key: { label: 'prod', scopes: ['ingest'] }, last_call_at: '2026-11-10T00:00:00Z', last_source: 'sdk', session });
     }
     if (url.pathname === '/api/platform-collect/benchmark') {
       if (key !== 'Bearer evals') return reply(403, { error: 'This key cannot download the benchmark. On API keys, create a key that can run the benchmark.' });
@@ -54,7 +55,7 @@ test('dist/cli.js starts with a node shebang', () => {
 test('verify prints workspace, scopes and last call', async () => {
   const out = await run(['verify']);
   assert.equal(out.code, 0, out.stderr);
-  assert.match(out.stdout, /Workspace elise\. Key "prod" sends traffic\./);
+  assert.match(out.stdout, /Workspace acme\. Key "prod" sends traffic\./);
   assert.match(out.stdout, /Last call arrived 2026-11-10T00:00:00Z from sdk\./);
   assert.equal(seen.at(-1).auth, 'Bearer k');
 });
@@ -63,6 +64,8 @@ test('verify --session found exits 0, not found exits 1', async () => {
   let out = await run(['verify', '--session', 'conv-1']);
   assert.equal(out.code, 0, out.stderr);
   assert.match(out.stdout, /Conversation conv-1: arrived, 3 calls \(gpt-x, claude-x\)\./);
+  out = await run(['verify', '--session', 'conv-one']);
+  assert.match(out.stdout, /Conversation conv-one: arrived, 1 call \(gpt-x\)\./);
   out = await run(['verify', '--session=nope']);
   assert.equal(out.code, 1);
   assert.match(out.stdout, /Conversation nope: not found yet\./);
@@ -80,7 +83,7 @@ test('benchmark pull writes the file and prints counts by split', async () => {
   const out = await run(['benchmark', 'pull', '--out', file], { GENERALCONTEXT_API_KEY: 'evals' });
   assert.equal(out.code, 0, out.stderr);
   assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), benchmark);
-  assert.match(out.stdout, /Wrote 3 tasks to .*b\.json \(train 2, held_out 1\)\./);
+  assert.match(out.stdout, /Wrote .*b\.json: 3 tasks \(1 held_out, 2 train\)\./);
 });
 
 test('benchmark pull with an ingest-only key prints the 403 message and exits 1', async () => {

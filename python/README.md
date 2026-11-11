@@ -1,7 +1,7 @@
 # generalcontext
 
 Record your AI agent's model calls for [General Context](https://generalcontextlabs.com/docs). We
-read your agent's production conversations against your policies, and each failure you confirm
+read your agent's production conversations and find where it goes wrong, and each failure you confirm
 becomes an RL and eval task built from the conversation. Your tasks together are your benchmark.
 
 Recording never gets in your agent's way: calls are sent in the background, a failure on our side
@@ -28,6 +28,9 @@ with generalcontext.session(conversation_id, user_id=customer_id, channel="chat"
 generalcontext.flush()   # before a serverless function, job or script exits
 ```
 
+If your app serves several companies of its own, pass `account=` to `session()` (the id or name you
+already use for that company) so conversations are grouped by account.
+
 `initialize()` records every call these clients make in the process, sync and async, streamed or
 not, from clients created before or after it. Call it in every process, including workers.
 
@@ -38,6 +41,15 @@ not, from clients created before or after it. Call it in every process, includin
 | Google Gemini | `google-genai` |
 | AWS Bedrock Converse | `boto3` `bedrock-runtime` (`converse`, `converse_stream`) |
 | Anything else | Send [OpenTelemetry](https://generalcontextlabs.com/docs/opentelemetry) |
+
+**Voice (OpenAI Realtime).** Connections from `client.realtime.connect()` (sync and async, needs
+`openai[realtime]`) are recorded too. Open the connection inside `session(...)` and the whole call lands
+in that conversation. Each `response.done` is recorded as one `openai-realtime` call shaped like a
+Responses call: the instructions and tools, the conversation so far as text (caller turns from the input
+transcription, agent turns from the output transcript, tool calls and their results), and a `voice` field
+with `speech_stopped_at`, `first_audio_at`, `interrupted` and `truncated_at_ms`. Turn on input audio
+transcription in the session to record what the caller said. Audio is never recorded. Pass a connection to
+`wrap()` to record only that one.
 
 Python 3.9 to 3.13. Supported client versions, redaction, outcomes and events, and every option:
 [SDK reference](https://generalcontextlabs.com/docs/sdk).

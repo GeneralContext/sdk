@@ -6,6 +6,7 @@
     generalcontext verify [--session ID] [--json]
     generalcontext benchmark pull [--out benchmark.json]
     generalcontext evals run BENCHMARK --agent ... [--upload]
+    generalcontext evals check BENCHMARK [--judge MODEL] [--grader module:function]
 
 Uses GENERALCONTEXT_API_KEY and GENERALCONTEXT_BASE_URL. Exit 0 on success, 1 on a failed check,
 2 on a usage or configuration error.
@@ -74,16 +75,18 @@ def verify(args):
         print(json.dumps(status))
         return 1 if args.session and not (session or {}).get("found") else 0
     key = status.get("key") or {}
-    scopes = ", ".join(SCOPES.get(s, s) for s in key.get("scopes") or []) or "no scopes"
-    print(f"Workspace {status.get('workspace')}: key {key.get('label') or '(unnamed)'} ({scopes}).")
+    scopes = " and ".join(SCOPES.get(s, s) for s in key.get("scopes") or []) or "has no scopes"
+    label = f' "{key["label"]}"' if key.get("label") else ""
+    print(f"Workspace {status.get('workspace')}. Key{label} {scopes}.")
     if status.get("last_call_at"):
         print(f"Last call arrived {status['last_call_at']} from {status.get('last_source') or 'unknown'}.")
     else:
         print("No calls have arrived yet.")
     if args.session:
         if session and session.get("found"):
-            models = ", ".join(session.get("models") or []) or "no model"
-            print(f"Conversation {args.session}: arrived, {session.get('calls', 0)} calls ({models}).")
+            calls = session.get("calls") or 0
+            models = ", ".join(session.get("models") or [])
+            print(f"Conversation {args.session}: arrived, {calls} call{'' if calls == 1 else 's'}{f' ({models})' if models else ''}.")
         else:
             print(f"Conversation {args.session}: not found yet.")
             return 1
@@ -99,7 +102,7 @@ def benchmark_pull(args):
     tasks = data.get("tasks") or []
     splits = Counter(task.get("split") or "unsplit" for task in tasks)
     detail = ", ".join(f"{count} {name}" for name, count in sorted(splits.items()))
-    print(f"Wrote {args.out}: {len(tasks)} tasks" + (f" ({detail})." if detail else "."))
+    print(f"Wrote {args.out}: {len(tasks)} task{'' if len(tasks) == 1 else 's'}" + (f" ({detail})." if detail else "."))
     return 0
 
 
@@ -109,6 +112,9 @@ def main(argv=None):
     if argv[:2] == ["evals", "run"]:
         from . import evals
         return _exit_code(lambda: evals.main(argv[2:], prog="generalcontext evals run"))
+    if argv[:2] == ["evals", "check"]:
+        from . import evals
+        return _exit_code(lambda: evals.check_main(argv[2:], prog="generalcontext evals check"))
     parser = argparse.ArgumentParser(prog="generalcontext", description="General Context from the command line.")
     commands = parser.add_subparsers(dest="command", metavar="command")
     check = commands.add_parser("verify", help="check the key and that calls are arriving")
@@ -118,8 +124,8 @@ def main(argv=None):
     bench_commands = bench.add_subparsers(dest="action", metavar="action")
     pull = bench_commands.add_parser("pull", help="download the ready tasks")
     pull.add_argument("--out", default="benchmark.json")
-    run = commands.add_parser("evals", help="run the benchmark (generalcontext evals run --help)")
-    run.add_argument("action", choices=["run"])
+    run = commands.add_parser("evals", help="run the benchmark or check its graders (generalcontext evals run --help)")
+    run.add_argument("action", choices=["run", "check"])
     try:
         args = parser.parse_args(argv)
     except SystemExit as exit:

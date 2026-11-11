@@ -83,11 +83,16 @@ GEMINI = {"candidates": [{"content": {"role": "model", "parts": [{"text": "Tours
 class Server(BaseHTTPRequestHandler):
     received = []  # (path, authorization, body) for collector requests
     status = 200
+    fail_times = 0  # answer the next N collector requests with `fail_status` (and Retry-After: 1)
+    fail_status = 503
     providers = []   # Paths of model provider requests
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
         if self.path.startswith("/api/platform-collect"):
+            if Server.fail_times > 0:
+                Server.fail_times -= 1
+                return self.reply(Server.fail_status, {"error": "unavailable"}, {"Retry-After": "1"})
             Server.received.append((self.path, self.headers.get("Authorization"), body))
             return self.reply(Server.status, {"recorded": len(body.get("runs") or []), "unknown": []}
                               if self.path.endswith("/runs") else {})
@@ -107,9 +112,11 @@ class Server(BaseHTTPRequestHandler):
             return self.reply(200, GEMINI)
         self.reply(404, {})
 
-    def reply(self, status, body):
+    def reply(self, status, body, headers=None):
         data = json.dumps(body).encode()
         self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -151,6 +158,7 @@ class SdkTest(unittest.TestCase):
         cls.url = f"http://127.0.0.1:{cls.server.server_port}"
         os.environ["GENERALCONTEXT_REDACT_SALT"] = "shared-secret"
         generalcontext.initialize(api_key=KEY, base_url=cls.url, app_name="support-bot", instrument_http=True)
+        generalcontext._config["base_url"] = cls.url  # another test class may have initialized first
 
     @classmethod
     def tearDownClass(cls):
@@ -160,7 +168,7 @@ class SdkTest(unittest.TestCase):
         self.assertTrue(generalcontext.flush(5))
         Server.received.clear()
         Server.providers.clear()
-        Server.status = 200
+        Server.status, Server.fail_times, Server.fail_status = 200, 0, 503
 
     def calls(self):
         self.assertTrue(generalcontext.flush(5))
@@ -188,10 +196,26 @@ class SdkTest(unittest.TestCase):
         self.assertEqual(call["task"], "qualify")
         self.assertEqual(call["request"]["messages"][0]["content"], "2 beds?")
         self.assertEqual((call["response"], call["error"]), (reply, None))
+        # The shared contract fixture has the shape this SDK sends, field for field.
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "contract", "calls.json")) as handle:
+            fixture = json.load(handle)
+        self.assertEqual(set(fixture), set(body))
+        for example in fixture["calls"]:
+            self.assertEqual(set(example), set(call))
+            self.assertTrue(example["conversation"] is None or set(example["conversation"]) <= {"id", "user_id", "channel", "product", "account", "metadata"})
 
     def test_conversation_is_an_alias_of_session(self):
         self.assertIs(generalcontext.conversation, generalcontext.session)
         self.assertIs(generalcontext.with_session, generalcontext.session)
+
+    def test_account_groups_a_session_by_the_apps_own_customer(self):
+        client = generalcontext.wrap(Client({}))
+        for sid, account in (("a1", "  northwind  "), ("a2", "  "), ("a3", None), ("a4", "x" * 200)):
+            with generalcontext.session(sid, account=account):
+                client.chat.completions.create(model="m", messages=[])
+        calls = self.calls()
+        self.assertEqual([c["conversation"] for c in calls[:3]], [{"id": "a1", "account": "northwind"}, {"id": "a2"}, {"id": "a3"}])
+        self.assertEqual(len(calls[3]["conversation"]["account"]), 120)
 
     def test_an_exception_is_recorded_and_reraised_unchanged(self):
         client = generalcontext.wrap(Client({}))
@@ -202,11 +226,18 @@ class SdkTest(unittest.TestCase):
 
     def test_a_collector_outage_never_reaches_the_agent(self):
         Server.status = 503
+        Server.fail_status, Server.fail_times = 503, 10_000
         client = generalcontext.wrap(Client({"ok": True}))
         self.assertEqual(client.chat.completions.create(messages=[]), {"ok": True})
-        self.assertTrue(generalcontext.flush(5))
+        # The call is held for another try, so flush says it is not sent yet, and returns on time.
+        started = time.perf_counter()
+        self.assertFalse(generalcontext.flush(1))
+        self.assertLess(time.perf_counter() - started, 2)
         self.assertFalse(generalcontext.report_outcome("s1", "success"))
-        self.assertFalse(generalcontext.log_event("s1", "tour.booked"))
+        self.assertFalse(generalcontext.log_event("s1", "order.placed"))
+        Server.status, Server.fail_times = 200, 0  # the collector is back: the held call goes out
+        self.assertTrue(generalcontext.flush(5))
+        self.assertEqual(len(self.calls()), 1)
 
     def test_wrapping_twice_records_once(self):
         client = generalcontext.wrap(generalcontext.wrap(Client({"ok": True})))
@@ -225,6 +256,50 @@ class SdkTest(unittest.TestCase):
         first = sent[0]["content"].split("<phone:")[1][:6]
         self.assertEqual(sent[1]["content"], f"<phone:{first}>")
 
+    def test_credentials_are_never_sent_even_with_redaction_off(self):
+        # A key pasted into a prompt, returned by a tool, or passed as a per-request option. The default
+        # client here has no redaction, so nothing but the always-on masking stands between them and us.
+        openai_key, aws_key, gc_key = "sk-proj-" + "a1B2" * 10, "AKIAIOSFODNN7EXAMPLE", "gck_" + "0f" * 24
+        client = generalcontext.wrap(Client({"choices": [{"message": {"role": "assistant", "content": "Your key " + gc_key + " is set."}}]}))
+        client.chat.completions.create(
+            model="m", messages=[{"role": "user", "content": "here is my key " + openai_key},
+                                 {"role": "tool", "tool_call_id": "t", "content": '{"AccessKeyId": "' + aws_key + '"}'}],
+            extra_headers={"Helicone-Auth": "Bearer sk-helicone-" + "z" * 30}, extra_query={"api-key": "azure-" + "q" * 32})
+        sent = json.dumps(self.calls()[0])
+        for secret in (openai_key, aws_key, gc_key, "sk-helicone", "azure-qqq"):
+            self.assertNotIn(secret, sent)
+        self.assertIn("<openai-key>", sent)
+        self.assertIn("<aws-key>", sent)
+        self.assertIn("<generalcontext-key>", sent)
+        self.assertEqual(generalcontext.mask_secrets("postgres://app:Hunter2pass@db:5432/x"), "postgres://app:<password>@db:5432/x")
+        self.assertNotIn("extra_query", sent)
+        self.assertTrue(generalcontext.report_outcome("s1", "fail", "customer read out " + openai_key))
+        self.assertNotIn(openai_key, json.dumps(Server.received[-1][2]))
+
+    def test_secret_masking_is_fast_on_adversarial_input(self):
+        for text in ("-----BEGIN RSA PRIVATE KEY-----\n" * 3000, "sk-" + "a" * 50_000, "Bearer " * 10_000, ("eyJ" + "a" * 10 + ".") * 5000):
+            started = time.perf_counter()
+            generalcontext.mask_secrets(text)
+            self.assertLess(time.perf_counter() - started, 0.5)
+
+    def test_a_busy_or_failing_collector_loses_nothing(self):
+        # A deploy (503) or a rate limit (429) used to drop the whole batch. It is kept and sent again.
+        for status in (503, 429):
+            Server.received.clear()
+            Server.status, Server.fail_times = 200, 1
+            Server.fail_status = status
+            client = generalcontext.wrap(Client({"choices": []}))
+            for i in range(3):
+                client.chat.completions.create(model="m", messages=[{"role": "user", "content": f"q{i}"}])
+            self.assertTrue(generalcontext.flush(10))
+            self.assertEqual(sorted(c["request"]["messages"][0]["content"] for c in self.calls()), ["q0", "q1", "q2"], status)
+
+    def test_a_refused_key_is_not_retried(self):
+        Server.fail_status, Server.fail_times = 401, 99
+        generalcontext.wrap(Client({"choices": []})).chat.completions.create(model="m", messages=[])
+        with self.assertLogs("generalcontext", "WARNING"):
+            self.assertTrue(generalcontext.flush(5))  # dropped with a warning, not held forever
+
     def test_second_initialize_is_ignored(self):
         with self.assertLogs("generalcontext", "WARNING"):
             generalcontext.initialize(api_key="other")
@@ -241,14 +316,14 @@ class SdkTest(unittest.TestCase):
         self.assertFalse(generalcontext.report_outcome("sms:thread-1", "maybe"))
 
     def test_log_event_posts_to_events(self):
-        self.assertTrue(generalcontext.log_event("sms:thread-1", "tour.booked", {"unit": "402", "beds": 2},
+        self.assertTrue(generalcontext.log_event("sms:thread-1", "order.placed", {"unit": "402", "beds": 2},
                                                  event_id="evt-1", timestamp="2026-11-09T00:00:00+00:00"))
         path, authorization, body = Server.received[-1]
         self.assertEqual((path, authorization), ("/api/platform-collect/events", "Bearer " + KEY))
-        self.assertEqual(body, {"events": [{"event_id": "evt-1", "event_type": "tour.booked",
+        self.assertEqual(body, {"events": [{"event_id": "evt-1", "event_type": "order.placed",
                                             "timestamp": "2026-11-09T00:00:00+00:00", "session_id": "sms:thread-1",
                                             "properties": {"unit": "402", "beds": 2}}]})
-        generalcontext.log_event("s", "lease.signed")
+        generalcontext.log_event("s", "order.placed")
         event = Server.received[-1][2]["events"][0]
         self.assertTrue(event["event_id"] and event["timestamp"])
 
@@ -315,10 +390,83 @@ class SdkTest(unittest.TestCase):
 
     def test_oversized_call_is_dropped(self):
         client = generalcontext.wrap(Client({}))
-        client.chat.completions.create(messages=[{"role": "user", "content": "x" * (generalcontext.MAX_CALL_BYTES + 1)}])
+        # Many strings under the clipping threshold, so compaction cannot bring the call under the limit.
+        client.chat.completions.create(messages=[{"role": "user", "content": "x" * 150_000}] * 30)
         client.chat.completions.create(messages=[{"role": "user", "content": "small"}])
         calls = self.calls()
         self.assertEqual([c["request"]["messages"][0]["content"] for c in calls], ["small"])
+
+    def test_long_text_is_clipped_and_inline_binary_omitted_without_touching_the_request(self):
+        import base64
+        data = base64.b64encode(b"\x07" * 450_000).decode()
+        request = {"messages": [
+            {"role": "user", "content": "s" * 4_100_000},
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": data}},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + data}},
+                {"type": "input_audio", "input_audio": {"format": "wav", "data": data}}]}]}
+        before = json.loads(json.dumps(request))
+        client = generalcontext.wrap(Client({"output": [{"type": "image_generation_call", "id": "ig", "result": data}]}))
+        client.chat.completions.create(**request)
+        self.assertEqual(request, before)
+        [call] = self.calls()
+        text, parts = call["request"]["messages"]
+        self.assertEqual(len(text["content"]), 120_000 + len("\n[... clipped 3980000 characters ...]\n"))
+        self.assertIn("\n[... clipped 3980000 characters ...]\n", text["content"])
+        image, url, audio = parts["content"]
+        self.assertEqual(image["source"]["media_type"], "image/jpeg")
+        self.assertRegex(image["source"]["data"], r"^\[omitted 600000 bytes sha256:[0-9a-f]{12}\]$")
+        self.assertRegex(url["image_url"]["url"], r"^data:image/png;base64,\[omitted 600000 bytes sha256:[0-9a-f]{12}\]$")
+        self.assertRegex(audio["input_audio"]["data"], r"^\[omitted 600000 bytes")
+        self.assertRegex(call["response"]["output"][0]["result"], r"^\[omitted 600000 bytes")
+        gemini = generalcontext.compact_for_recording({"inline_data": {"mime_type": "image/png", "data": data}})
+        self.assertEqual(gemini["inline_data"]["mime_type"], "image/png")
+        self.assertTrue(gemini["inline_data"]["data"].startswith("[omitted"))
+        self.assertEqual(generalcontext.compact_for_recording({"id": "call_1", "name": "run"}), {"id": "call_1", "name": "run"})
+
+    @unittest.skipUnless(HAS_OPENAI, "openai is not installed")
+    def test_a_growing_responses_agent_loop_records_every_call_under_the_limit(self):
+        import base64
+        client = self.openai()
+        image = lambda n: "data:image/png;base64," + base64.b64encode(b"\x01" * n).decode()
+        history = [{"role": "user", "content": [
+            {"type": "input_text", "text": "src " * 375_000},
+            {"type": "input_image", "image_url": image(450_000)},
+            {"type": "input_image", "image_url": image(450_003)}]}]
+        for turn in range(20):
+            request = {"model": "gpt-test", "input": json.loads(json.dumps(history)), "stream": True, "store": False}
+            before = json.loads(json.dumps(request))
+            for _ in client.responses.create(**request):
+                pass
+            self.assertEqual(request, before)
+            history += [{"type": "function_call", "call_id": f"c{turn}", "name": "run", "arguments": "{}"},
+                        {"type": "function_call_output", "call_id": f"c{turn}", "output": "ok"},
+                        {"role": "user", "content": [{"type": "input_image", "image_url": image(300_000 + turn)}]}]
+        calls = self.calls()
+        self.assertEqual(len(calls), 20)
+        for turn, call in enumerate(calls):
+            self.assertLess(len(json.dumps(call)), generalcontext.MAX_CALL_BYTES)
+            text, a, b = call["request"]["input"][0]["content"]
+            self.assertIn("\n[... clipped 1380000 characters ...]\n", text["text"])
+            self.assertRegex(a["image_url"], r"^data:image/png;base64,\[omitted 600000 bytes sha256:[0-9a-f]{12}\]$")
+            self.assertRegex(b["image_url"], r"^data:image/png;base64,\[omitted 600004 bytes")
+            self.assertEqual(len(call["request"]["input"]), 1 + 3 * turn)
+            self.assertIsNotNone(call["response"])
+
+    @unittest.skipUnless(HAS_ANTHROPIC, "anthropic is not installed")
+    def test_anthropic_base64_image_block_is_recorded_as_a_placeholder(self):
+        import anthropic, base64
+        data = base64.b64encode(b"\x02" * 300_000).decode()
+        messages = [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
+            {"type": "text", "text": "what?"}]}]
+        anthropic.Anthropic(api_key="sk-test", base_url=self.url, max_retries=0).messages.create(
+            model="claude-test", max_tokens=5, messages=messages)
+        self.assertEqual(messages[0]["content"][0]["source"]["data"], data)
+        [call] = self.calls()
+        source = call["request"]["messages"][0]["content"][0]["source"]
+        self.assertEqual(source["media_type"], "image/png")
+        self.assertRegex(source["data"], r"^\[omitted 400000 bytes sha256:[0-9a-f]{12}\]$")
 
     def test_nan_and_infinity_in_a_request_never_poison_the_batch(self):
         # The collector rejects NaN/Infinity (not JSON), which used to drop every call in the batch.
@@ -349,9 +497,9 @@ class SdkTest(unittest.TestCase):
 
     def test_batches_split_by_bytes(self):
         client = generalcontext.wrap(Client({}))
-        big = "y" * 1_500_000
+        big = [{"role": "user", "content": "y" * 150_000}] * 10
         for _ in range(4):
-            client.chat.completions.create(messages=[{"role": "user", "content": big}])
+            client.chat.completions.create(messages=big)
         self.assertEqual(len(self.calls()), 4)
         batches = [body for path, _, body in Server.received if path.endswith("/sdk")]
         self.assertGreaterEqual(len(batches), 2)
@@ -812,3 +960,321 @@ class KillSwitchWrapTest(unittest.TestCase):
             self.assertNotIn("create", vars(client.chat.completions), "wrap must not patch the client")
         finally:
             del os.environ["GENERALCONTEXT_DISABLED"]
+
+
+# ---- OpenAI Realtime (voice) --------------------------------------------------------------------
+# A fake Realtime server (websockets, plain ws://) drives a real client.realtime.connect() from the installed openai.
+
+def _realtime_support():
+    if not HAS_OPENAI:
+        return "openai is not installed"
+    if importlib.util.find_spec("websockets") is None:
+        return "websockets is not installed (openai[realtime])"
+    try:
+        from openai.resources.realtime.realtime import RealtimeConnection  # noqa: F401
+    except Exception:
+        return "this openai has no client.realtime.connect()"
+    return None
+
+
+REALTIME_SKIP = _realtime_support()
+AUDIO = __import__("base64").b64encode(b"\x07" * 6000).decode()  # 8000 base64 characters, never recorded
+
+
+def _two_turn_server(sent, received):
+    tools = [{"type": "function", "name": "get_plan", "description": "Plan for an account",
+              "parameters": {"type": "object", "properties": {"order": {"type": "string"}}}}]
+    usage = lambda i, o: {"total_tokens": i + o, "input_tokens": i, "output_tokens": o}  # noqa: E731
+    fc = {"id": "item_fc", "type": "function_call", "call_id": "call_plan", "name": "get_plan",
+          "arguments": "{\"unit\":\"4B\"}", "status": "completed"}
+    preamble = {"id": "item_a1", "type": "message", "role": "assistant", "status": "completed",
+                "content": [{"type": "output_audio", "transcript": "Let me check."}]}
+    answer = {"id": "item_a2", "type": "message", "role": "assistant", "status": "incomplete",
+              "content": [{"type": "output_audio", "transcript": "Account 4B is on Fiber 500."}]}
+
+    def handler(ws):
+        def send(event):
+            sent.append(event["type"])
+            ws.send(json.dumps(event))
+        send({"type": "session.created", "event_id": "e0", "session": {"type": "realtime", "model": "gpt-realtime", "instructions": "", "tools": []}})
+        appended = False
+        for message in ws:
+            e = json.loads(message)
+            received.append(e)
+            kind = e["type"]
+            if kind == "session.update":
+                send({"type": "session.updated", "event_id": "e1", "session": dict({"type": "realtime", "model": "gpt-realtime"}, **e["session"])})
+            elif kind == "input_audio_buffer.append" and not appended:
+                appended = True
+                for event in [
+                    {"type": "input_audio_buffer.speech_started", "audio_start_ms": 0, "item_id": "item_u1"},
+                    {"type": "input_audio_buffer.speech_stopped", "audio_end_ms": 1800, "item_id": "item_u1"},
+                    {"type": "input_audio_buffer.committed", "item_id": "item_u1", "previous_item_id": None},
+                    {"type": "conversation.item.added", "previous_item_id": None, "item": {"id": "item_u1", "type": "message", "role": "user", "content": [{"type": "input_audio", "transcript": None}]}},
+                    {"type": "conversation.item.input_audio_transcription.completed", "item_id": "item_u1", "content_index": 0, "transcript": "What is the rent for 4B?", "usage": {"type": "duration", "seconds": 2}},
+                    {"type": "response.created", "response": {"id": "resp_1", "object": "realtime.response", "status": "in_progress", "output": []}},
+                    {"type": "response.output_item.added", "response_id": "resp_1", "output_index": 0, "item": dict(preamble, status="in_progress", content=[])},
+                    {"type": "response.output_audio.delta", "response_id": "resp_1", "item_id": "item_a1", "output_index": 0, "content_index": 0, "delta": AUDIO},
+                    {"type": "response.output_audio_transcript.done", "response_id": "resp_1", "item_id": "item_a1", "output_index": 0, "content_index": 0, "transcript": "Let me check."},
+                    {"type": "response.output_item.added", "response_id": "resp_1", "output_index": 1, "item": dict(fc, arguments="", status="in_progress")},
+                    {"type": "response.function_call_arguments.done", "response_id": "resp_1", "item_id": "item_fc", "output_index": 1, "call_id": "call_plan", "name": "get_plan", "arguments": fc["arguments"]},
+                    {"type": "response.output_item.done", "response_id": "resp_1", "output_index": 1, "item": fc},
+                    {"type": "response.done", "response": {"id": "resp_1", "object": "realtime.response", "status": "completed", "output": [preamble, fc], "usage": usage(120, 15)}},
+                ]:
+                    send(dict(event, event_id="e"))
+            elif kind == "conversation.item.create":
+                send({"type": "conversation.item.added", "event_id": "e12", "previous_item_id": "item_fc", "item": dict(e["item"], id="item_fco")})
+            elif kind == "response.create":
+                send({"type": "response.created", "event_id": "e13", "response": {"id": "resp_2", "object": "realtime.response", "status": "in_progress", "output": []}})
+                send({"type": "response.output_item.added", "event_id": "e14", "response_id": "resp_2", "output_index": 0, "item": dict(answer, status="in_progress", content=[])})
+                for i in range(3):
+                    send({"type": "response.output_audio.delta", "event_id": f"e15{i}", "response_id": "resp_2", "item_id": "item_a2", "output_index": 0, "content_index": 0, "delta": AUDIO})
+                send({"type": "response.output_audio_transcript.done", "event_id": "e16", "response_id": "resp_2", "item_id": "item_a2", "output_index": 0, "content_index": 0, "transcript": answer["content"][0]["transcript"]})
+                send({"type": "input_audio_buffer.speech_started", "event_id": "e17", "audio_start_ms": 2600, "item_id": "item_u2"})
+            elif kind == "conversation.item.truncate":
+                send({"type": "conversation.item.truncated", "event_id": "e18", "item_id": e["item_id"], "content_index": 0, "audio_end_ms": e["audio_end_ms"]})
+            elif kind == "response.cancel":
+                send({"type": "response.output_item.done", "event_id": "e19", "response_id": "resp_2", "output_index": 0, "item": answer})
+                send({"type": "response.done", "event_id": "e20", "response": {"id": "resp_2", "object": "realtime.response", "status": "cancelled", "output": [answer], "usage": usage(160, 30)}})
+    return handler, tools
+
+
+def _voice_contract():
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "contract", "voice.json")) as handle:
+        return [c for c in json.load(handle)["calls"] if c["api"] == "openai-realtime"]
+
+
+def _item_kind(item):
+    return item.get("type") or item.get("role")
+
+
+def _item_shapes(calls):
+    """Item kind to its keys, and to its voice keys without the optional truncated_at_ms."""
+    shapes = {}
+    for call in calls:
+        for item in call["request"]["input"] + call["response"]["output"]:
+            voice = sorted(set(item["voice"]) - {"truncated_at_ms"}) if "voice" in item else None
+            shapes.setdefault(_item_kind(item), set()).add((tuple(sorted(item)), tuple(voice) if voice else None))
+    return shapes
+
+
+@unittest.skipIf(REALTIME_SKIP, REALTIME_SKIP or "")
+class RealtimeTest(unittest.TestCase):
+    # The collector and setup from SdkTest, without inheriting its tests.
+    setUpClass = classmethod(SdkTest.setUpClass.__func__)
+    tearDownClass = classmethod(SdkTest.tearDownClass.__func__)
+    setUp = SdkTest.setUp
+    calls = SdkTest.calls
+
+    def serve(self, handler):
+        from websockets.sync.server import serve
+        server = serve(handler, "127.0.0.1", 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return openai.OpenAI(api_key="sk-test", base_url=f"http://127.0.0.1:{server.socket.getsockname()[1]}/v1", max_retries=0)
+
+    def realtime_calls(self):
+        return [c for c in self.calls() if c["api"] == "openai-realtime"]
+
+    def test_two_turn_voice_call_records_one_responses_shaped_call_per_response(self):
+        sent, received = [], []
+        handler, tools = _two_turn_server(sent, received)
+        client = self.serve(handler)
+        seen = []
+        with generalcontext.session("call-1"):
+            connection = client.realtime.connect(model="gpt-realtime").enter()
+        with generalcontext.session("other-scope"):  # the session at connect time is the one that counts
+            connection.session.update(session={"type": "realtime", "instructions": "You are a support agent.", "tools": tools,
+                                               "audio": {"output": {"format": {"type": "audio/pcm", "rate": 24000}}}})
+            connection.input_audio_buffer.append(audio=AUDIO)
+            playing, done = None, 0
+            for event in connection:
+                seen.append(event.type)
+                if event.type == "response.function_call_arguments.done":
+                    connection.conversation.item.create(item={"type": "function_call_output", "call_id": event.call_id, "output": "{\"plan\":\"Fiber 500\"}"})
+                    connection.response.create()
+                elif event.type == "response.output_audio.delta":
+                    playing = playing or event.item_id
+                elif event.type == "input_audio_buffer.speech_started" and playing:
+                    connection.conversation.item.truncate(item_id=playing, content_index=0, audio_end_ms=640)
+                    connection.response.cancel()
+                    playing = None
+                elif event.type == "response.done":
+                    done += 1
+                    if done == 2:
+                        break
+            connection.close()
+        calls = self.realtime_calls()
+
+        self.assertEqual(seen, sent)  # the app saw every server event, in order
+        self.assertEqual(next(e for e in received if e["type"] == "input_audio_buffer.append")["audio"], AUDIO)
+        self.assertEqual([e["type"] for e in received], ["session.update", "input_audio_buffer.append", "conversation.item.create",
+                                                         "response.create", "conversation.item.truncate", "response.cancel"])
+        self.assertEqual(len(calls), 2)
+        for c in calls:
+            self.assertEqual(c["conversation"], {"id": "call-1", "channel": "voice"})
+            self.assertEqual(c["request"]["model"], "gpt-realtime")
+            self.assertEqual(c["request"]["instructions"], "You are a support agent.")
+            self.assertEqual(c["request"]["tools"][0]["name"], "get_plan")
+            self.assertTrue({"speech_stopped_at", "first_audio_at", "interrupted"} <= set(c["voice"]))
+        first, second = calls
+        user = {"role": "user", "content": [{"type": "input_text", "text": "What is the rent for 4B?"}], "audio": True,
+                "at": first["request"]["input"][0].get("at")}
+        self.assertIsNotNone(user["at"])
+        latency = generalcontext._rt_latency(first["voice"])
+        self.assertIsInstance(latency, int)
+        said = {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Let me check."}], "audio": True,
+                "voice": {"latency_ms": latency, "interrupted": False}}
+        call = {"type": "function_call", "call_id": "call_plan", "name": "get_plan", "arguments": "{\"unit\":\"4B\"}"}
+        result = {"type": "function_call_output", "call_id": "call_plan", "output": "{\"plan\":\"Fiber 500\"}"}
+        reply = {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Account 4B is on Fiber 500."}], "audio": True,
+                 "voice": {"latency_ms": None, "interrupted": True, "truncated_at_ms": 640}}
+        self.assertEqual(first["request"]["input"], [user])
+        self.assertEqual(first["response"], {"id": "resp_1", "output": [said, call], "usage": {"total_tokens": 135, "input_tokens": 120, "output_tokens": 15}})
+        self.assertIsNone(first["error"])
+        self.assertIsNotNone(first["voice"]["speech_stopped_at"])
+        self.assertIsNotNone(first["voice"]["first_audio_at"])
+        self.assertFalse(first["voice"]["interrupted"])
+        # The first reply's timing is still on its item in the second call's history.
+        # Each later reply sends only what is new since the last one, chained to it: here the tool result.
+        self.assertNotIn("previous_response_id", first["request"])
+        self.assertEqual(second["request"]["previous_response_id"], "resp_1")
+        self.assertEqual(second["request"]["input"], [result])
+        self.assertEqual(first["response"]["output"][0]["voice"], {"latency_ms": latency, "interrupted": False})
+        self.assertEqual(second["response"]["output"], [reply])
+        self.assertIsNotNone(second["voice"]["first_audio_at"])
+        self.assertTrue(second["voice"]["interrupted"])
+        self.assertEqual(second["voice"]["truncated_at_ms"], 640)
+        recorded = json.dumps(calls)
+        # The shared voice fixture has the shape this SDK sends, key for key. Values may differ.
+        fixture = _voice_contract()
+        # The first reply carries the history so far, later ones only what is new, chained by previous_response_id.
+        for index, c in enumerate(calls):
+            like = fixture[min(index, len(fixture) - 1)]
+            self.assertEqual(set(c), set(like))
+            self.assertEqual(set(c["request"]), set(like["request"]))
+            self.assertEqual(set(c["response"]), set(like["response"]))
+        expected, actual = _item_shapes(fixture), _item_shapes(calls)
+        self.assertEqual(set(actual), {"user", "message", "function_call", "function_call_output"})
+        for kind, shapes in actual.items():
+            self.assertLessEqual(shapes, expected[kind], kind)
+        self.assertIsNone(__import__("re").search(r"[A-Za-z0-9+/]{100,}", recorded))
+        self.assertNotIn("omitted", recorded)  # dropped at the source, not even a placeholder
+
+    def test_error_event_and_socket_closed_mid_response_record_an_error(self):
+        def handler(ws):
+            ws.send(json.dumps({"type": "session.created", "event_id": "e0", "session": {"model": "gpt-realtime", "instructions": "Be brief.", "tools": []}}))
+            for message in ws:
+                e = json.loads(message)
+                if e["type"] == "conversation.item.create":
+                    ws.send(json.dumps({"type": "conversation.item.added", "event_id": "e1", "item": dict(e["item"], id="item_u")}))
+                if e["type"] == "response.create":
+                    ws.send(json.dumps({"type": "response.created", "event_id": "e2", "response": {"id": "resp_x", "status": "in_progress", "output": []}}))
+                    ws.send(json.dumps({"type": "response.output_audio.delta", "event_id": "e3", "response_id": "resp_x", "item_id": "i", "output_index": 0, "content_index": 0, "delta": AUDIO}))
+                    ws.send(json.dumps({"type": "error", "event_id": "e4", "error": {"type": "server_error", "code": "overloaded", "message": "The server is overloaded"}}))
+                    ws.close()
+                    return
+        client = self.serve(handler)
+        with generalcontext.session("call-2", account="acme-properties"):
+            with client.realtime.connect(model="gpt-realtime") as connection:
+                connection.conversation.item.create(item={"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]})
+                connection.response.create()
+                kinds = [event.type for event in connection]  # ends when the server closes
+        self.assertEqual(kinds[-1], "error")
+        calls = self.realtime_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["conversation"], {"id": "call-2", "account": "acme-properties", "channel": "voice"})
+        self.assertEqual(calls[0]["request"]["input"], [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}])
+        self.assertRegex(calls[0]["error"], "overloaded")
+        self.assertEqual(calls[0]["request"]["instructions"], "Be brief.")
+
+    def test_the_wait_before_a_reply_counts_from_the_caller_through_a_silent_tool_call(self):
+        # The caller stops speaking, the model calls a tool (no audio), then speaks after the result. The
+        # caller waited the whole time, so the spoken reply's latency starts at speech_stopped.
+        def handler(ws):
+            for message in ws:
+                e = json.loads(message)
+                if e["type"] == "response.create":
+                    send = lambda event: ws.send(json.dumps(event))
+                    send({"type": "input_audio_buffer.speech_stopped", "event_id": "e0", "audio_end_ms": 900, "item_id": "u1"})
+                    send({"type": "conversation.item.input_audio_transcription.completed", "event_id": "e1", "item_id": "u1", "content_index": 0, "transcript": "Any two bedrooms?"})
+                    send({"type": "response.created", "event_id": "e2", "response": {"id": "r1", "status": "in_progress", "output": []}})
+                    send({"type": "response.output_item.done", "event_id": "e3", "response_id": "r1", "output_index": 0, "item": {"id": "fc", "type": "function_call", "call_id": "c1", "name": "units", "arguments": "{}"}})
+                    send({"type": "response.done", "event_id": "e4", "response": {"id": "r1", "status": "completed", "output": [], "usage": None}})
+                    time.sleep(0.12)
+                    send({"type": "response.created", "event_id": "e5", "response": {"id": "r2", "status": "in_progress", "output": []}})
+                    send({"type": "response.output_audio.delta", "event_id": "e6", "response_id": "r2", "item_id": "a2", "output_index": 0, "content_index": 0, "delta": "AAAA"})
+                    send({"type": "response.output_audio_transcript.done", "event_id": "e7", "response_id": "r2", "item_id": "a2", "output_index": 0, "content_index": 0, "transcript": "Yes, unit 204."})
+                    send({"type": "response.done", "event_id": "e8", "response": {"id": "r2", "status": "completed", "output": [], "usage": None}})
+                    ws.close()
+                    return
+        client = self.serve(handler)
+        with generalcontext.session("call-4"):
+            with client.realtime.connect(model="gpt-realtime") as connection:
+                connection.response.create()
+                for _ in connection:
+                    pass
+        tool_call, spoken = self.realtime_calls()
+        self.assertIsNone(tool_call["voice"]["first_audio_at"])
+        self.assertRegex(spoken["voice"]["speech_stopped_at"], r"^\d{4}-")
+        reply = next(item for item in spoken["response"]["output"] if item.get("role") == "assistant")
+        self.assertGreaterEqual(reply["voice"]["latency_ms"], 100)
+
+    def test_a_caller_turn_with_no_transcript_still_shows_and_a_late_transcript_fills_it_in(self):
+        def handler(ws):
+            send = lambda event: ws.send(json.dumps(event))
+            spoke = lambda i: send({"type": "conversation.item.added", "event_id": "x" + i, "previous_item_id": None, "item": {"id": i, "type": "message", "role": "user", "content": [{"type": "input_audio", "transcript": None}]}})
+            def reply(r, text):
+                send({"type": "response.created", "event_id": "c" + r, "response": {"id": r, "status": "in_progress", "output": []}})
+                send({"type": "response.output_text.done", "event_id": "t" + r, "response_id": r, "item_id": "a" + r, "output_index": 0, "content_index": 0, "text": text})
+                send({"type": "response.done", "event_id": "d" + r, "response": {"id": r, "status": "completed", "output": [], "usage": None}})
+            for message in ws:
+                if json.loads(message)["type"] == "response.create":
+                    spoke("u1")
+                    reply("r1", "Hello.")
+                    spoke("u2")
+                    send({"type": "conversation.item.input_audio_transcription.completed", "event_id": "tr", "item_id": "u2", "content_index": 0, "transcript": "Book me in."})
+                    spoke("u2")
+                    reply("r2", "Done.")
+                    ws.close()
+                    return
+        client = self.serve(handler)
+        with generalcontext.session("call-5"):
+            with client.realtime.connect(model="gpt-realtime") as connection:
+                connection.response.create()
+                for _ in connection:
+                    pass
+        calls = self.realtime_calls()
+        users = [item for c in calls for item in c["request"]["input"] if item.get("role") == "user"]
+        self.assertEqual([(item["content"][0]["text"], item.get("audio")) for item in users], [("", True), ("Book me in.", True)])
+
+    def test_async_connection_and_bounded_state(self):
+        def handler(ws):
+            count = 0
+            for message in ws:
+                count += 1
+                if count == 250:
+                    ws.send(json.dumps({"type": "response.created", "response": {"id": "r"}}))
+                    ws.send(json.dumps({"type": "response.output_text.done", "response_id": "r", "item_id": "a", "text": "ok"}))
+                    ws.send(json.dumps({"type": "response.done", "response": {"id": "r", "status": "completed", "output": [], "usage": None}}))
+
+        sync_client = self.serve(handler)
+        client = openai.AsyncOpenAI(api_key="sk-test", base_url=str(sync_client.base_url), max_retries=0)
+
+        async def run():
+            with generalcontext.session("call-3"):
+                async with client.realtime.connect(model="gpt-realtime") as connection:
+                    for i in range(250):
+                        await connection.conversation.item.create(item={"id": f"u{i}", "type": "message", "role": "user", "content": [{"type": "input_text", "text": f"t{i}"}]})
+                    async for event in connection:
+                        if event.type == "response.done":
+                            break
+        asyncio.run(run())
+        calls = self.realtime_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["conversation"], {"id": "call-3", "channel": "voice"})
+        self.assertEqual(len(calls[0]["request"]["input"]), 199)  # 200 kept, one of them the reply
+        self.assertEqual(calls[0]["request"]["input"][0]["content"][0]["text"], "t51")
+        self.assertEqual(calls[0]["response"]["output"], [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}], "voice": {"latency_ms": None, "interrupted": False}}])
+        if os.environ.get("GC_PRINT_REALTIME"):
+            print(json.dumps(calls[0], indent=2))

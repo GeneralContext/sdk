@@ -3,8 +3,10 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import { AzureOpenAI } from 'openai';
@@ -17,6 +19,8 @@ const anthropicVertex = await optional('@anthropic-ai/vertex-sdk');
 
 const childPosts = new Map(); // keyed by request path
 const collected = { calls: [], outcomes: [], events: [], batches: [] };
+// The collector answers the next `failTimes` batches with `failStatus` and Retry-After: 1.
+const collector = { failTimes: 0, failStatus: 503 };
 const sse = (res, events) => {
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   for (const e of events) res.write(e);
@@ -105,6 +109,11 @@ before(async () => {
       if (!childPosts.has(req.url)) childPosts.set(req.url, []);
       childPosts.get(req.url).push({ auth: req.headers.authorization, body: json });
       return reply(200, { ok: true });
+    }
+    if (req.url === '/api/platform-collect/sdk' && collector.failTimes > 0) {
+      collector.failTimes -= 1;
+      res.writeHead(collector.failStatus, { 'content-type': 'application/json', 'retry-after': '1' });
+      return res.end('{"error":"unavailable"}');
     }
     if (req.url === '/api/platform-collect/sdk') { collected.batches.push(json); collected.calls.push(...json.calls); return reply(200, { ok: true }); }
     if (req.url === '/api/platform-collect/outcomes') { collected.outcomes.push({ auth: req.headers.authorization, ...json }); return reply(200, { ok: true }); }
@@ -237,6 +246,16 @@ test('session and task tags survive awaits', async () => {
   assert.equal(calls[2].conversation.id, 'legacy');
 });
 
+test('account groups a session by the app\'s own customer', async () => {
+  await sdk.withSession({ sessionId: 'a1', account: '  northwind  ' }, () => openai().chat.completions.create({ model: 'gpt-x', messages: [] }));
+  await sdk.withSession({ sessionId: 'a2', account: '   ' }, () => openai().chat.completions.create({ model: 'gpt-x', messages: [] }));
+  await sdk.withSession({ sessionId: 'a3', account: 'x'.repeat(200) }, () => openai().chat.completions.create({ model: 'gpt-x', messages: [] }));
+  const calls = await drain();
+  assert.deepEqual(calls[0].conversation, { id: 'a1', account: 'northwind' });
+  assert.deepEqual(calls[1].conversation, { id: 'a2' });
+  assert.equal(calls[2].conversation.account.length, 120);
+});
+
 test('rejected calls are recorded and rethrown unchanged', async () => {
   await assert.rejects(openai().chat.completions.create({ model: 'bad', messages: [] }), err => err instanceof OpenAI.BadRequestError);
   const [call] = await drain();
@@ -252,11 +271,53 @@ test('redaction replaces personal details with stable placeholders', async () =>
   assert.match(text, /<email:[0-9a-f]{6}> or <phone:[0-9a-f]{6}>/);
 });
 
+test('credentials are never sent, even with redaction off, and request options are not recorded', async () => {
+  const openaiKey = 'sk-proj-' + 'a1B2'.repeat(10), awsKey = 'AKIAIOSFODNN7EXAMPLE', gcKey = 'gck_' + '0f'.repeat(24);
+  // This suite initializes with redact: true, and masking must hold without it too: the Python suite runs redaction off.
+  await openai().chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: `here is my key ${openaiKey}` },
+    { role: 'tool', tool_call_id: 't', content: JSON.stringify({ AccessKeyId: awsKey, note: gcKey }) }] },
+    { headers: { 'Helicone-Auth': 'Bearer sk-helicone-' + 'z'.repeat(30) } });
+  const [call] = await drain();
+  const sent = JSON.stringify(call);
+  for (const secret of [openaiKey, awsKey, gcKey, 'sk-helicone']) assert.ok(!sent.includes(secret), secret);
+  assert.match(sent, /<openai-key>/);
+  assert.match(sent, /<aws-key>/);
+  assert.equal(sdk.maskSecrets('postgres://app:Hunter2pass@db:5432/x'), 'postgres://app:<password>@db:5432/x');
+  assert.equal(await sdk.reportOutcome('s1', 'fail', `customer read out ${openaiKey}`), true);
+  assert.ok(!JSON.stringify(collected.outcomes.at(-1)).includes(openaiKey));
+});
+
+test('secret masking is fast on adversarial input', () => {
+  for (const text of ['-----BEGIN RSA PRIVATE KEY-----\n'.repeat(3000), 'sk-' + 'a'.repeat(50_000), 'Bearer '.repeat(10_000), ('eyJ' + 'a'.repeat(10) + '.').repeat(5000)]) {
+    const started = performance.now();
+    sdk.maskSecrets(text);
+    assert.ok(performance.now() - started < 500);
+  }
+});
+
+test('a busy or failing collector loses nothing, and a refused key is not retried', async () => {
+  // A deploy (503) or a rate limit (429) used to drop the whole batch. It is kept and sent again.
+  for (const status of [503, 429]) {
+    await drain();
+    Object.assign(collector, { failTimes: 1, failStatus: status });
+    for (let i = 0; i < 3; i++) await openai().chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: `q${i}` }] });
+    assert.equal(await sdk.flush(1), false, 'the refused batch waits out Retry-After');
+    await new Promise(r => setTimeout(r, 1200));
+    assert.equal(await sdk.flush(5000), true);
+    assert.deepEqual((await drain()).map(c => c.request.messages[0].content).sort(), ['q0', 'q1', 'q2'], String(status));
+  }
+  Object.assign(collector, { failTimes: 1, failStatus: 401 });
+  await openai().chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'refused' }] });
+  assert.equal(await sdk.flush(5000), true, 'a 401 is dropped with a warning, not held');
+  assert.deepEqual(await drain(), []);
+  collector.failTimes = 0;
+});
+
 test('reportOutcome and logEvent post to the collector', async () => {
   assert.equal(await sdk.reportOutcome('s1', 'success', 'booked'), true);
   assert.deepEqual(collected.outcomes.at(-1), { auth: 'Bearer gc_key', session_id: 's1', outcome: 'success', note: 'booked' });
-  assert.equal(await sdk.logEvent({ sessionId: 's1', eventType: 'tour.booked', eventId: 'e1', properties: { unit: '4B' }, timestamp: '2026-01-01T00:00:00.000Z' }), true);
-  assert.deepEqual(collected.events.at(-1), { events: [{ event_id: 'e1', event_type: 'tour.booked', timestamp: '2026-01-01T00:00:00.000Z', session_id: 's1', properties: { unit: '4B' } }] });
+  assert.equal(await sdk.logEvent({ sessionId: 's1', eventType: 'order.placed', eventId: 'e1', properties: { unit: '4B' }, timestamp: '2026-01-01T00:00:00.000Z' }), true);
+  assert.deepEqual(collected.events.at(-1), { events: [{ event_id: 'e1', event_type: 'order.placed', timestamp: '2026-01-01T00:00:00.000Z', session_id: 's1', properties: { unit: '4B' } }] });
 });
 
 test('reportOutcome and logEvent apply redaction so scrubbed session ids match', async () => {
@@ -383,7 +444,9 @@ test('oversized calls are dropped with one warning', async () => {
   const out = await child(`
     initialize({ apiKey: 'k', baseUrl: BASE + '/child/big', instrumentModules: { openAI: OpenAI } });
     const o = record();
-    for (let i = 0; i < 2; i++) await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'x'.repeat(4_100_000) }] });
+    // Many strings under the clipping threshold, so compaction cannot bring the call under the limit.
+    const big = Array.from({ length: 30 }, () => ({ role: 'user', content: 'x'.repeat(150_000) }));
+    for (let i = 0; i < 2; i++) await o.chat.completions.create({ model: 'gpt-x', messages: big });
     ${callOnce} await new Promise(r => setTimeout(r, 30)); await flush();`);
   assert.equal(out.code, 0, out.stderr);
   assert.equal((out.stderr.match(/byte limit/g) ?? []).length, 1);
@@ -394,7 +457,7 @@ test('batches split by bytes as well as count', async () => {
   const out = await child(`
     initialize({ apiKey: 'k', baseUrl: BASE + '/child/split', instrumentModules: { openAI: OpenAI } });
     const o = record();
-    for (let i = 0; i < 5; i++) await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: String(i) + 'x'.repeat(1_500_000) }] });
+    for (let i = 0; i < 5; i++) await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: String(i) + 'x'.repeat(150_000) }, ...Array.from({ length: 9 }, () => ({ role: 'user', content: 'x'.repeat(150_000) }))] });
     await new Promise(r => setTimeout(r, 30)); await flush();`);
   assert.equal(out.code, 0, out.stderr);
   const posts = childPosts.get('/child/split/api/platform-collect/sdk');
@@ -677,4 +740,522 @@ test('autoload finds @google/genai and the Bedrock runtime', { skip: (!genai || 
     await new Promise(r => setTimeout(r, 30)); await flush();`);
   assert.equal(out.code, 0, out.stderr);
   assert.deepEqual(recorded('auto').map(c => c.api), ['gemini', 'bedrock-converse']);
+});
+
+const png = n => 'data:image/png;base64,' + Buffer.alloc(Math.ceil(n * 3 / 4), 7).toString('base64').slice(0, n);
+const placeholder = /^\[omitted (\d+) bytes sha256:[0-9a-f]{12}\]$/;
+
+test('a growing Responses agent loop with a 1.5 MB snapshot and images records every call under the limit', async () => {
+  const client = openai();
+  const snapshot = 'src '.repeat(375_000); // 1.5 MB
+  const input = [{ role: 'user', content: [
+    { type: 'input_text', text: snapshot },
+    { type: 'input_image', image_url: png(600_000) },
+    { type: 'input_image', image_url: png(600_001) },
+  ] }];
+  for (let turn = 0; turn < 20; turn++) {
+    const request = { model: 'gpt-x', input: structuredClone(input), stream: true, store: false };
+    const before = structuredClone(request);
+    const stream = await client.responses.create(request);
+    for await (const _ of stream) { /* consume */ }
+    assert.deepEqual(request, before, 'the caller request is unchanged');
+    input.push({ type: 'function_call', call_id: `c${turn}`, name: 'run', arguments: '{"cmd":"ls"}' });
+    input.push({ type: 'function_call_output', call_id: `c${turn}`, output: 'ok' });
+    input.push({ role: 'user', content: [{ type: 'input_image', image_url: png(300_000 + turn) }] });
+  }
+  const calls = await drain();
+  assert.equal(calls.length, 20);
+  for (const [turn, call] of calls.entries()) {
+    assert.ok(Buffer.byteLength(JSON.stringify(call)) < 4_000_000);
+    const [text, a, b] = call.request.input[0].content;
+    assert.equal(text.text.length, 100_000 + 20_000 + `\n[... clipped ${1_500_000 - 120_000} characters ...]\n`.length);
+    assert.ok(text.text.includes('\n[... clipped 1380000 characters ...]\n'));
+    assert.match(a.image_url, /^data:image\/png;base64,\[omitted 600000 bytes sha256:[0-9a-f]{12}\]$/);
+    assert.match(b.image_url, /^data:image\/png;base64,\[omitted 600001 bytes sha256:[0-9a-f]{12}\]$/);
+    assert.equal(call.request.input.length, 1 + turn * 3);
+    if (turn) assert.equal(call.request.input[1].call_id, 'c0');
+    assert.equal(call.response.status, 'completed');
+  }
+});
+
+test('Anthropic base64 image blocks and Responses image_generation results are replaced, media types kept', () => {
+  const data = Buffer.alloc(3000, 1).toString('base64');
+  const call = {
+    request: { messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } }] }],
+      contents: [{ parts: [{ inlineData: { mimeType: 'image/png', data } }, { inline_data: { mime_type: 'image/png', data } }] }] },
+    response: { output: [{ type: 'image_generation_call', id: 'ig', result: data }] },
+  };
+  const before = structuredClone(call);
+  const out = sdk.compactForRecording(call);
+  assert.deepEqual(call, before);
+  const source = out.request.messages[0].content[0].source;
+  assert.equal(source.media_type, 'image/jpeg');
+  assert.match(source.data, placeholder);
+  assert.equal(source.data.match(placeholder)[1], String(data.length));
+  assert.match(out.request.contents[0].parts[0].inlineData.data, placeholder);
+  assert.equal(out.request.contents[0].parts[0].inlineData.mimeType, 'image/png');
+  assert.match(out.request.contents[0].parts[1].inline_data.data, placeholder);
+  assert.match(out.response.output[0].result, placeholder);
+  assert.equal(out.response.output[0].id, 'ig');
+  assert.equal(sdk.compactForRecording('short'), 'short');
+});
+
+test('Anthropic image blocks are recorded as placeholders through the SDK', async () => {
+  const data = Buffer.alloc(900_000, 2).toString('base64');
+  const request = { model: 'claude-x', max_tokens: 5, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data } }, { type: 'text', text: 'what?' }] }] };
+  await anthropic().messages.create(request);
+  assert.equal(request.messages[0].content[0].source.data, data);
+  const [call] = await drain();
+  assert.match(call.request.messages[0].content[0].source.data, placeholder);
+});
+
+test('a call still over the limit after compaction is dropped with the warning', async () => {
+  const out = await child(`
+    initialize({ apiKey: 'k', baseUrl: BASE + '/child/stillbig', instrumentModules: { openAI: OpenAI } });
+    const o = record();
+    await o.chat.completions.create({ model: 'gpt-x', messages: Array.from({ length: 40 }, () => ({ role: 'user', content: 'y'.repeat(150_000) })) });
+    await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'x'.repeat(4_100_000) }] });
+    ${callOnce} await new Promise(r => setTimeout(r, 30)); await flush();`);
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal((out.stderr.match(/byte limit/g) ?? []).length, 1);
+  const calls = recorded('stillbig');
+  assert.equal(calls.length, 2); // the 4.1 MB string was clipped and kept, the 6 MB of short strings dropped
+  assert.match(calls[0].request.messages[0].content, /clipped 3980000 characters/);
+});
+
+test('a Responses stream the caller throws out of is recorded with what arrived and an error', async () => {
+  const stream = await openai().responses.create({ model: 'gpt-x', input: 'boom', stream: true });
+  const mine = new Error('caller bailed');
+  let seen = 0;
+  await assert.rejects(async () => {
+    for await (const event of stream) { seen++; if (event.type === 'response.output_item.done') throw mine; }
+  }, error => error === mine);
+  assert.ok(seen > 1);
+  const [call] = await drain();
+  assert.equal(call.request.input, 'boom');
+  assert.match(call.error, /ended early/);
+  assert.equal(call.response.id, 'r1');
+  assert.equal(call.response.output[0].content[0].text, '{"unit":"4B"}');
+});
+
+test('plain initialize() records ES module and CommonJS builds of openai and @anthropic-ai/sdk', async () => {
+  // Regression: autoload used require() only, which patches the CommonJS classes. An ES module app imports
+  // different classes, so nothing was recorded and nothing warned.
+  const out = await child(`
+    initialize({ apiKey: 'k', baseUrl: BASE + '/child/esm' });
+    const { default: EsmOpenAI } = await import('openai');
+    const { default: EsmAnthropic } = await import('@anthropic-ai/sdk');
+    const { createRequire } = await import('node:module');
+    const require = createRequire(import.meta.url);
+    const CjsOpenAI = require('openai').OpenAI;
+    if (CjsOpenAI === EsmOpenAI) throw new Error('expected separate builds');
+    const esm = new EsmOpenAI({ apiKey: 'k', baseURL: BASE + '/v1', maxRetries: 0 });
+    await esm.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'esm chat' }] });
+    await esm.responses.create({ model: 'gpt-x', input: 'esm responses' });
+    await new EsmAnthropic({ apiKey: 'k', baseURL: BASE, maxRetries: 0 }).messages.create({ model: 'claude-x', max_tokens: 5, messages: [{ role: 'user', content: 'esm anthropic' }] });
+    await new CjsOpenAI({ apiKey: 'k', baseURL: BASE + '/v1', maxRetries: 0 }).chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'cjs chat' }] });
+    await new Promise(r => setTimeout(r, 30)); await flush();`);
+  assert.equal(out.code, 0, out.stderr);
+  const calls = recorded('esm').map(c => [c.api, c.request.input ?? (c.request.messages[0].content)]);
+  assert.deepEqual(calls, [['openai-chat', 'esm chat'], ['openai-responses', 'esm responses'], ['anthropic', 'esm anthropic'], ['openai-chat', 'cjs chat']]);
+});
+
+test('await ready() makes a call right after initialize() safe', async () => {
+  const out = await child(`
+    initialize({ apiKey: 'k', baseUrl: BASE + '/child/ready' });
+    const { ready } = await import(${JSON.stringify(dist)});
+    await ready();
+    const o = record();
+    await o.chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'hello' }] });
+    await new Promise(r => setTimeout(r, 30)); await flush();`);
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(recorded('ready').length, 1);
+});
+
+test('plain initialize() warns once when no model SDK resolves, and not with instrumentModules', async () => {
+  // A copy of dist in an empty directory resolves none of the provider SDKs, like generalcontext installed
+  // in a different project from the app's model SDK.
+  const { mkdtempSync, copyFileSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(path.join(tmpdir(), 'gc-nosdk-'));
+  copyFileSync(dist, path.join(dir, 'index.js'));
+  writeFileSync(path.join(dir, 'package.json'), '{"type":"module"}');
+  const run = code => new Promise(resolve => {
+    const p = spawn(process.execPath, ['--input-type=module', '-e', `import { initialize, ready } from './index.js'; ${code}`], { cwd: dir, env: { ...process.env, NODE_PATH: '' } });
+    let stderr = '';
+    p.stderr.on('data', d => { stderr += d; });
+    p.on('close', code => resolve({ code, stderr }));
+  });
+  const bare = await run(`initialize({ apiKey: 'k', baseUrl: 'http://127.0.0.1:1' }); await ready();`);
+  assert.equal(bare.code, 0, bare.stderr);
+  assert.equal((bare.stderr.match(/found no model SDK/g) ?? []).length, 1);
+  const given = await run(`initialize({ apiKey: 'k', baseUrl: 'http://127.0.0.1:1', instrumentModules: {} }); await ready();`);
+  assert.doesNotMatch(given.stderr, /found no model SDK/);
+  // In node/, where the SDKs are installed, there is no warning.
+  const found = await child(`initialize({ apiKey: 'k', baseUrl: BASE + '/child/found' }); const { ready } = await import(${JSON.stringify(dist)}); await ready();`);
+  assert.doesNotMatch(found.stderr, /found no model SDK/);
+});
+
+// ---- OpenAI Realtime (voice) ------------------------------------------------------------------
+// A fake Realtime server (ws over plain TCP) drives a real OpenAIRealtimeWS from the installed openai.
+// The client builds a wss:// URL, so the test hands it a plain TCP connection through the `ws` createConnection option.
+
+const realtimeWS = await optional('openai/realtime/ws');
+const wsLib = await optional('ws');
+const AUDIO = Buffer.alloc(6000, 7).toString('base64'); // 8000 base64 characters, never to be recorded
+
+async function fakeRealtime(script) {
+  const wss = new wsLib.WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await new Promise(r => wss.once('listening', r));
+  const sent = [];
+  const received = [];
+  wss.on('connection', socket => {
+    const send = e => { sent.push(e.type); socket.send(JSON.stringify(e)); };
+    script.onOpen(send);
+    socket.on('message', data => { const e = JSON.parse(String(data)); received.push(e); script.onClient(e, send); });
+  });
+  return { port: wss.address().port, sent, received, close: () => new Promise(r => wss.close(r)) };
+}
+
+// Turn 1: the caller asks, the model calls a tool. Turn 2: the app sends the tool result, the model answers
+// in audio, and the caller barges in while it plays.
+function twoTurnScript() {
+  const tools = [{ type: 'function', name: 'get_plan', description: 'Plan for an account', parameters: { type: 'object', properties: { account: { type: 'string' } } } }];
+  const usage = (i, o) => ({ total_tokens: i + o, input_tokens: i, output_tokens: o });
+  const fc = { id: 'item_fc', type: 'function_call', call_id: 'call_plan', name: 'get_plan', arguments: '{"account":"4B"}', status: 'completed' };
+  const preamble = { id: 'item_a1', type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_audio', transcript: 'Let me check.' }] };
+  const answer = { id: 'item_a2', type: 'message', role: 'assistant', status: 'incomplete', content: [{ type: 'output_audio', transcript: 'Account 4B is on Fiber 500.' }] };
+  let appended = false;
+  return {
+    tools,
+    onOpen(send) { send({ type: 'session.created', event_id: 'e0', session: { type: 'realtime', model: 'gpt-realtime', instructions: '', tools: [] } }); },
+    onClient(e, send) {
+      if (e.type === 'session.update') send({ type: 'session.updated', event_id: 'e1', session: { type: 'realtime', model: 'gpt-realtime', ...e.session } });
+      if (e.type === 'input_audio_buffer.append' && !appended) {
+        appended = true;
+        send({ type: 'input_audio_buffer.speech_started', event_id: 'e2', audio_start_ms: 0, item_id: 'item_u1' });
+        send({ type: 'input_audio_buffer.speech_stopped', event_id: 'e3', audio_end_ms: 1800, item_id: 'item_u1' });
+        send({ type: 'input_audio_buffer.committed', event_id: 'e4', item_id: 'item_u1', previous_item_id: null });
+        send({ type: 'conversation.item.added', event_id: 'e5', previous_item_id: null, item: { id: 'item_u1', type: 'message', role: 'user', content: [{ type: 'input_audio', transcript: null }] } });
+        send({ type: 'conversation.item.input_audio_transcription.completed', event_id: 'e6', item_id: 'item_u1', content_index: 0, transcript: 'What is the rent for 4B?', usage: { type: 'duration', seconds: 2 } });
+        send({ type: 'response.created', event_id: 'e7', response: { id: 'resp_1', object: 'realtime.response', status: 'in_progress', output: [] } });
+        send({ type: 'response.output_item.added', event_id: 'e8a', response_id: 'resp_1', output_index: 0, item: { ...preamble, status: 'in_progress', content: [] } });
+        send({ type: 'response.output_audio.delta', event_id: 'e8b', response_id: 'resp_1', item_id: 'item_a1', output_index: 0, content_index: 0, delta: AUDIO });
+        send({ type: 'response.output_audio_transcript.done', event_id: 'e8c', response_id: 'resp_1', item_id: 'item_a1', output_index: 0, content_index: 0, transcript: 'Let me check.' });
+        send({ type: 'response.output_item.added', event_id: 'e8', response_id: 'resp_1', output_index: 1, item: { ...fc, arguments: '', status: 'in_progress' } });
+        send({ type: 'response.function_call_arguments.done', event_id: 'e9', response_id: 'resp_1', item_id: 'item_fc', output_index: 1, call_id: 'call_plan', name: 'get_plan', arguments: fc.arguments });
+        send({ type: 'response.output_item.done', event_id: 'e10', response_id: 'resp_1', output_index: 1, item: fc });
+        send({ type: 'response.done', event_id: 'e11', response: { id: 'resp_1', object: 'realtime.response', status: 'completed', output: [preamble, fc], usage: usage(120, 15) } });
+      }
+      if (e.type === 'conversation.item.create') send({ type: 'conversation.item.added', event_id: 'e12', previous_item_id: 'item_fc', item: { id: 'item_fco', ...e.item } });
+      if (e.type === 'response.create') {
+        send({ type: 'response.created', event_id: 'e13', response: { id: 'resp_2', object: 'realtime.response', status: 'in_progress', output: [] } });
+        send({ type: 'response.output_item.added', event_id: 'e14', response_id: 'resp_2', output_index: 0, item: { ...answer, status: 'in_progress', content: [] } });
+        for (let i = 0; i < 3; i++) send({ type: 'response.output_audio.delta', event_id: `e15${i}`, response_id: 'resp_2', item_id: 'item_a2', output_index: 0, content_index: 0, delta: AUDIO });
+        send({ type: 'response.output_audio_transcript.done', event_id: 'e16', response_id: 'resp_2', item_id: 'item_a2', output_index: 0, content_index: 0, transcript: answer.content[0].transcript });
+        send({ type: 'input_audio_buffer.speech_started', event_id: 'e17', audio_start_ms: 2600, item_id: 'item_u2' });
+      }
+      if (e.type === 'conversation.item.truncate') send({ type: 'conversation.item.truncated', event_id: 'e18', item_id: e.item_id, content_index: 0, audio_end_ms: e.audio_end_ms });
+      if (e.type === 'response.cancel') {
+        send({ type: 'response.output_item.done', event_id: 'e19', response_id: 'resp_2', output_index: 0, item: answer });
+        send({ type: 'response.done', event_id: 'e20', response: { id: 'resp_2', object: 'realtime.response', status: 'cancelled', output: [answer], usage: usage(160, 30) } });
+      }
+    },
+  };
+}
+
+// The app: a voice agent loop. It streams microphone audio, answers tool calls, and stops playback on barge-in.
+async function runVoiceApp(rt, tools, sessionDone) {
+  const seen = { all: [], typed: [] };
+  rt.on('event', e => seen.all.push(e.type));
+  for (const t of ['session.created', 'response.function_call_arguments.done', 'response.output_audio.delta', 'input_audio_buffer.speech_started', 'response.done', 'conversation.item.truncated']) rt.on(t, e => seen.typed.push(e.type));
+  rt.on('error', () => {});
+  let playing = null;
+  rt.on('response.output_audio.delta', e => { playing ??= e.item_id; });
+  rt.on('response.function_call_arguments.done', e => {
+    rt.send({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: e.call_id, output: '{"plan":"Fiber 500"}' } });
+    rt.send({ type: 'response.create' });
+  });
+  rt.on('input_audio_buffer.speech_started', () => {
+    if (!playing) return;
+    rt.send({ type: 'conversation.item.truncate', item_id: playing, content_index: 0, audio_end_ms: 640 });
+    rt.send({ type: 'response.cancel' });
+    playing = null;
+  });
+  let doneCount = 0;
+  rt.on('response.done', () => { if (++doneCount === 2) sessionDone(); });
+  await new Promise(r => rt.socket.once('open', r));
+  rt.send({ type: 'session.update', session: { type: 'realtime', instructions: 'You are a support agent.', tools, audio: { output: { format: { type: 'audio/pcm', rate: 24000 } } } } });
+  rt.send({ type: 'input_audio_buffer.append', audio: AUDIO });
+  return seen;
+}
+
+const LONG_BASE64 = /[A-Za-z0-9+/]{100,}/;
+
+test('OpenAI Realtime: a two-turn voice call records one Responses-shaped call per response, no audio', { skip: (!realtimeWS || !wsLib) && 'openai/realtime/ws or ws not installed' }, async () => {
+  await sdk.ready();
+  await drain();
+  const script = twoTurnScript();
+  const fake = await fakeRealtime(script);
+  const client = new OpenAI({ apiKey: 'k', baseURL: `http://127.0.0.1:${fake.port}/v1`, maxRetries: 0 });
+  let finished;
+  const done = new Promise(r => { finished = r; });
+  const rt = sdk.withSession('call-1', () => new realtimeWS.OpenAIRealtimeWS({
+    model: 'gpt-realtime', options: { createConnection: () => net.connect({ host: '127.0.0.1', port: fake.port }) },
+  }, client));
+  const seen = await sdk.withSession('other-scope', () => runVoiceApp(rt, script.tools, finished));
+  await done;
+  rt.close();
+  await new Promise(r => rt.socket.once('close', r));
+  const calls = (await drain()).filter(c => c.api === 'openai-realtime');
+  await fake.close();
+
+  // App-visible behavior: every server event reached the app's 'event' listener in order, and the typed listeners too.
+  assert.deepEqual(seen.all, fake.sent);
+  assert.equal(seen.typed.filter(t => t === 'response.output_audio.delta').length, 4);
+  assert.equal(seen.typed.filter(t => t === 'response.done').length, 2);
+  // The client events went out unchanged, audio included.
+  assert.equal(fake.received.find(e => e.type === 'input_audio_buffer.append').audio, AUDIO);
+  assert.deepEqual(fake.received.map(e => e.type), ['session.update', 'input_audio_buffer.append', 'conversation.item.create', 'response.create', 'conversation.item.truncate', 'response.cancel']);
+
+  assert.equal(calls.length, 2);
+  for (const c of calls) {
+    assert.deepEqual(c.conversation, { id: 'call-1', channel: 'voice' });
+    assert.equal(c.request.model, 'gpt-realtime');
+    assert.equal(c.request.instructions, 'You are a support agent.');
+    assert.equal(c.request.tools[0].name, 'get_plan');
+    assert.ok(c.voice && 'speech_stopped_at' in c.voice && 'first_audio_at' in c.voice && 'interrupted' in c.voice);
+    assert.ok(c.started_at <= c.ended_at);
+  }
+  const [first, second] = calls;
+  const user = { role: 'user', content: [{ type: 'input_text', text: 'What is the rent for 4B?' }], audio: true, at: first.request.input[0]?.at };
+  assert.match(user.at, /^\d{4}-/);
+  const firstLatency = Date.parse(first.voice.first_audio_at) - Date.parse(first.voice.speech_stopped_at);
+  const said = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Let me check.' }], audio: true, voice: { latency_ms: firstLatency, interrupted: false } };
+  const call = { type: 'function_call', call_id: 'call_plan', name: 'get_plan', arguments: '{"account":"4B"}' };
+  const result = { type: 'function_call_output', call_id: 'call_plan', output: '{"plan":"Fiber 500"}' };
+  const reply = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Account 4B is on Fiber 500.' }], audio: true, voice: { latency_ms: null, interrupted: true, truncated_at_ms: 640 } };
+  assert.deepEqual(first.request.input, [user]);
+  assert.deepEqual(first.response, { id: 'resp_1', output: [said, call], usage: { total_tokens: 135, input_tokens: 120, output_tokens: 15 } });
+  assert.equal(first.error, null);
+  assert.match(first.voice.speech_stopped_at, /^\d{4}-/);
+  assert.match(first.voice.first_audio_at, /^\d{4}-/);
+  assert.equal(first.voice.interrupted, false);
+  // The first reply's timing is still on its item in the second call's history.
+  // Each later reply sends only what is new since the last one, chained to it: here the tool result.
+  assert.equal(first.request.previous_response_id, undefined);
+  assert.equal(second.request.previous_response_id, 'resp_1');
+  assert.deepEqual(second.request.input, [result]);
+  assert.deepEqual(first.response.output[0].voice, { latency_ms: firstLatency, interrupted: false });
+  assert.deepEqual(second.response.output, [reply]);
+  assert.equal(second.response.id, 'resp_2');
+  assert.match(second.voice.first_audio_at, /^\d{4}-/);
+  assert.equal(second.voice.interrupted, true);
+  assert.equal(second.voice.truncated_at_ms, 640);
+  const json = JSON.stringify(calls);
+  // The shared voice fixture has the shape this SDK sends, key for key. Values may differ.
+  const fixture = JSON.parse(readFileSync(new URL('../../contract/voice.json', import.meta.url), 'utf8')).calls.filter(c => c.api === 'openai-realtime');
+  const keys = o => Object.keys(o).sort().join(',');
+  // The first reply carries the history so far, later ones only what is new, chained by previous_response_id.
+  calls.forEach((c, i) => {
+    const like = fixture[Math.min(i, fixture.length - 1)];
+    assert.equal(keys(c), keys(like));
+    assert.equal(keys(c.request), keys(like.request));
+    assert.equal(keys(c.response), keys(like.response));
+  });
+  const shapes = list => {
+    const out = {};
+    for (const c of list) for (const item of [...c.request.input, ...c.response.output]) {
+      const voice = item.voice ? Object.keys(item.voice).filter(k => k !== 'truncated_at_ms').sort().join(',') : '';
+      (out[item.type ?? item.role] ??= new Set()).add(`${keys(item)}|${voice}`);
+    }
+    return out;
+  };
+  const expected = shapes(fixture), actual = shapes(calls);
+  assert.deepEqual(Object.keys(actual).sort(), ['function_call', 'function_call_output', 'message', 'user']);
+  for (const [kind, set] of Object.entries(actual)) for (const shape of set) assert.ok(expected[kind]?.has(shape), `${kind} ${shape}`);
+  assert.doesNotMatch(json, LONG_BASE64);
+  assert.ok(!json.includes(AUDIO.slice(0, 64)));
+  assert.doesNotMatch(json, /omitted \d+ bytes/); // dropped at the source, not even a placeholder
+  if (process.env.GC_PRINT_REALTIME) console.log(JSON.stringify(second, null, 2));
+});
+
+test('OpenAI Realtime: an error event and a socket closed mid-response are recorded with an error', { skip: (!realtimeWS || !wsLib) && 'openai/realtime/ws or ws not installed' }, async () => {
+  await drain();
+  const fake = await fakeRealtime({
+    onOpen(send) { send({ type: 'session.created', event_id: 'e0', session: { model: 'gpt-realtime', instructions: 'Be brief.', tools: [] } }); },
+    onClient(e, send) {
+      if (e.type === 'conversation.item.create') send({ type: 'conversation.item.added', event_id: 'e1', item: { id: 'item_u', ...e.item } });
+      if (e.type === 'response.create') {
+        send({ type: 'response.created', event_id: 'e2', response: { id: 'resp_x', status: 'in_progress', output: [] } });
+        send({ type: 'response.output_audio.delta', event_id: 'e3', response_id: 'resp_x', item_id: 'item_x', output_index: 0, content_index: 0, delta: AUDIO });
+        send({ type: 'error', event_id: 'e4', error: { type: 'server_error', code: 'overloaded', message: 'The server is overloaded' } });
+      }
+    },
+  });
+  const client = new OpenAI({ apiKey: 'k', baseURL: `http://127.0.0.1:${fake.port}/v1`, maxRetries: 0 });
+  const rt = sdk.withSession({ sessionId: 'call-2', account: 'acme-properties' }, () => new realtimeWS.OpenAIRealtimeWS({ model: 'gpt-realtime', options: { createConnection: () => net.connect({ host: '127.0.0.1', port: fake.port }) } }, client));
+  const errors = [];
+  rt.on('error', e => errors.push(e.message));
+  const sawError = new Promise(r => rt.on('event', e => { if (e.type === 'error') setTimeout(r, 5); }));
+  await new Promise(r => rt.socket.once('open', r));
+  rt.send({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] } });
+  rt.send({ type: 'response.create' });
+  await sawError;
+  rt.close();
+  await new Promise(r => rt.socket.once('close', r));
+  const calls = (await drain()).filter(c => c.api === 'openai-realtime');
+  await fake.close();
+  assert.equal(errors.length, 1); // the app's own error listener still fires
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].conversation, { id: 'call-2', account: 'acme-properties', channel: 'voice' });
+  assert.deepEqual(calls[0].request.input, [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }]);
+  assert.match(calls[0].error, /overloaded/);
+  assert.equal(calls[0].request.instructions, 'Be brief.');
+  assert.doesNotMatch(JSON.stringify(calls), LONG_BASE64);
+});
+
+test('OpenAI Realtime: the wait before a reply counts from the caller, through a silent tool call first', async () => {
+  // A caller stops speaking, the model calls a tool (no audio), then speaks after the result. The caller
+  // waited the whole time, so the spoken reply's latency starts at speech_stopped, not at its own response.
+  const mod = await optional('openai/realtime/websocket');
+  if (!mod) return;
+  await drain();
+  const Real = globalThis.WebSocket;
+  class FakeSocket extends EventTarget {
+    constructor(url) { super(); this.url = url; this.readyState = 1; }
+    send() {}
+    close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
+    server(e) { const m = new Event('message'); m.data = JSON.stringify(e); this.dispatchEvent(m); }
+  }
+  globalThis.WebSocket = FakeSocket;
+  let rt;
+  try {
+    const client = new OpenAI({ apiKey: 'k', baseURL: 'http://127.0.0.1:9/v1', dangerouslyAllowBrowser: true });
+    rt = sdk.withSession('call-4', () => new mod.OpenAIRealtimeWebSocket({ model: 'gpt-realtime', dangerouslyAllowBrowser: true }, client));
+  } finally { globalThis.WebSocket = Real; }
+  const s = rt.socket;
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  s.server({ type: 'input_audio_buffer.speech_stopped', audio_end_ms: 900, item_id: 'u1' });
+  s.server({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'u1', content_index: 0, transcript: 'Any two bedrooms?' });
+  s.server({ type: 'response.created', response: { id: 'r1' } });
+  s.server({ type: 'response.output_item.done', response_id: 'r1', item: { id: 'fc', type: 'function_call', call_id: 'c1', name: 'units', arguments: '{}' } });
+  s.server({ type: 'response.done', response: { id: 'r1', status: 'completed', output: [], usage: null } });
+  await wait(120);
+  s.server({ type: 'response.created', response: { id: 'r2' } });
+  s.server({ type: 'response.output_audio.delta', response_id: 'r2', item_id: 'a2', delta: 'AAAA' });
+  s.server({ type: 'response.output_audio_transcript.done', response_id: 'r2', item_id: 'a2', transcript: 'Yes, unit 204.' });
+  s.server({ type: 'response.done', response: { id: 'r2', status: 'completed', output: [], usage: null } });
+  rt.close();
+  const [toolCall, spoken] = (await drain()).filter(c => c.api === 'openai-realtime');
+  assert.equal(toolCall.voice.first_audio_at, null);
+  assert.match(spoken.voice.speech_stopped_at, /^\d{4}-/);
+  const reply = spoken.response.output.find(item => item.role === 'assistant');
+  assert.ok(reply.voice.latency_ms >= 100, `latency ${reply.voice.latency_ms} includes the tool call`);
+});
+
+test('OpenAI Realtime: a caller turn with no transcript still shows, and a late transcript fills it in', async () => {
+  const mod = await optional('openai/realtime/websocket');
+  if (!mod) return;
+  await drain();
+  const Real = globalThis.WebSocket;
+  class FakeSocket extends EventTarget {
+    constructor(url) { super(); this.url = url; this.readyState = 1; }
+    send() {}
+    close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
+    server(e) { const m = new Event('message'); m.data = JSON.stringify(e); this.dispatchEvent(m); }
+  }
+  globalThis.WebSocket = FakeSocket;
+  let rt;
+  try {
+    const client = new OpenAI({ apiKey: 'k', baseURL: 'http://127.0.0.1:9/v1', dangerouslyAllowBrowser: true });
+    rt = sdk.withSession('call-5', () => new mod.OpenAIRealtimeWebSocket({ model: 'gpt-realtime', dangerouslyAllowBrowser: true }, client));
+  } finally { globalThis.WebSocket = Real; }
+  const s = rt.socket;
+  const spoke = id => s.server({ type: 'conversation.item.added', item: { id, type: 'message', role: 'user', content: [{ type: 'input_audio', transcript: null }] } });
+  const reply = (id, text) => {
+    s.server({ type: 'response.created', response: { id } });
+    s.server({ type: 'response.output_text.done', response_id: id, item_id: `a_${id}`, text });
+    s.server({ type: 'response.done', response: { id, status: 'completed', output: [], usage: null } });
+  };
+  spoke('u1');                                  // transcription is off: never transcribed
+  reply('r1', 'Hello.');
+  spoke('u2');
+  s.server({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'u2', content_index: 0, transcript: 'Book me in.' });
+  spoke('u2');                                  // a later echo without a transcript does not erase it
+  reply('r2', 'Done.');
+  rt.close();
+  const calls = (await drain()).filter(c => c.api === 'openai-realtime');
+  const users = calls.flatMap(c => c.request.input).filter(item => item.role === 'user');
+  assert.deepEqual(users.map(item => [item.content[0].text, item.audio]), [['', true], ['Book me in.', true]]);
+});
+
+test('OpenAI Realtime: a long call sends each item once, not its whole history every turn', async () => {
+  // Found under load: 50 calls of 120 turns sent the full history with every reply, 74 MB and a full queue.
+  const mod = await optional('openai/realtime/websocket');
+  if (!mod) return;
+  await drain();
+  const Real = globalThis.WebSocket;
+  class FakeSocket extends EventTarget {
+    constructor(url) { super(); this.url = url; this.readyState = 1; }
+    send() {}
+    close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
+    server(e) { const m = new Event('message'); m.data = JSON.stringify(e); this.dispatchEvent(m); }
+  }
+  globalThis.WebSocket = FakeSocket;
+  let rt;
+  try {
+    const client = new OpenAI({ apiKey: 'k', baseURL: 'http://127.0.0.1:9/v1', dangerouslyAllowBrowser: true });
+    rt = sdk.withSession('call-6', () => new mod.OpenAIRealtimeWebSocket({ model: 'gpt-realtime', dangerouslyAllowBrowser: true }, client));
+  } finally { globalThis.WebSocket = Real; }
+  const s = rt.socket;
+  for (let turn = 1; turn <= 60; turn++) {
+    s.server({ type: 'conversation.item.added', item: { id: `u${turn}`, type: 'message', role: 'user', content: [{ type: 'input_audio', transcript: null }] } });
+    s.server({ type: 'conversation.item.input_audio_transcription.completed', item_id: `u${turn}`, content_index: 0, transcript: `line ${turn}` });
+    s.server({ type: 'response.created', response: { id: `r${turn}` } });
+    s.server({ type: 'response.output_text.done', response_id: `r${turn}`, item_id: `a${turn}`, text: `reply ${turn}` });
+    s.server({ type: 'response.done', response: { id: `r${turn}`, status: 'completed', output: [], usage: null } });
+  }
+  rt.close();
+  const calls = (await drain()).filter(c => c.api === 'openai-realtime');
+  assert.equal(calls.length, 60);
+  assert.equal(calls.reduce((n, c) => n + c.request.input.length, 0), 60, 'each caller line sent exactly once');
+  assert.deepEqual(calls.slice(1).map(c => c.request.previous_response_id), calls.slice(0, -1).map(c => c.response.id));
+});
+
+test('OpenAI Realtime: OpenAIRealtimeWebSocket is patched too, and state keeps at most 200 items', async () => {
+  // Node's global WebSocket needs a real wss:// server, so this drives the patched class through a stand-in
+  // global WebSocket instead of the network. The observer and the app's listeners are the same code path.
+  const mod = await optional('openai/realtime/websocket');
+  if (!mod) return;
+  await drain();
+  const Real = globalThis.WebSocket;
+  class FakeSocket extends EventTarget {
+    constructor(url) { super(); this.url = url; this.readyState = 1; this.out = []; }
+    send(data) { this.out.push(JSON.parse(data)); }
+    close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
+    server(e) { const m = new Event('message'); m.data = JSON.stringify(e); this.dispatchEvent(m); }
+  }
+  globalThis.WebSocket = FakeSocket;
+  let rt;
+  try {
+    const client = new OpenAI({ apiKey: 'k', baseURL: 'http://127.0.0.1:9/v1', dangerouslyAllowBrowser: true });
+    rt = sdk.withSession('call-3', () => new mod.OpenAIRealtimeWebSocket({ model: 'gpt-realtime', dangerouslyAllowBrowser: true }, client));
+  } finally { globalThis.WebSocket = Real; }
+  const heard = [];
+  rt.on('event', e => heard.push(e.type));
+  const s = rt.socket;
+  for (let i = 0; i < 250; i++) rt.send({ type: 'conversation.item.create', item: { id: `u${i}`, type: 'message', role: 'user', content: [{ type: 'input_text', text: `t${i}` }] } });
+  s.server({ type: 'response.created', response: { id: 'r' } });
+  s.server({ type: 'response.output_text.done', response_id: 'r', item_id: 'a', text: 'ok' });
+  s.server({ type: 'response.done', response: { id: 'r', status: 'completed', output: [], usage: null } });
+  rt.close();
+  const calls = (await drain()).filter(c => c.api === 'openai-realtime');
+  assert.deepEqual(heard, ['response.created', 'response.output_text.done', 'response.done']);
+  assert.equal(s.out.length, 250);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].conversation, { id: 'call-3', channel: 'voice' });
+  assert.equal(calls[0].request.input.length, 199); // 200 kept, one of them the reply
+  assert.equal(calls[0].request.input[0].content[0].text, 't51');
+  assert.deepEqual(calls[0].response.output, [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }], voice: { latency_ms: null, interrupted: false } }]);
 });

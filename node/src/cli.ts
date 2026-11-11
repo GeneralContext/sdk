@@ -117,8 +117,8 @@ async function benchmark(args: string[]): Promise<number> {
   const tasks: any[] = Array.isArray(body.tasks) ? body.tasks : [];
   const splits = new Map<string, number>();
   for (const t of tasks) { const s = typeof t?.split === 'string' && t.split ? t.split : 'unsplit'; splits.set(s, (splits.get(s) ?? 0) + 1); }
-  const bySplit = [...splits].map(([s, n]) => `${s} ${n}`).join(', ');
-  console.log(`Wrote ${tasks.length} task${tasks.length === 1 ? '' : 's'} to ${out}${bySplit ? ` (${bySplit})` : ''}.`);
+  const bySplit = [...splits].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([s, n]) => `${n} ${s}`).join(', ');
+  console.log(`Wrote ${out}: ${tasks.length} task${tasks.length === 1 ? '' : 's'}${bySplit ? ` (${bySplit})` : ''}.`);
   return 0;
 }
 

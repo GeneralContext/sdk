@@ -7,7 +7,7 @@
 //
 // Needs `fnm` (Node 18, 20, 22, 24) and python3 (the fake provider is stress/compat/python/fake.py,
 // shared with the Python harness). Builds and packs the SDK once, then installs each package version
-// into its own directory under $STRESS_SCRATCH (default $JCODE_SCRATCH_DIR or the OS temp dir),
+// into its own directory under $STRESS_SCRATCH (default the OS temp dir),
 // never in the repository or the home directory. At most 4 environments run at once.
 // Writes results-node.json and matrix-node.md next to this file; exits 1 on any failure.
 import { spawn, spawnSync } from 'node:child_process';
@@ -38,7 +38,7 @@ const key = v => v.split('.').map(Number);
 const cmp = (a, b) => { const x = key(a), y = key(b); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] - y[i]; return 0; };
 
 // A chosen scratch root is used as is (CI and local runs reuse it); otherwise a private temp dir.
-const ROOT = process.env.STRESS_SCRATCH || process.env.JCODE_SCRATCH_DIR;
+const ROOT = process.env.STRESS_SCRATCH;
 const SCRATCH = ROOT ? path.join(ROOT, 'gc-compat-node') : fs.mkdtempSync(path.join(os.tmpdir(), 'gc-compat-node-'));
 fs.mkdirSync(SCRATCH, { recursive: true, mode: 0o700 });
 const NPM_ENV = { ...process.env, npm_config_cache: path.join(SCRATCH, 'npm-cache'), npm_config_audit: 'false', npm_config_fund: 'false', npm_config_update_notifier: 'false' };

@@ -1,0 +1,93 @@
+{
+  "sdk": "python/0.3.0",
+  "app": null,
+  "calls": [
+    {
+      "api": "openai-responses",
+      "conversation": {
+        "id": "conv_contract_1",
+        "channel": "chat",
+        "product": "support",
+        "account": "acme-retail"
+      },
+      "task": null,
+      "started_at": "2026-11-10T00:00:00Z",
+      "request": {
+        "model": "gpt-6.1-terra",
+        "input": [
+          {
+            "role": "user",
+            "content": "I was charged twice."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "name": "orders__get",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "unit": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "response": {
+        "id": "resp_contract_1",
+        "model": "gpt-6.1-terra",
+        "output": [
+          {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "orders__get",
+            "arguments": "{\"order\": \"10442\"}"
+          }
+        ],
+        "usage": {
+          "input_tokens": 120,
+          "output_tokens": 18
+        }
+      },
+      "ended_at": "2026-11-10T00:00:01Z",
+      "error": null
+    },
+    {
+      "api": "anthropic",
+      "conversation": null,
+      "task": null,
+      "started_at": "2026-11-10T00:00:02Z",
+      "request": {
+        "model": "claude-sonnet-5",
+        "max_tokens": 1024,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Summarize the ledger."
+          }
+        ]
+      },
+      "response": {
+        "id": "msg_contract_1",
+        "model": "claude-sonnet-5",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "One 75 dollar late fee on 11-06."
+          }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+          "input_tokens": 40,
+          "output_tokens": 12
+        }
+      },
+      "ended_at": "2026-11-10T00:00:03Z",
+      "error": null
+    }
+  ]
+}

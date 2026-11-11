@@ -14,7 +14,7 @@
 // logged and dropped, never thrown. No runtime dependencies.
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createHmac, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { createRequire } from 'node:module';
@@ -32,12 +32,16 @@ const FLUSH_TIMEOUT_MS = 10_000; // flush() default, like the Python SDK
 const RETRY_PAUSE_MS = 30_000; // after the collector fails to answer, wait this long before sending again
 
 type Metadata = Record<string, string | number | boolean>;
-export type Session = { sessionId: string; userId?: string; channel?: string; product?: string; metadata?: Metadata };
-type Tags = { id: string; user_id?: string; channel?: string; product?: string; metadata?: Metadata };
-type Api = 'openai-chat' | 'openai-responses' | 'anthropic' | 'gemini' | 'bedrock-converse';
+export type Session = { sessionId: string; userId?: string; channel?: string; product?: string; account?: string; metadata?: Metadata };
+type Tags = { id: string; user_id?: string; channel?: string; product?: string; account?: string; metadata?: Metadata };
+type Api = 'openai-chat' | 'openai-responses' | 'anthropic' | 'gemini' | 'bedrock-converse' | 'openai-realtime';
+/** Voice timing on 'openai-realtime' calls. Timestamps are ISO strings, null when not seen. */
+export type VoiceTiming = {
+  speech_stopped_at: string | null; first_audio_at: string | null; interrupted: boolean; truncated_at_ms?: number;
+};
 export type Call = {
   api: Api; conversation: Tags | null; task: string | null; request: unknown; response: unknown;
-  started_at: string; ended_at: string; error: string | null;
+  started_at: string; ended_at: string; error: string | null; voice?: VoiceTiming;
 };
 type Scrub = (text: string) => string;
 type BeforeSend = (call: Call) => Call | null | undefined;
@@ -86,6 +90,9 @@ let originalFetch: typeof fetch = globalThis.fetch;
 let exitHooked = false;
 let stopped = false; // set when the exit flush runs out of time
 let pausedUntil = 0; // background sends wait until then after a failed send; flush() still tries
+// Prepared calls the collector refused for now (busy, failing, unreachable). Sent before the queue.
+const retry: string[] = [];
+let retryBytes = 0;
 const inflight = new Set<AbortController>();
 
 const apiKey = () => config.apiKey ?? process.env.GENERALCONTEXT_API_KEY;
@@ -128,16 +135,47 @@ export function initialize(options: InitializeOptions = {}): void {
   if (!secureUrl(baseUrl())) warn(`baseUrl ${baseUrl()} is not https; nothing will be sent`);
 
   const modules = options.instrumentModules ?? autoload();
-  // @google/genai ships separate CommonJS and ES module builds with their own classes. require() above found the
-  // CommonJS one, so also patch the ES module build. Starting the import here means it settles before the app's own.
-  if (!options.instrumentModules && modules.googleGenAI) {
-    import('@google/genai' as string).then(patchGemini, () => {});
+  // openai, @anthropic-ai/sdk and @google/genai ship separate CommonJS and ES module builds with their own classes.
+  // require() above found the CommonJS ones, which is what a CommonJS app uses. An ES module app (import OpenAI
+  // from 'openai') gets the other build, so patch that too. patchMethod skips a method already patched.
+  // The imports settle a few ticks after initialize() returns, before an app's own `await import(...)` of the
+  // same module resumes. A call made synchronously right after initialize(), before any await, can run
+  // unrecorded: await ready() first in that case.
+  // OpenAI Realtime (voice) connection classes live in their own entry points. openai/realtime/ws needs the
+  // optional `ws` package, so either may be missing.
+  if (!options.instrumentModules || options.instrumentModules.openAI) {
+    const require = createRequire(import.meta.url);
+    for (const name of REALTIME_MODULES) { try { patchRealtime(require(name)); } catch { /* not installed */ } }
+    const realtime = Promise.all(REALTIME_MODULES.map(name => import(name).then(patchRealtime, () => {}))).then(() => {});
+    pending = pending.then(() => realtime);
+  }
+  if (!options.instrumentModules) {
+    const esm: [string, (m: unknown) => void][] = [['openai', patchOpenAI], ['@anthropic-ai/sdk', patchAnthropic]];
+    if (modules.googleGenAI) esm.push(['@google/genai', patchGemini]);
+    // @aws-sdk/client-bedrock-runtime resolves to one class from both require() and import(), so it needs nothing here.
+    let found = Object.values(modules).some(Boolean);
+    const realtime = pending;
+    pending = Promise.all(esm.map(([name, patch]) => import(name as string).then(m => { found = true; patch(m); }, () => {})))
+      .then(() => { if (!found) warn(NO_SDK); }).then(() => realtime);
   }
   if (modules.openAI) patchOpenAI(modules.openAI);
   if (modules.anthropic) patchAnthropic(modules.anthropic);
   if (modules.googleGenAI) patchGemini(modules.googleGenAI);
   if (modules.bedrockRuntime) patchBedrock(modules.bedrockRuntime);
   if (options.instrumentFetch ?? false) patchFetch();
+}
+
+let pending: Promise<void> = Promise.resolve();
+// Resolution is from this file's location, so an SDK installed in another project's node_modules is not found.
+const NO_SDK = 'found no model SDK to record (openai, @anthropic-ai/sdk, @google/genai, @aws-sdk/client-bedrock-runtime). '
+  + 'Install generalcontext in the same project as your model SDK, or pass instrumentModules.';
+
+/**
+ * Resolves once initialize() has patched every SDK build it found, including the ES module builds it loads
+ * asynchronously. Await it when a model call may run before the app's next await after initialize(). Never rejects.
+ */
+export function ready(): Promise<void> {
+  return pending;
 }
 
 // Load installed SDKs when the caller did not pass them. Bundlers can hide these; pass instrumentModules there.
@@ -220,12 +258,14 @@ export function withSession<T>(session: Session | string, run: () => T): T {
   if (s.userId) tags.user_id = s.userId;
   if (s.channel) tags.channel = s.channel;
   if (s.product) tags.product = s.product;
+  const account = s.account == null ? '' : String(s.account).trim().slice(0, 120);
+  if (account) tags.account = account;
   if (s.metadata) tags.metadata = s.metadata;
   return scope.run({ ...scope.getStore(), tags }, run);
 }
 
 /** Older name for withSession. Accepts { id } as well as { sessionId }. */
-export function conversation<T>(tags: Session | { id: string; channel?: string; product?: string; metadata?: Metadata } | string, run: () => T): T {
+export function conversation<T>(tags: Session | { id: string; channel?: string; product?: string; account?: string; metadata?: Metadata } | string, run: () => T): T {
   if (typeof tags === 'object' && 'id' in tags) {
     const { id, ...rest } = tags;
     return withSession({ ...rest, sessionId: id }, run);
@@ -238,11 +278,53 @@ export function task<T>(name: string, run: () => T): T {
   return scope.run({ ...scope.getStore(), task: name }, run);
 }
 
+const CLIP_OVER = 200_000; // strings longer than this many characters are clipped
+const CLIP_HEAD = 100_000;
+const CLIP_TAIL = 20_000;
+const BINARY_MIN = 256; // shorter base64 payloads are left alone
+const BASE64 = /^[A-Za-z0-9+/_-]+={0,2}$/;
+const DATA_URL = /^data:([^,;]*)((?:;[^,;]*)*);base64,/;
+const omitted = (payload: string) => `[omitted ${payload.length} bytes sha256:${createHash('sha256').update(payload).digest('hex').slice(0, 12)}]`;
+
+/**
+ * The copy of a call that is recorded. Never changes `value`, and never touches what the caller sends to the provider.
+ * Agents resend the whole run on every call, so without this, later calls pass the per-call limit and are lost.
+ *
+ * - Inline binary becomes a placeholder that keeps the shape: a base64 data URL keeps its prefix
+ *   (`data:image/png;base64,[omitted N bytes sha256:ab12cd34ef56]`), and a base64 `data`, `result` or
+ *   `b64_json` field (Anthropic `source.data`, Gemini `inlineData.data`, OpenAI `input_audio.data`, Responses
+ *   `image_generation_call.result`) becomes `[omitted N bytes sha256:...]`. N is the length of the base64 text
+ *   and the hash is the first 12 hex digits of the sha256 of that text, so the same image gets the same placeholder
+ *   in every call. Media types stay. Binary is never recorded: it does not help review and it is a privacy risk.
+ * - Any string over 200,000 characters keeps its first 100,000 and last 20,000 characters around
+ *   `\n[... clipped N characters ...]\n`.
+ *
+ * Runs before beforeSend and redaction. A call still over the limit afterwards is dropped.
+ */
+export function compactForRecording(value: unknown, key?: string, depth = 0): unknown {
+  if (typeof value === 'string') {
+    if (value.length > BINARY_MIN) {
+      const url = DATA_URL.exec(value.slice(0, 512));
+      if (url) return value.slice(0, url[0].length) + omitted(value.slice(url[0].length));
+      if ((key === 'data' || key === 'result' || key === 'b64_json') && BASE64.test(value)) return omitted(value);
+    }
+    if (value.length > CLIP_OVER) return `${value.slice(0, CLIP_HEAD)}\n[... clipped ${value.length - CLIP_HEAD - CLIP_TAIL} characters ...]\n${value.slice(-CLIP_TAIL)}`;
+    return value;
+  }
+  if (value === null || typeof value !== 'object' || depth > 64) return value;
+  if (typeof (value as { toJSON?: unknown }).toJSON === 'function') value = (value as { toJSON: () => unknown }).toJSON();
+  if (value === null || typeof value !== 'object') return compactForRecording(value, key, depth + 1);
+  if (Array.isArray(value)) return value.map(item => compactForRecording(item, undefined, depth + 1));
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value)) out[k] = compactForRecording(v, k, depth + 1);
+  return out;
+}
+
 // Runs before the caller's await continues, so only take the snapshot here. Redaction and beforeSend run at send time.
 function record(call: Omit<Call, 'conversation' | 'task'>, at: Scope | undefined, scrub?: Scrub | null) {
   try {
     if (!apiKey()) { warnLimited('no-key', 'GENERALCONTEXT_API_KEY is not set; a model call was not recorded'); return; }
-    const json = JSON.stringify({ ...call, conversation: at?.tags ?? null, task: at?.task ?? null });
+    const json = JSON.stringify(compactForRecording({ ...call, request: withoutRequestOptions(call.request), conversation: at?.tags ?? null, task: at?.task ?? null }));
     const bytes = Buffer.byteLength(json);
     if (bytes > MAX_CALL_BYTES) { warnLimited('oversized', `a model call of ${bytes} bytes is over the ${MAX_CALL_BYTES} byte limit and was dropped`); return; }
     if (queue.length >= MAX_QUEUE || queuedBytes + bytes > MAX_QUEUE_BYTES) { warnLimited('queue-full', 'queue is full; a model call was dropped'); return; }
@@ -266,6 +348,39 @@ function hookExit() {
   });
 }
 
+// Credentials are never sent, whatever `redact` says. They reach a recording when an app pastes a key into a
+// prompt, a tool returns one, or a request carries one in its options. Each pattern needs the provider's
+// fixed prefix, so ordinary text is never touched. The key name stays, so a reader knows one was there.
+const SECRETS: [string, RegExp][] = [
+  ['anthropic-key', /\bsk-ant-[A-Za-z0-9_-]{20,}/g],
+  ['openai-key', /\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}/g],
+  ['stripe-key', /\b[rsp]k_(?:live|test)_[A-Za-z0-9]{16,}/g],
+  ['google-key', /\bAIza[A-Za-z0-9_-]{35}\b/g],
+  ['aws-key', /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g],
+  ['github-token', /\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})/g],
+  ['slack-token', /\bxox[abposr]-[A-Za-z0-9-]{10,}/g],
+  ['generalcontext-key', /\bgck_[a-f0-9]{48}\b/g],
+  ['jwt', /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g],
+  ['bearer-token', /(?<=\bBearer\s)[A-Za-z0-9._~+/-]{20,}=*/g],
+  // A password inside a connection string or URL: postgres://user:PASSWORD@host. Only the password goes.
+  ['password', /(?<=\b[a-z][a-z0-9+.-]{1,20}:\/\/[^\s:/@]{1,64}:)[^\s@/]{1,128}(?=@)/g],
+  ['private-key', /-----BEGIN [A-Z ]{0,20}PRIVATE KEY-----(?:[A-Za-z0-9+/=\s:,]|-(?!-)){1,16384}?-----END [A-Z ]{0,20}PRIVATE KEY-----/g],
+];
+export function maskSecrets(text: string): string {
+  if (text.length < 16) return text;
+  return SECRETS.reduce((out, [kind, pattern]) => out.replace(pattern, `<${kind}>`), text);
+}
+// Request options that carry credentials or transport settings, not what the model was asked. Dropped from the
+// recorded request: Gemini's httpOptions (per-request headers) and anything spelled like a header map.
+const REQUEST_OPTIONS = new Set(['httpOptions', 'http_options', 'headers', 'extra_headers', 'extraHeaders', 'extra_query', 'extraQuery', 'abortSignal', 'signal']);
+function withoutRequestOptions(value: unknown, depth = 0): unknown {
+  if (!value || typeof value !== 'object' || depth > 3) return value;
+  if (Array.isArray(value)) return value;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value)) if (!REQUEST_OPTIONS.has(k)) out[k] = k === 'config' ? withoutRequestOptions(v, depth + 1) : v;
+  return out;
+}
+
 // Apply beforeSend and redaction. Returns the JSON to send, or null to drop.
 function prepare(entry: Entry): string | null {
   let call = JSON.parse(entry.json) as Call | null | undefined;
@@ -276,10 +391,21 @@ function prepare(entry: Entry): string | null {
     }
     if (call == null) return null;
   }
-  return JSON.stringify(scrubbed(call, entry.scrub === undefined ? config.scrub : entry.scrub));
+  const scrub = entry.scrub === undefined ? config.scrub : entry.scrub;
+  return JSON.stringify(scrubbed(call, scrub ? (text: string) => scrub(maskSecrets(text)) : maskSecrets));
 }
 
-type Reply = { ok: boolean; status: number };
+type Reply = { ok: boolean; status: number; retryAfterMs?: number };
+// Answers worth retrying: the collector is busy (429) or failing (5xx). Anything else (a bad key, a body too
+// large) will fail again the same way, so that batch is dropped with a warning.
+const retryable = (status: number) => status === 429 || status === 408 || status >= 500;
+// Retry-After in seconds (or an HTTP date), kept between 1 s and 5 minutes.
+function retryAfterMs(value: string | string[] | undefined): number | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (!raw) return undefined;
+  const seconds = /^\d+$/.test(raw.trim()) ? Number(raw) * 1000 : Date.parse(raw) - Date.now();
+  return Number.isFinite(seconds) ? Math.min(300_000, Math.max(1000, seconds)) : undefined;
+}
 
 // While a caller awaits flush(), reportOutcome() or logEvent(), our sockets keep the process alive
 // so the await can finish. Otherwise they are unref'd: background sending never keeps a finished
@@ -304,7 +430,8 @@ function postRaw(url: string, body: string, signal: AbortSignal): Promise<Reply>
       headers: { Authorization: `Bearer ${apiKey()}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     }, res => {
       res.resume(); // drain, so the socket is freed
-      res.on('end', () => resolve({ ok: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300, status: res.statusCode ?? 0 }));
+      res.on('end', () => resolve({ ok: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300, status: res.statusCode ?? 0,
+        retryAfterMs: retryAfterMs(res.headers['retry-after']) }));
       res.on('error', reject);
     });
     req.on('socket', socket => {
@@ -340,10 +467,11 @@ function send(): Promise<void> {
   if (sending) return sending;
   sending = (async () => {
     const envelope = JSON.stringify({ sdk: `node/${VERSION}`, app: config.appName });
-    while (queue.length && !stopped) {
-      // Up to BATCH calls and MAX_BATCH_BYTES per request.
-      const parts: string[] = [];
-      let size = envelope.length + 16;
+    while ((queue.length || retry.length) && !stopped) {
+      // Up to BATCH calls and MAX_BATCH_BYTES per request. Calls refused earlier go first, already prepared.
+      const parts: string[] = retry.splice(0, BATCH);
+      retryBytes = retry.reduce((sum, part) => sum + part.length, 0);
+      let size = envelope.length + 16 + parts.reduce((sum, part) => sum + part.length + 1, 0);
       while (queue.length && parts.length < BATCH) {
         const entry = queue[0];
         let json: string | null;
@@ -366,13 +494,19 @@ function send(): Promise<void> {
       if (!parts.length) continue;
       const body = `{"calls":[${parts.join(',')}],${envelope.slice(1)}`;
       const response = await post('/api/platform-collect/sdk', body, SEND_TIMEOUT_MS);
-      if (response && !response.ok) warnLimited('rejected', `${parts.length} calls not accepted: ${response.status}`);
-      if (!response && !stopped) {
+      if (response && !response.ok && !retryable(response.status)) warnLimited('rejected', `${parts.length} calls not accepted: ${response.status}`);
+      if ((!response || (!response.ok && retryable(response.status))) && !stopped) {
+        // Busy, failing, unreachable, hung or timed out: put this batch back at the front, already prepared, and
+        // try again after a pause. Nothing recorded is lost to a deploy or a brief outage.
+        retry.unshift(...parts);
+        retryBytes += parts.reduce((sum, part) => sum + part.length, 0);
+        if (retryBytes > MAX_QUEUE_BYTES) { const dropped = retry.splice(BATCH * 10); retryBytes = retry.reduce((sum, part) => sum + part.length, 0); warnLimited('queue-full', `${dropped.length} calls dropped while the collector was unavailable`); }
+        const pause = response?.retryAfterMs ?? RETRY_PAUSE_MS;
         // Unreachable, hung or timed out. Stop here instead of trying every queued batch in turn (15 s each),
         // which kept the process alive for minutes after the app finished. The queue stays bounded and is
         // retried after a pause, on flush(), or at exit.
-        pausedUntil = Date.now() + RETRY_PAUSE_MS;
-        const resume = setTimeout(() => { if (queue.length) void send(); }, RETRY_PAUSE_MS);
+        pausedUntil = Date.now() + pause;
+        const resume = setTimeout(() => { if (queue.length || retry.length) void send(); }, pause);
         resume.unref?.();
         break;
       }
@@ -390,14 +524,14 @@ export async function flush(timeoutMs = FLUSH_TIMEOUT_MS): Promise<boolean> {
   if (timer) { clearTimeout(timer); timer = null; }
   let deadline: ReturnType<typeof setTimeout> | undefined;
   try {
-    const sent = send().then(() => queue.length === 0, () => false);
+    const sent = send().then(() => queue.length === 0 && retry.length === 0, () => false);
     // The deadline timer stays referenced: an awaited flush() must be able to finish and report.
     const late = new Promise<boolean>(resolve => { deadline = setTimeout(() => resolve(false), Math.max(0, timeoutMs)); });
     return await holdOpen(Promise.race([sent, late]));
   } catch { return false; } finally { clearTimeout(deadline); }
 }
 
-const scrubText = (value: string) => (config.scrub ? config.scrub(value) : value);
+const scrubText = (value: string) => (config.scrub ? config.scrub(maskSecrets(value)) : maskSecrets(value));
 
 /** Mark how a session ended. Returns true when the platform accepted it. Never throws. */
 export async function reportOutcome(sessionId: string, outcome: 'success' | 'fail', note?: string): Promise<boolean> {
@@ -471,7 +605,7 @@ function recording(create: (...args: unknown[]) => unknown, api: Api, scrub?: Sc
       } catch { /* leave the SDK promise as it was */ }
     }
     (reply as Promise<unknown>).then(response => {
-      const done = (result: unknown) => record({ api, request, response: api === 'gemini' ? plainGemini(result) : result, started_at: started, ended_at: new Date().toISOString(), error: null }, at, scrub);
+      const done = (result: unknown, error: string | null = null) => record({ api, request, response: api === 'gemini' ? plainGemini(result) : result, started_at: started, ended_at: new Date().toISOString(), error }, at, scrub);
       if (request?.stream && (isStream(response) || isLegacyStream(response))) observeStream(response, api, done);
       else done(response);
     }, error => {
@@ -492,20 +626,27 @@ const isLegacyStream = (value: unknown): value is LegacyStream =>
 
 // Both SDKs' Stream classes read chunks through `this.iterator`, including tee() and toReadableStream().
 // Replacing it keeps the object, its type and its methods, and lets us see each chunk once.
-function observeStream(stream: SdkStream | LegacyStream, api: Api, done: (response: unknown) => void) {
+// A stream the caller stops early (break, return or a throw inside for await, which aborts the request) or
+// that fails is still recorded, with what was assembled so far and an error. The caller's exception is untouched.
+function observeStream(stream: SdkStream | LegacyStream, api: Api, done: (response: unknown, error?: string | null) => void) {
   const legacy = !isStream(stream);
   const source = legacy ? (stream as LegacyStream)[Symbol.asyncIterator].bind(stream) : (stream as SdkStream).iterator.bind(stream);
   const observed = async function* () {
     const assemble = api === 'anthropic' ? anthropicAssembler() : openAIAssembler();
-    let finished = false;
+    let error: string | null = 'stream ended early: the caller stopped reading before the response completed';
     try {
       for await (const chunk of { [Symbol.asyncIterator]: source }) {
         try { assemble.add(chunk); } catch { /* never break the caller's stream */ }
         yield chunk;
       }
-      finished = true;
+      error = null;
+    } catch (failure) {
+      error = String((failure as Error)?.message ?? failure);
+      throw failure;
     } finally {
-      if (finished) done(assemble.result());
+      let result: unknown = null;
+      try { result = assemble.result(); } catch { /* record the error alone */ }
+      done(result, error);
     }
   };
   // An own property shadows the class method on this instance only.
@@ -516,12 +657,19 @@ function observeStream(stream: SdkStream | LegacyStream, api: Api, done: (respon
 type Assembler = { add: (chunk: any) => void; result: () => unknown };
 
 function openAIAssembler(): Assembler {
-  let model: string | undefined, id: string | undefined, usage: unknown = null, final: unknown = null;
+  let model: string | undefined, id: string | undefined, usage: unknown = null, final: unknown = null, partial: any = null;
+  const items: unknown[] = [];
   const choices: { index: number; message: { role: string; content: string | null; tool_calls?: any[] }; finish_reason: string | null }[] = [];
   return {
     add(chunk) {
       // Responses API events: the final response arrives whole.
-      if (chunk.type) { if (chunk.type === 'response.completed') final = chunk.response; return; }
+      // Keep the latest snapshot and finished output items too, so a stream stopped early still records what arrived.
+      if (chunk.type) {
+        if (chunk.type === 'response.completed') final = chunk.response;
+        else if (chunk.response) partial = chunk.response;
+        else if (chunk.type === 'response.output_item.done' && chunk.item) items[chunk.output_index ?? items.length] = chunk.item;
+        return;
+      }
       model ??= chunk.model; id ??= chunk.id;
       if (chunk.usage) usage = chunk.usage;
       for (const c of chunk.choices ?? []) {
@@ -539,7 +687,7 @@ function openAIAssembler(): Assembler {
         if (c.finish_reason) choice.finish_reason = c.finish_reason;
       }
     },
-    result: () => final ?? ({ id, object: 'chat.completion', model, choices: choices.filter(Boolean), usage }),
+    result: () => final ?? (partial ? { ...partial, output: items.filter(Boolean) } : { id, object: 'chat.completion', model, choices: choices.filter(Boolean), usage }),
   };
 }
 
@@ -765,6 +913,376 @@ function converseAssembler(): Assembler {
   };
 }
 
+// ---- OpenAI Realtime (voice) ----------------------------------------------------------------
+//
+// A realtime session is one WebSocket carrying many responses. Each response.done becomes one 'openai-realtime'
+// call shaped like a Responses call: request { model, instructions, tools, input } and response { id, output, usage },
+// so the platform folds a whole phone call into one conversation. Only text is kept: transcripts, text, tool calls
+// and tool results. Audio bytes are never read into this state. Events are observed, never changed or delayed.
+
+const REALTIME_MODULES = ['openai/realtime/ws', 'openai/realtime/websocket'];
+const REALTIME_MAX_ITEMS = 200;
+// A finished response is recorded once the next response starts, the socket closes, or this long after
+// response.done, so an interruption that arrives while its audio is still playing is on the call.
+const REALTIME_HOLD_MS = 60_000;
+
+type RtItem = Record<string, unknown>;
+type RtEntry = { id: string | null; item: RtItem | null; seq: number; response?: string };
+type RtResponse = {
+  id: string; seq: number; started_at: string; ended_at?: string; usage?: unknown; error: string | null;
+  instructions?: unknown; tools?: unknown; voice: VoiceTiming; output_ids: Set<string>; timer?: ReturnType<typeof setTimeout>;
+  firstAudioMs?: number; audioBytes: number;
+};
+type RtState = {
+  at: Scope | undefined; scrub?: Scrub | null; model?: string; instructions?: unknown; tools?: unknown;
+  next?: { instructions?: unknown; tools?: unknown }; entries: RtEntry[]; seq: number; speechStoppedAt: string | null;
+  current: RtResponse | null; held: RtResponse | null; closed: boolean; bytesPerMs: number;
+  // The id of the last response recorded, and the highest item seq it covered. Later responses send only
+  // newer items, chained by previous_response_id, so a long call costs one item per item, not the square.
+  lastId?: string; sentSeq: number;
+};
+
+const RT_STATE = Symbol.for('generalcontext.realtime');
+const rtLive = new Set<RtState>();
+let rtExitHooked = false;
+
+function patchRealtime(value: unknown) {
+  const v = value as any;
+  for (const cls of [v?.OpenAIRealtimeWS, v?.OpenAIRealtimeWebSocket, v?.default?.OpenAIRealtimeWS, v?.default?.OpenAIRealtimeWebSocket]) {
+    const proto = cls?.prototype;
+    if (!proto || typeof proto.send !== 'function' || typeof proto._emit !== 'function' || Object.prototype.hasOwnProperty.call(proto, MARK)) continue;
+    Object.defineProperty(proto, MARK, { value: true });
+    patchRealtimeMethods(proto, undefined);
+    // The constructor assigns this.socket in the app's async scope, so that is where the session id is read.
+    // Automatic reconnects assign it again; the state (and its session) stays the same.
+    const SOCKET = Symbol('socket');
+    Object.defineProperty(proto, 'socket', {
+      configurable: true,
+      get(this: any) { return this[SOCKET]; },
+      set(this: any, socket: unknown) {
+        Object.defineProperty(this, SOCKET, { value: socket, writable: true, configurable: true });
+        try { watchSocketClose(this, rtState(this, undefined), socket); } catch { /* never break the app */ }
+      },
+    });
+  }
+}
+
+function patchRealtimeMethods(owner: any, scrub: Scrub | null | undefined) {
+  const emit = owner._emit, send = owner.send, sendRef = owner.sendResponseCreate;
+  if (typeof emit === 'function' && !emit[MARK]) {
+    owner._emit = function (this: any, name: string, ...args: unknown[]) {
+      try {
+        if (name === 'event') rtServerEvent(rtState(this, scrub), args[0] as any);
+        else if (name === 'close') rtClose(rtState(this, scrub)); // connections with automatic reconnects
+      } catch { /* never break the app */ }
+      return emit.call(this, name, ...args);
+    };
+    owner._emit[MARK] = true;
+  }
+  for (const [key, original] of [['send', send], ['sendResponseCreate', sendRef]] as const) {
+    if (typeof original !== 'function' || original[MARK]) continue;
+    owner[key] = function (this: any, event: unknown, ...rest: unknown[]) {
+      try { rtClientEvent(rtState(this, scrub), event as any); } catch { /* never break the app */ }
+      return original.call(this, event, ...rest);
+    };
+    owner[key][MARK] = true;
+  }
+}
+
+function rtState(conn: any, scrub: Scrub | null | undefined): RtState {
+  let state: RtState = conn[RT_STATE];
+  if (!state) {
+    state = { at: scope.getStore(), scrub, entries: [], seq: 0, speechStoppedAt: null, current: null, held: null, closed: false, bytesPerMs: 48, sentSeq: 0 };
+    try { state.model = new URL(String(conn.url)).searchParams.get('model') ?? undefined; } catch { /* no url yet */ }
+    Object.defineProperty(conn, RT_STATE, { value: state, configurable: true });
+  } else if (scrub !== undefined && state.scrub === undefined) state.scrub = scrub;
+  return state;
+}
+
+const rtWatched = new WeakSet<object>();
+function watchSocketClose(conn: any, state: RtState, socket: any) {
+  if (!socket || typeof socket !== 'object' || rtWatched.has(socket)) return;
+  rtWatched.add(socket);
+  const onClose = () => { if (conn.socket === socket || conn.socket === undefined) rtClose(state); };
+  if (typeof socket.on === 'function') socket.on('close', onClose);
+  else if (typeof socket.addEventListener === 'function') socket.addEventListener('close', onClose);
+}
+
+const rtText = (item: any): string | null => {
+  const parts: string[] = [];
+  for (const part of Array.isArray(item?.content) ? item.content : []) {
+    const text = typeof part?.text === 'string' ? part.text : typeof part?.transcript === 'string' ? part.transcript : null;
+    if (text) parts.push(text);
+  }
+  return parts.length ? parts.join('') : null;
+};
+const rtHasAudio = (item: any) => (Array.isArray(item?.content) ? item.content : []).some((p: any) => /audio/.test(String(p?.type)));
+
+// A realtime item as a Responses item, text only. Returns null when there is no text yet (audio awaiting its transcript).
+function rtConvert(item: any): RtItem | null {
+  if (!item || typeof item !== 'object') return null;
+  if (item.type === 'function_call') return { type: 'function_call', call_id: item.call_id, name: item.name, arguments: item.arguments ?? '' };
+  if (item.type === 'function_call_output') return { type: 'function_call_output', call_id: item.call_id, output: item.output };
+  if (item.type !== 'message') return null;
+  const audio = rtHasAudio(item);
+  // Caller audio with no transcript (input transcription is off, or it has not arrived yet) is kept as an
+  // empty spoken turn, so the call still shows that the caller spoke. A transcript fills it in later.
+  const text = rtText(item) ?? (audio && item.role !== 'assistant' ? '' : null);
+  if (text == null) return null;
+  if (item.role === 'assistant') return { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }], ...(audio ? { audio: true } : {}) };
+  return { role: item.role ?? 'user', content: [{ type: 'input_text', text }], ...(audio ? { audio: true } : {}) };
+}
+
+function rtEntry(state: RtState, id: string | null | undefined, match?: (e: RtEntry) => boolean): RtEntry {
+  let entry = id ? state.entries.find(e => e.id === id) : undefined;
+  if (!entry && match) entry = state.entries.find(e => !e.id && match(e));
+  if (entry) { if (id) entry.id = id; return entry; }
+  entry = { id: id ?? null, item: null, seq: ++state.seq };
+  state.entries.push(entry);
+  if (state.entries.length > REALTIME_MAX_ITEMS) state.entries.splice(0, state.entries.length - REALTIME_MAX_ITEMS);
+  return entry;
+}
+
+function rtUpsert(state: RtState, raw: any, responseId?: string) {
+  const id = typeof raw?.id === 'string' ? raw.id : null;
+  const converted = rtConvert(raw);
+  // The app's own conversation.item.create usually has no id. Match the server's echo of it by content.
+  const same = converted && JSON.stringify(converted);
+  const entry = rtEntry(state, id, e => !!same && !!e.item && JSON.stringify(e.item) === same);
+  // An untranscribed echo of an item never erases a transcript that already arrived.
+  const blank = converted && 'role' in converted && converted.role !== 'assistant' && !(converted as any).content?.[0]?.text;
+  if (converted && !(blank && entry.item)) entry.item = { ...entry.item, ...converted };
+  if (responseId) entry.response = responseId;
+}
+
+function rtServerEvent(state: RtState, event: any) {
+  const type = typeof event?.type === 'string' ? event.type : '';
+  const now = new Date().toISOString();
+  switch (type) {
+    case 'session.created': case 'session.updated': {
+      const s = event.session ?? {};
+      if (typeof s.model === 'string') state.model = s.model;
+      if ('instructions' in s) state.instructions = s.instructions;
+      if ('tools' in s) state.tools = s.tools;
+      rtFormat(state, s);
+      break;
+    }
+    case 'conversation.item.added': case 'conversation.item.created': case 'conversation.item.done': {
+      const r = state.current;
+      const own = r && typeof event.item?.id === 'string' && r.output_ids.has(event.item.id) ? r.id : undefined;
+      rtUpsert(state, event.item, own);
+      break;
+    }
+    case 'conversation.item.input_audio_transcription.completed': {
+      const entry = rtEntry(state, event.item_id);
+      entry.item = { role: 'user', content: [{ type: 'input_text', text: String(event.transcript ?? '') }], audio: true, at: now };
+      break;
+    }
+    // Every user turn starts with speech_started. It interrupts the response being generated, or the last one
+    // while its audio is still playing (audio length estimated from the delta sizes, the bytes are not kept).
+    case 'input_audio_buffer.speech_started': {
+      const r = state.current ?? state.held;
+      if (r && (r === state.current || Date.now() < rtPlaybackEnd(state, r))) r.voice.interrupted = true;
+      break;
+    }
+    case 'input_audio_buffer.speech_stopped': state.speechStoppedAt = now; break;
+    case 'response.created': {
+      rtRelease(state);
+      if (state.current) rtFinish(state, 'a new response started before response.done');
+      state.current = rtStart(state, event.response?.id, now);
+      break;
+    }
+    case 'response.output_item.added': case 'response.output_item.done':
+      rtOwn(state, event.response_id, event.item?.id);
+      rtUpsert(state, event.item, rtResponseFor(state, event.response_id)?.id);
+      break;
+    case 'response.output_audio.delta': case 'response.audio.delta': {
+      const r = rtResponseFor(state, event.response_id);
+      if (r && !r.voice.first_audio_at) {
+        r.voice.first_audio_at = now; r.firstAudioMs = Date.now();
+        // The caller has been waiting since they stopped speaking, through any silent response before
+        // this one (a tool call): the wait ends at the first audio they hear.
+        if (state.speechStoppedAt) r.voice.speech_stopped_at = state.speechStoppedAt;
+        state.speechStoppedAt = null;
+      }
+      if (r && typeof event.delta === 'string') r.audioBytes += Math.floor(event.delta.length * 3 / 4);
+      break;
+    }
+    case 'response.output_audio_transcript.done': case 'response.audio_transcript.done': case 'response.output_text.done': case 'response.text.done': {
+      const r = rtResponseFor(state, event.response_id);
+      rtOwn(state, event.response_id, event.item_id);
+      const entry = rtEntry(state, event.item_id);
+      const text = String(event.transcript ?? event.text ?? '');
+      const audio = type.includes('audio');
+      entry.item = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }], ...(audio ? { audio: true } : {}) };
+      if (r) entry.response = r.id;
+      break;
+    }
+    case 'response.function_call_arguments.done': {
+      rtOwn(state, event.response_id, event.item_id);
+      const entry = rtEntry(state, event.item_id);
+      entry.item = { type: 'function_call', call_id: event.call_id, name: event.name, arguments: event.arguments ?? '' };
+      const r = rtResponseFor(state, event.response_id);
+      if (r) entry.response = r.id;
+      break;
+    }
+    case 'conversation.item.truncated': rtTruncate(state, event.item_id, event.audio_end_ms); break;
+    case 'error': {
+      const r = state.current;
+      if (r) r.error = `realtime error: ${String(event.error?.message ?? 'unknown error')}${event.error?.code ? ` (${event.error.code})` : ''}`;
+      break;
+    }
+    case 'response.done': {
+      const res = event.response ?? {};
+      let r = rtResponseFor(state, res.id);
+      if (!r) r = state.current = rtStart(state, res.id, now);
+      for (const item of Array.isArray(res.output) ? res.output : []) { rtOwn(state, r.id, item?.id); rtUpsert(state, item, r.id); }
+      r.ended_at = now;
+      r.usage = res.usage ?? null;
+      if (res.status === 'failed' && !r.error) r.error = `response failed: ${JSON.stringify(res.status_details ?? null)}`;
+      if (res.status === 'cancelled') r.voice.interrupted = true;
+      if (state.current === r) state.current = null;
+      rtHold(state, r);
+      break;
+    }
+  }
+}
+
+function rtClientEvent(state: RtState, event: any) {
+  switch (event?.type) {
+    case 'session.update': {
+      const s = event.session ?? {};
+      if (typeof s.model === 'string') state.model = s.model;
+      if ('instructions' in s) state.instructions = s.instructions;
+      if ('tools' in s) state.tools = s.tools;
+      rtFormat(state, s);
+      break;
+    }
+    case 'conversation.item.create': rtUpsert(state, event.item); break;
+    case 'response.create': {
+      const r = event.response ?? {};
+      if ('instructions' in r || 'tools' in r) state.next = { instructions: r.instructions, tools: r.tools };
+      break;
+    }
+    case 'response.cancel': rtInterrupt(state); break;
+    case 'conversation.item.truncate': rtTruncate(state, event.item_id, event.audio_end_ms); break;
+  }
+}
+
+function rtStart(state: RtState, id: unknown, now: string): RtResponse {
+  const r: RtResponse = {
+    id: typeof id === 'string' ? id : `resp_${randomUUID()}`, seq: ++state.seq, started_at: now, error: null, output_ids: new Set(), audioBytes: 0,
+    voice: { speech_stopped_at: state.speechStoppedAt, first_audio_at: null, interrupted: false },
+  };
+  if (state.next) { r.instructions = state.next.instructions; r.tools = state.next.tools; state.next = undefined; }
+  rtLive.add(state);
+  return r;
+}
+
+// Output audio is pcm16 at 24 kHz (48 bytes per ms) unless the session picked G.711 (8 bytes per ms).
+function rtFormat(state: RtState, session: any) {
+  const format = session?.audio?.output?.format?.type ?? session?.output_audio_format;
+  if (typeof format === 'string') state.bytesPerMs = /pcmu|pcma|g711/.test(format) ? 8 : 48;
+}
+
+const rtPlaybackEnd = (state: RtState, r: RtResponse) =>
+  r.firstAudioMs === undefined ? 0 : r.firstAudioMs + r.audioBytes / state.bytesPerMs;
+
+const rtResponseFor = (state: RtState, id: unknown): RtResponse | null =>
+  [state.current, state.held].find(r => r && (!id || r.id === id)) ?? null;
+
+function rtOwn(state: RtState, responseId: unknown, itemId: unknown) {
+  const r = rtResponseFor(state, responseId);
+  if (r && typeof itemId === 'string') r.output_ids.add(itemId);
+}
+
+// The response the caller is hearing: the one in flight, else the last finished one still playing.
+function rtInterrupt(state: RtState) {
+  const r = state.current ?? state.held;
+  if (r) r.voice.interrupted = true;
+}
+
+function rtTruncate(state: RtState, itemId: unknown, ms: unknown) {
+  const r = [state.current, state.held].find(x => x && typeof itemId === 'string' && x.output_ids.has(itemId)) ?? state.current ?? state.held;
+  if (!r) return;
+  r.voice.interrupted = true;
+  if (typeof ms === 'number') r.voice.truncated_at_ms = ms;
+}
+
+function rtHold(state: RtState, r: RtResponse) {
+  rtRelease(state);
+  state.held = r;
+  r.timer = setTimeout(() => { if (state.held === r) rtRelease(state); }, REALTIME_HOLD_MS);
+  r.timer.unref?.();
+  if (!rtExitHooked) {
+    rtExitHooked = true;
+    process.once('beforeExit', () => {
+      for (const s of rtLive) { rtRelease(s); }
+      if (queue.length) void flush(EXIT_FLUSH_MS);
+    });
+  }
+}
+
+function rtRelease(state: RtState) {
+  const r = state.held;
+  if (!r) return;
+  state.held = null;
+  if (r.timer) clearTimeout(r.timer);
+  rtRecord(state, r);
+  if (!state.current) rtLive.delete(state);
+}
+
+function rtFinish(state: RtState, error: string) {
+  const r = state.current;
+  if (!r) return;
+  state.current = null;
+  r.ended_at = new Date().toISOString();
+  r.error ??= error;
+  rtRecord(state, r);
+}
+
+function rtClose(state: RtState) {
+  if (state.closed) return;
+  state.closed = true;
+  rtRelease(state);
+  rtFinish(state, 'connection closed before response.done');
+  rtLive.delete(state);
+}
+
+function rtRecord(state: RtState, r: RtResponse) {
+  try {
+    const input: RtItem[] = [], output: RtItem[] = [];
+    // Timing goes on the stored assistant item too, so every later call's input still carries it.
+    const stopped = r.voice.speech_stopped_at ? Date.parse(r.voice.speech_stopped_at) : NaN;
+    const audio = r.voice.first_audio_at ? Date.parse(r.voice.first_audio_at) : NaN;
+    const timing: Record<string, unknown> = {
+      latency_ms: Number.isFinite(stopped) && Number.isFinite(audio) ? audio - stopped : null, interrupted: r.voice.interrupted,
+    };
+    if (r.voice.truncated_at_ms !== undefined) timing.truncated_at_ms = r.voice.truncated_at_ms;
+    for (const e of state.entries) {
+      if (!e.item) continue;
+      const mine = e.response === r.id || (e.id && r.output_ids.has(e.id));
+      if (mine && e.item.role === 'assistant') e.item = { ...e.item, voice: timing };
+      if (mine) output.push(e.item);
+      else if (e.seq < r.seq && e.seq > state.sentSeq) input.push(e.item);
+    }
+    const request: Record<string, unknown> = {
+      model: state.model ?? null,
+      instructions: r.instructions ?? state.instructions ?? null,
+      tools: r.tools ?? state.tools ?? [],
+      input,
+    };
+    // After the first reply, only what is new since the last one, chained to it, as the Responses API does.
+    if (state.lastId) request.previous_response_id = state.lastId;
+    state.lastId = r.id;
+    state.sentSeq = Math.max(state.sentSeq, ...state.entries.filter(e => e.item && (e.seq < r.seq || e.response === r.id || (e.id && r.output_ids.has(e.id)))).map(e => e.seq));
+    record({
+      api: 'openai-realtime', request, response: { id: r.id, output, usage: r.usage ?? null },
+      started_at: r.started_at, ended_at: r.ended_at ?? new Date().toISOString(), error: r.error, voice: { ...r.voice },
+    }, state.at?.tags && !state.at.tags.channel ? { ...state.at, tags: { ...state.at.tags, channel: 'voice' } } : state.at, state.scrub);
+  } catch (error) { warnLimited('record', `could not record a realtime response: ${(error as Error).message}`); }
+}
+
 const PATTERNS: [string, RegExp][] = [
   // Bounded repeats and a token-start lookbehind keep this linear on adversarial input.
   ['email', /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}/g],
@@ -813,7 +1331,14 @@ export function wrap<C extends object>(client: C, options: { redact?: boolean | 
   const models = target.models;
   const gemini = typeof models?.generateContent === 'function';
   const bedrock = typeof target.send === 'function' && target.config && !gemini && !owners.length;
-  if (!owners.length && !gemini && !bedrock) throw new TypeError('wrap expects an OpenAI, Anthropic, Google Gen AI or Bedrock Runtime client');
+  // An OpenAIRealtimeWS or OpenAIRealtimeWebSocket connection. Its session is the one wrap() runs in.
+  const realtime = typeof target.send === 'function' && typeof target._emit === 'function' && 'socket' in target;
+  if (realtime) {
+    patchRealtimeMethods(target, scrub);
+    try { watchSocketClose(target, rtState(target, scrub), target.socket); } catch { /* never break the app */ }
+    return client;
+  }
+  if (!owners.length && !gemini && !bedrock) throw new TypeError('wrap expects an OpenAI, Anthropic, Google Gen AI or Bedrock Runtime client, or an OpenAI Realtime connection');
   for (const [owner, api] of owners) {
     if (!owner.create[MARK]) owner.create = recording(owner.create.bind(owner), api, scrub);
   }
