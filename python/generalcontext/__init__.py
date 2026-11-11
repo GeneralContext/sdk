@@ -46,6 +46,7 @@ import queue
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -219,6 +220,9 @@ MAX_CALL_BYTES = 4_000_000     # The server rejects larger calls.
 MAX_QUEUE_BYTES = 64_000_000
 MAX_BATCH_BYTES = 4_000_000
 MAX_QUEUE_CALLS = 5000
+# Calls held for another try while the collector is unavailable. Past this, the oldest refused batch is dropped.
+MAX_RETRY_CALLS = 1000
+RETRY_PAUSE = 30.0  # seconds before sending again after the collector failed to answer
 _warned_at = {}
 
 
@@ -267,6 +271,7 @@ class _Sender:
         # Also run in a forked child: the parent's thread and lock do not exist there.
         self.queue = queue.Queue(maxsize=MAX_QUEUE_CALLS)
         self.lock = threading.Lock()
+        self.wake = threading.Event()  # set by flush() to cut a retry pause short
         self.bytes = 0
         self.thread = None
     def put(self, call, scrub):
@@ -327,10 +332,18 @@ class _Sender:
                 head = json.dumps({"sdk": f"python/{__version__}", "app": _config["app"]})[:-1]
                 _post("/api/platform-collect/sdk", (head + ', "calls": [').encode() + b",".join(batch) + b"]}", 15)
             except Exception as error:  # Never let our failure reach the agent.
+                pause = _retry_pause(error)
+                if pause is not None and len(pending) + len(batch) <= MAX_RETRY_CALLS:
+                    # Busy, failing, unreachable or timed out: keep the batch, in order, and send it again after
+                    # a pause. flush() keeps waiting for it, since these calls still owe their task_done.
+                    _warn("retry", "General Context is unavailable (%s); %d calls will be sent again shortly", error, len(batch))
+                    pending = batch + pending
+                    self.wake.wait(pause)
+                    self.wake.clear()
+                    continue
                 _warn("send", "General Context did not accept %d calls: %s", len(batch), error)
-            finally:
-                for _ in batch:
-                    self.queue.task_done()
+            for _ in batch:
+                self.queue.task_done()
 
 
 def _encode(call, scrub):
@@ -383,9 +396,28 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_sender._reset)
 
 
+def _retry_pause(error):
+    """Seconds to wait before sending a refused batch again, or None when it would fail the same way again.
+
+    Retried: busy (429), timed out (408), failing (5xx), unreachable or timed out on our side. Retry-After is
+    honored, between 1 second and 5 minutes. A bad key or an oversized body is not retried."""
+    if isinstance(error, urllib.error.HTTPError):
+        if error.code not in (408, 429) and error.code < 500:
+            return None
+        after = (error.headers or {}).get("Retry-After") if hasattr(error, "headers") else None
+        try:
+            return min(300.0, max(1.0, float(after))) if after else RETRY_PAUSE
+        except ValueError:
+            return RETRY_PAUSE
+    if isinstance(error, (urllib.error.URLError, OSError, TimeoutError)):
+        return RETRY_PAUSE
+    return None
+
+
 def flush(timeout=10):
     """Wait until recorded calls are sent. Call before a short-lived process exits. True if all were sent."""
     try:
+        _sender.wake.set()  # a batch waiting out a retry pause is tried again now
         done = threading.Event()
         threading.Thread(target=lambda: (_sender.queue.join(), done.set()), daemon=True).start()
         return done.wait(timeout)

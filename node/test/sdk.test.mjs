@@ -19,6 +19,8 @@ const anthropicVertex = await optional('@anthropic-ai/vertex-sdk');
 
 const childPosts = new Map(); // keyed by request path
 const collected = { calls: [], outcomes: [], events: [], batches: [] };
+// The collector answers the next `failTimes` batches with `failStatus` and Retry-After: 1.
+const collector = { failTimes: 0, failStatus: 503 };
 const sse = (res, events) => {
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   for (const e of events) res.write(e);
@@ -107,6 +109,11 @@ before(async () => {
       if (!childPosts.has(req.url)) childPosts.set(req.url, []);
       childPosts.get(req.url).push({ auth: req.headers.authorization, body: json });
       return reply(200, { ok: true });
+    }
+    if (req.url === '/api/platform-collect/sdk' && collector.failTimes > 0) {
+      collector.failTimes -= 1;
+      res.writeHead(collector.failStatus, { 'content-type': 'application/json', 'retry-after': '1' });
+      return res.end('{"error":"unavailable"}');
     }
     if (req.url === '/api/platform-collect/sdk') { collected.batches.push(json); collected.calls.push(...json.calls); return reply(200, { ok: true }); }
     if (req.url === '/api/platform-collect/outcomes') { collected.outcomes.push({ auth: req.headers.authorization, ...json }); return reply(200, { ok: true }); }
@@ -276,6 +283,24 @@ test('secret masking is fast on adversarial input', () => {
     sdk.maskSecrets(text);
     assert.ok(performance.now() - started < 500);
   }
+});
+
+test('a busy or failing collector loses nothing, and a refused key is not retried', async () => {
+  // A deploy (503) or a rate limit (429) used to drop the whole batch. It is kept and sent again.
+  for (const status of [503, 429]) {
+    await drain();
+    Object.assign(collector, { failTimes: 1, failStatus: status });
+    for (let i = 0; i < 3; i++) await openai().chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: `q${i}` }] });
+    assert.equal(await sdk.flush(1), false, 'the refused batch waits out Retry-After');
+    await new Promise(r => setTimeout(r, 1200));
+    assert.equal(await sdk.flush(5000), true);
+    assert.deepEqual((await drain()).map(c => c.request.messages[0].content).sort(), ['q0', 'q1', 'q2'], String(status));
+  }
+  Object.assign(collector, { failTimes: 1, failStatus: 401 });
+  await openai().chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: 'refused' }] });
+  assert.equal(await sdk.flush(5000), true, 'a 401 is dropped with a warning, not held');
+  assert.deepEqual(await drain(), []);
+  collector.failTimes = 0;
 });
 
 test('reportOutcome and logEvent post to the collector', async () => {

@@ -90,6 +90,9 @@ let originalFetch: typeof fetch = globalThis.fetch;
 let exitHooked = false;
 let stopped = false; // set when the exit flush runs out of time
 let pausedUntil = 0; // background sends wait until then after a failed send; flush() still tries
+// Prepared calls the collector refused for now (busy, failing, unreachable). Sent before the queue.
+const retry: string[] = [];
+let retryBytes = 0;
 const inflight = new Set<AbortController>();
 
 const apiKey = () => config.apiKey ?? process.env.GENERALCONTEXT_API_KEY;
@@ -390,7 +393,17 @@ function prepare(entry: Entry): string | null {
   return JSON.stringify(scrubbed(call, scrub ? (text: string) => scrub(maskSecrets(text)) : maskSecrets));
 }
 
-type Reply = { ok: boolean; status: number };
+type Reply = { ok: boolean; status: number; retryAfterMs?: number };
+// Answers worth retrying: the collector is busy (429) or failing (5xx). Anything else (a bad key, a body too
+// large) will fail again the same way, so that batch is dropped with a warning.
+const retryable = (status: number) => status === 429 || status === 408 || status >= 500;
+// Retry-After in seconds (or an HTTP date), kept between 1 s and 5 minutes.
+function retryAfterMs(value: string | string[] | undefined): number | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (!raw) return undefined;
+  const seconds = /^\d+$/.test(raw.trim()) ? Number(raw) * 1000 : Date.parse(raw) - Date.now();
+  return Number.isFinite(seconds) ? Math.min(300_000, Math.max(1000, seconds)) : undefined;
+}
 
 // While a caller awaits flush(), reportOutcome() or logEvent(), our sockets keep the process alive
 // so the await can finish. Otherwise they are unref'd: background sending never keeps a finished
@@ -415,7 +428,8 @@ function postRaw(url: string, body: string, signal: AbortSignal): Promise<Reply>
       headers: { Authorization: `Bearer ${apiKey()}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     }, res => {
       res.resume(); // drain, so the socket is freed
-      res.on('end', () => resolve({ ok: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300, status: res.statusCode ?? 0 }));
+      res.on('end', () => resolve({ ok: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300, status: res.statusCode ?? 0,
+        retryAfterMs: retryAfterMs(res.headers['retry-after']) }));
       res.on('error', reject);
     });
     req.on('socket', socket => {
@@ -451,10 +465,11 @@ function send(): Promise<void> {
   if (sending) return sending;
   sending = (async () => {
     const envelope = JSON.stringify({ sdk: `node/${VERSION}`, app: config.appName });
-    while (queue.length && !stopped) {
-      // Up to BATCH calls and MAX_BATCH_BYTES per request.
-      const parts: string[] = [];
-      let size = envelope.length + 16;
+    while ((queue.length || retry.length) && !stopped) {
+      // Up to BATCH calls and MAX_BATCH_BYTES per request. Calls refused earlier go first, already prepared.
+      const parts: string[] = retry.splice(0, BATCH);
+      retryBytes = retry.reduce((sum, part) => sum + part.length, 0);
+      let size = envelope.length + 16 + parts.reduce((sum, part) => sum + part.length + 1, 0);
       while (queue.length && parts.length < BATCH) {
         const entry = queue[0];
         let json: string | null;
@@ -477,13 +492,19 @@ function send(): Promise<void> {
       if (!parts.length) continue;
       const body = `{"calls":[${parts.join(',')}],${envelope.slice(1)}`;
       const response = await post('/api/platform-collect/sdk', body, SEND_TIMEOUT_MS);
-      if (response && !response.ok) warnLimited('rejected', `${parts.length} calls not accepted: ${response.status}`);
-      if (!response && !stopped) {
+      if (response && !response.ok && !retryable(response.status)) warnLimited('rejected', `${parts.length} calls not accepted: ${response.status}`);
+      if ((!response || (!response.ok && retryable(response.status))) && !stopped) {
+        // Busy, failing, unreachable, hung or timed out: put this batch back at the front, already prepared, and
+        // try again after a pause. Nothing recorded is lost to a deploy or a brief outage.
+        retry.unshift(...parts);
+        retryBytes += parts.reduce((sum, part) => sum + part.length, 0);
+        if (retryBytes > MAX_QUEUE_BYTES) { const dropped = retry.splice(BATCH * 10); retryBytes = retry.reduce((sum, part) => sum + part.length, 0); warnLimited('queue-full', `${dropped.length} calls dropped while the collector was unavailable`); }
+        const pause = response?.retryAfterMs ?? RETRY_PAUSE_MS;
         // Unreachable, hung or timed out. Stop here instead of trying every queued batch in turn (15 s each),
         // which kept the process alive for minutes after the app finished. The queue stays bounded and is
         // retried after a pause, on flush(), or at exit.
-        pausedUntil = Date.now() + RETRY_PAUSE_MS;
-        const resume = setTimeout(() => { if (queue.length) void send(); }, RETRY_PAUSE_MS);
+        pausedUntil = Date.now() + pause;
+        const resume = setTimeout(() => { if (queue.length || retry.length) void send(); }, pause);
         resume.unref?.();
         break;
       }
@@ -501,7 +522,7 @@ export async function flush(timeoutMs = FLUSH_TIMEOUT_MS): Promise<boolean> {
   if (timer) { clearTimeout(timer); timer = null; }
   let deadline: ReturnType<typeof setTimeout> | undefined;
   try {
-    const sent = send().then(() => queue.length === 0, () => false);
+    const sent = send().then(() => queue.length === 0 && retry.length === 0, () => false);
     // The deadline timer stays referenced: an awaited flush() must be able to finish and report.
     const late = new Promise<boolean>(resolve => { deadline = setTimeout(() => resolve(false), Math.max(0, timeoutMs)); });
     return await holdOpen(Promise.race([sent, late]));

@@ -83,11 +83,16 @@ GEMINI = {"candidates": [{"content": {"role": "model", "parts": [{"text": "Tours
 class Server(BaseHTTPRequestHandler):
     received = []  # (path, authorization, body) for collector requests
     status = 200
+    fail_times = 0  # answer the next N collector requests with `fail_status` (and Retry-After: 1)
+    fail_status = 503
     providers = []   # Paths of model provider requests
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
         if self.path.startswith("/api/platform-collect"):
+            if Server.fail_times > 0:
+                Server.fail_times -= 1
+                return self.reply(Server.fail_status, {"error": "unavailable"}, {"Retry-After": "1"})
             Server.received.append((self.path, self.headers.get("Authorization"), body))
             return self.reply(Server.status, {"recorded": len(body.get("runs") or []), "unknown": []}
                               if self.path.endswith("/runs") else {})
@@ -107,9 +112,11 @@ class Server(BaseHTTPRequestHandler):
             return self.reply(200, GEMINI)
         self.reply(404, {})
 
-    def reply(self, status, body):
+    def reply(self, status, body, headers=None):
         data = json.dumps(body).encode()
         self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -161,7 +168,7 @@ class SdkTest(unittest.TestCase):
         self.assertTrue(generalcontext.flush(5))
         Server.received.clear()
         Server.providers.clear()
-        Server.status = 200
+        Server.status, Server.fail_times, Server.fail_status = 200, 0, 503
 
     def calls(self):
         self.assertTrue(generalcontext.flush(5))
@@ -210,11 +217,18 @@ class SdkTest(unittest.TestCase):
 
     def test_a_collector_outage_never_reaches_the_agent(self):
         Server.status = 503
+        Server.fail_status, Server.fail_times = 503, 10_000
         client = generalcontext.wrap(Client({"ok": True}))
         self.assertEqual(client.chat.completions.create(messages=[]), {"ok": True})
-        self.assertTrue(generalcontext.flush(5))
+        # The call is held for another try, so flush says it is not sent yet, and returns on time.
+        started = time.perf_counter()
+        self.assertFalse(generalcontext.flush(1))
+        self.assertLess(time.perf_counter() - started, 2)
         self.assertFalse(generalcontext.report_outcome("s1", "success"))
         self.assertFalse(generalcontext.log_event("s1", "tour.booked"))
+        Server.status, Server.fail_times = 200, 0  # the collector is back: the held call goes out
+        self.assertTrue(generalcontext.flush(5))
+        self.assertEqual(len(self.calls()), 1)
 
     def test_wrapping_twice_records_once(self):
         client = generalcontext.wrap(generalcontext.wrap(Client({"ok": True})))
@@ -258,6 +272,24 @@ class SdkTest(unittest.TestCase):
             started = time.perf_counter()
             generalcontext.mask_secrets(text)
             self.assertLess(time.perf_counter() - started, 0.5)
+
+    def test_a_busy_or_failing_collector_loses_nothing(self):
+        # A deploy (503) or a rate limit (429) used to drop the whole batch. It is kept and sent again.
+        for status in (503, 429):
+            Server.received.clear()
+            Server.status, Server.fail_times = 200, 1
+            Server.fail_status = status
+            client = generalcontext.wrap(Client({"choices": []}))
+            for i in range(3):
+                client.chat.completions.create(model="m", messages=[{"role": "user", "content": f"q{i}"}])
+            self.assertTrue(generalcontext.flush(10))
+            self.assertEqual(sorted(c["request"]["messages"][0]["content"] for c in self.calls()), ["q0", "q1", "q2"], status)
+
+    def test_a_refused_key_is_not_retried(self):
+        Server.fail_status, Server.fail_times = 401, 99
+        generalcontext.wrap(Client({"choices": []})).chat.completions.create(model="m", messages=[])
+        with self.assertLogs("generalcontext", "WARNING"):
+            self.assertTrue(generalcontext.flush(5))  # dropped with a warning, not held forever
 
     def test_second_initialize_is_ignored(self):
         with self.assertLogs("generalcontext", "WARNING"):
