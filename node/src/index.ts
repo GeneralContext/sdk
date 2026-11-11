@@ -1011,7 +1011,7 @@ function rtServerEvent(state: RtState, event: any) {
     }
     case 'conversation.item.input_audio_transcription.completed': {
       const entry = rtEntry(state, event.item_id);
-      entry.item = { role: 'user', content: [{ type: 'input_text', text: String(event.transcript ?? '') }], audio: true };
+      entry.item = { role: 'user', content: [{ type: 'input_text', text: String(event.transcript ?? '') }], audio: true, at: now };
       break;
     }
     // Every user turn starts with speech_started. It interrupts the response being generated, or the last one
@@ -1183,9 +1183,18 @@ function rtClose(state: RtState) {
 function rtRecord(state: RtState, r: RtResponse) {
   try {
     const input: RtItem[] = [], output: RtItem[] = [];
+    // Timing goes on the stored assistant item too, so every later call's input still carries it.
+    const stopped = r.voice.speech_stopped_at ? Date.parse(r.voice.speech_stopped_at) : NaN;
+    const audio = r.voice.first_audio_at ? Date.parse(r.voice.first_audio_at) : NaN;
+    const timing: Record<string, unknown> = {
+      latency_ms: Number.isFinite(stopped) && Number.isFinite(audio) ? audio - stopped : null, interrupted: r.voice.interrupted,
+    };
+    if (r.voice.truncated_at_ms !== undefined) timing.truncated_at_ms = r.voice.truncated_at_ms;
     for (const e of state.entries) {
       if (!e.item) continue;
-      if (e.response === r.id || (e.id && r.output_ids.has(e.id))) output.push(e.item);
+      const mine = e.response === r.id || (e.id && r.output_ids.has(e.id));
+      if (mine && e.item.role === 'assistant') e.item = { ...e.item, voice: timing };
+      if (mine) output.push(e.item);
       else if (e.seq < r.seq) input.push(e.item);
     }
     const request = {
@@ -1197,7 +1206,7 @@ function rtRecord(state: RtState, r: RtResponse) {
     record({
       api: 'openai-realtime', request, response: { id: r.id, output, usage: r.usage ?? null },
       started_at: r.started_at, ended_at: r.ended_at ?? new Date().toISOString(), error: r.error, voice: { ...r.voice },
-    }, state.at, state.scrub);
+    }, state.at?.tags && !state.at.tags.channel ? { ...state.at, tags: { ...state.at.tags, channel: 'voice' } } : state.at, state.scrub);
   } catch (error) { warnLimited('record', `could not record a realtime response: ${(error as Error).message}`); }
 }
 

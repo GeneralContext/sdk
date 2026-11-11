@@ -37,6 +37,15 @@ await flush(); // before a serverless function, job or script exits
 | AWS Bedrock Converse | `@aws-sdk/client-bedrock-runtime` | `bedrockRuntime` |
 | Anything else | Send [OpenTelemetry](https://generalcontextlabs.com/docs/opentelemetry) | |
 
+**Voice (OpenAI Realtime).** `OpenAIRealtimeWS` (`openai/realtime/ws`) and `OpenAIRealtimeWebSocket`
+(`openai/realtime/websocket`) connections are recorded too. Create the connection inside `withSession(...)` and
+the whole call lands in that conversation. Each `response.done` is recorded as one `openai-realtime` call shaped
+like a Responses call: the instructions and tools, the conversation so far as text (caller turns from the input
+transcription, agent turns from the output transcript, tool calls and their results), and a `voice` field with
+`speech_stopped_at`, `first_audio_at`, `interrupted` and `truncated_at_ms`. Turn on input audio transcription in
+the session to record what the caller said. Audio is never recorded. Pass a connection to `wrap()` to record only
+that one.
+
 Node 18 to 24, Node.js runtime only (not Edge). Supported client versions, Next.js, proxies, redaction, outcomes and events, and every option: [SDK reference](https://generalcontextlabs.com/docs/sdk).
 
 ## Command line

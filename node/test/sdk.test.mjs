@@ -863,6 +863,7 @@ function twoTurnScript() {
   const tools = [{ type: 'function', name: 'get_rent', description: 'Rent for a unit', parameters: { type: 'object', properties: { unit: { type: 'string' } } } }];
   const usage = (i, o) => ({ total_tokens: i + o, input_tokens: i, output_tokens: o });
   const fc = { id: 'item_fc', type: 'function_call', call_id: 'call_rent', name: 'get_rent', arguments: '{"unit":"4B"}', status: 'completed' };
+  const preamble = { id: 'item_a1', type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_audio', transcript: 'Let me check.' }] };
   const answer = { id: 'item_a2', type: 'message', role: 'assistant', status: 'incomplete', content: [{ type: 'output_audio', transcript: 'Unit 4B rents for 2100 dollars a month.' }] };
   let appended = false;
   return {
@@ -878,10 +879,13 @@ function twoTurnScript() {
         send({ type: 'conversation.item.added', event_id: 'e5', previous_item_id: null, item: { id: 'item_u1', type: 'message', role: 'user', content: [{ type: 'input_audio', transcript: null }] } });
         send({ type: 'conversation.item.input_audio_transcription.completed', event_id: 'e6', item_id: 'item_u1', content_index: 0, transcript: 'What is the rent for 4B?', usage: { type: 'duration', seconds: 2 } });
         send({ type: 'response.created', event_id: 'e7', response: { id: 'resp_1', object: 'realtime.response', status: 'in_progress', output: [] } });
-        send({ type: 'response.output_item.added', event_id: 'e8', response_id: 'resp_1', output_index: 0, item: { ...fc, arguments: '', status: 'in_progress' } });
-        send({ type: 'response.function_call_arguments.done', event_id: 'e9', response_id: 'resp_1', item_id: 'item_fc', output_index: 0, call_id: 'call_rent', name: 'get_rent', arguments: fc.arguments });
-        send({ type: 'response.output_item.done', event_id: 'e10', response_id: 'resp_1', output_index: 0, item: fc });
-        send({ type: 'response.done', event_id: 'e11', response: { id: 'resp_1', object: 'realtime.response', status: 'completed', output: [fc], usage: usage(120, 15) } });
+        send({ type: 'response.output_item.added', event_id: 'e8a', response_id: 'resp_1', output_index: 0, item: { ...preamble, status: 'in_progress', content: [] } });
+        send({ type: 'response.output_audio.delta', event_id: 'e8b', response_id: 'resp_1', item_id: 'item_a1', output_index: 0, content_index: 0, delta: AUDIO });
+        send({ type: 'response.output_audio_transcript.done', event_id: 'e8c', response_id: 'resp_1', item_id: 'item_a1', output_index: 0, content_index: 0, transcript: 'Let me check.' });
+        send({ type: 'response.output_item.added', event_id: 'e8', response_id: 'resp_1', output_index: 1, item: { ...fc, arguments: '', status: 'in_progress' } });
+        send({ type: 'response.function_call_arguments.done', event_id: 'e9', response_id: 'resp_1', item_id: 'item_fc', output_index: 1, call_id: 'call_rent', name: 'get_rent', arguments: fc.arguments });
+        send({ type: 'response.output_item.done', event_id: 'e10', response_id: 'resp_1', output_index: 1, item: fc });
+        send({ type: 'response.done', event_id: 'e11', response: { id: 'resp_1', object: 'realtime.response', status: 'completed', output: [preamble, fc], usage: usage(120, 15) } });
       }
       if (e.type === 'conversation.item.create') send({ type: 'conversation.item.added', event_id: 'e12', previous_item_id: 'item_fc', item: { id: 'item_fco', ...e.item } });
       if (e.type === 'response.create') {
@@ -948,7 +952,7 @@ test('OpenAI Realtime: a two-turn voice call records one Responses-shaped call p
 
   // App-visible behavior: every server event reached the app's 'event' listener in order, and the typed listeners too.
   assert.deepEqual(seen.all, fake.sent);
-  assert.equal(seen.typed.filter(t => t === 'response.output_audio.delta').length, 3);
+  assert.equal(seen.typed.filter(t => t === 'response.output_audio.delta').length, 4);
   assert.equal(seen.typed.filter(t => t === 'response.done').length, 2);
   // The client events went out unchanged, audio included.
   assert.equal(fake.received.find(e => e.type === 'input_audio_buffer.append').audio, AUDIO);
@@ -956,7 +960,7 @@ test('OpenAI Realtime: a two-turn voice call records one Responses-shaped call p
 
   assert.equal(calls.length, 2);
   for (const c of calls) {
-    assert.deepEqual(c.conversation, { id: 'call-1' });
+    assert.deepEqual(c.conversation, { id: 'call-1', channel: 'voice' });
     assert.equal(c.request.model, 'gpt-realtime');
     assert.equal(c.request.instructions, 'You are a leasing agent.');
     assert.equal(c.request.tools[0].name, 'get_rent');
@@ -964,17 +968,22 @@ test('OpenAI Realtime: a two-turn voice call records one Responses-shaped call p
     assert.ok(c.started_at <= c.ended_at);
   }
   const [first, second] = calls;
-  const user = { role: 'user', content: [{ type: 'input_text', text: 'What is the rent for 4B?' }], audio: true };
+  const user = { role: 'user', content: [{ type: 'input_text', text: 'What is the rent for 4B?' }], audio: true, at: first.request.input[0]?.at };
+  assert.match(user.at, /^\d{4}-/);
+  const firstLatency = Date.parse(first.voice.first_audio_at) - Date.parse(first.voice.speech_stopped_at);
+  const said = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Let me check.' }], audio: true, voice: { latency_ms: firstLatency, interrupted: false } };
   const call = { type: 'function_call', call_id: 'call_rent', name: 'get_rent', arguments: '{"unit":"4B"}' };
   const result = { type: 'function_call_output', call_id: 'call_rent', output: '{"rent":2100}' };
-  const reply = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Unit 4B rents for 2100 dollars a month.' }], audio: true };
+  const reply = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Unit 4B rents for 2100 dollars a month.' }], audio: true, voice: { latency_ms: null, interrupted: true, truncated_at_ms: 640 } };
   assert.deepEqual(first.request.input, [user]);
-  assert.deepEqual(first.response, { id: 'resp_1', output: [call], usage: { total_tokens: 135, input_tokens: 120, output_tokens: 15 } });
+  assert.deepEqual(first.response, { id: 'resp_1', output: [said, call], usage: { total_tokens: 135, input_tokens: 120, output_tokens: 15 } });
   assert.equal(first.error, null);
   assert.match(first.voice.speech_stopped_at, /^\d{4}-/);
-  assert.equal(first.voice.first_audio_at, null);
+  assert.match(first.voice.first_audio_at, /^\d{4}-/);
   assert.equal(first.voice.interrupted, false);
-  assert.deepEqual(second.request.input, [user, call, result]);
+  // The first reply's timing is still on its item in the second call's history.
+  assert.deepEqual(second.request.input, [user, said, call, result]);
+  assert.deepEqual(second.request.input[1].voice, { latency_ms: firstLatency, interrupted: false });
   assert.deepEqual(second.response.output, [reply]);
   assert.equal(second.response.id, 'resp_2');
   assert.match(second.voice.first_audio_at, /^\d{4}-/);
@@ -1015,7 +1024,7 @@ test('OpenAI Realtime: an error event and a socket closed mid-response are recor
   await fake.close();
   assert.equal(errors.length, 1); // the app's own error listener still fires
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].conversation, { id: 'call-2' });
+  assert.deepEqual(calls[0].conversation, { id: 'call-2', channel: 'voice' });
   assert.deepEqual(calls[0].request.input, [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }]);
   assert.match(calls[0].error, /overloaded/);
   assert.equal(calls[0].request.instructions, 'Be brief.');
@@ -1053,8 +1062,8 @@ test('OpenAI Realtime: OpenAIRealtimeWebSocket is patched too, and state keeps a
   assert.deepEqual(heard, ['response.created', 'response.output_text.done', 'response.done']);
   assert.equal(s.out.length, 250);
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].conversation, { id: 'call-3' });
+  assert.deepEqual(calls[0].conversation, { id: 'call-3', channel: 'voice' });
   assert.equal(calls[0].request.input.length, 199); // 200 kept, one of them the reply
   assert.equal(calls[0].request.input[0].content[0].text, 't51');
-  assert.deepEqual(calls[0].response.output, [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }]);
+  assert.deepEqual(calls[0].response.output, [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }], voice: { latency_ms: null, interrupted: false } }]);
 });

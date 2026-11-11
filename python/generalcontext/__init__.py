@@ -108,7 +108,9 @@ def initialize(api_key=None, base_url=None, app_name=None, redact=False, before_
     if not _secure(_base_url()):
         _warn_insecure()
     atexit.register(_flush_at_exit)
+    atexit.register(_flush_realtime_at_exit)  # atexit runs last registered first, so this goes before the flush
     _patch_sdks()
+    _patch_realtime()
     _patch_gemini()
     _patch_bedrock()
     if instrument_http:
@@ -153,6 +155,19 @@ def wrap(client, *, redact=False):
     if _disabled():
         return client
     scrub = _redactor(redact)
+    if callable(getattr(client, "recv_bytes", None)) and callable(getattr(client, "parse_event", None)):
+        # An OpenAI Realtime connection. Its session is the one wrap() runs in.
+        is_async = inspect.iscoroutinefunction(inspect.unwrap(client.recv_bytes))
+        _rt_state(client, scrub)
+        for method, observe in (("recv_bytes", _rt_on_server), ("send", _rt_on_client),
+                                ("send_raw", _rt_on_client_raw), ("close", None)):
+            bound = getattr(client, method, None)
+            if bound is None or getattr(bound, "_generalcontext", False):
+                continue
+            inner = _rt_method(getattr(type(client), method), observe, is_async, scrub)
+            setattr(client, method, functools.partial(inner, client))
+            getattr(client, method)._generalcontext = True
+        return client
     targets = []
     if hasattr(client, "chat") and hasattr(getattr(client.chat, "completions", None), "create"):
         targets.append((client.chat.completions, "openai-chat"))
@@ -1004,6 +1019,481 @@ def _assemble_converse(events):
     if metrics:
         response["metrics"] = metrics
     return response
+
+
+# ---- OpenAI Realtime (voice) -----------------------------------------------------------------
+#
+# A realtime session is one WebSocket carrying many responses. Each response.done becomes one
+# "openai-realtime" call shaped like a Responses call: request {model, instructions, tools, input} and
+# response {id, output, usage}, so the platform folds a whole phone call into one conversation. Only text
+# is kept: transcripts, text, tool calls and tool results. Audio bytes are never read into this state.
+# Events are observed, never changed or delayed.
+
+_REALTIME_MODULES = ("openai.resources.realtime.realtime", "openai.resources.beta.realtime.realtime")
+REALTIME_MAX_ITEMS = 200
+# A finished response is recorded once the next response starts, the connection closes, or this long
+# after response.done, so an interruption that arrives while its audio still plays is on the call.
+REALTIME_HOLD_SECONDS = 60
+_live_realtime = set()
+
+
+def _patch_realtime():
+    for module_name in _REALTIME_MODULES:
+        try:
+            module = __import__(module_name, fromlist=["RealtimeConnection"])
+        except Exception:
+            continue  # Not in this openai version.
+        for name, is_async in (("RealtimeConnection", False), ("AsyncRealtimeConnection", True)):
+            cls = getattr(module, name, None)
+            if cls is not None:
+                _patch_realtime_class(cls, is_async)
+
+
+def _patch_realtime_class(cls, is_async, scrub=None):
+    init = vars(cls).get("__init__")
+    if init is not None and not getattr(init, "_generalcontext", False):
+        @functools.wraps(init)
+        def patched_init(self, *args, **kwargs):
+            init(self, *args, **kwargs)
+            _rt_state(self, scrub)  # The session the app is in when it connects.
+        patched_init._generalcontext = True
+        cls.__init__ = patched_init
+    for method, observe in (("recv_bytes", _rt_on_server), ("send", _rt_on_client), ("send_raw", _rt_on_client_raw),
+                            ("close", None)):
+        original = vars(cls).get(method)
+        if original is not None and not getattr(original, "_generalcontext", False):
+            setattr(cls, method, _rt_method(original, observe, is_async, scrub))
+
+
+def _rt_method(original, observe, is_async, scrub):
+    def before(self, args):
+        if observe is _rt_on_client or observe is _rt_on_client_raw:
+            _rt_safe(observe, self, args[0] if args else None, scrub)
+        elif observe is None:
+            _rt_safe(lambda conn, _event, sc: _rt_state(conn, sc).close(), self, None, scrub)
+
+    def after(self, result):
+        if observe is _rt_on_server:
+            _rt_safe(observe, self, result, scrub)
+
+    def failed(self, error):
+        # recv_bytes raising ConnectionClosed means the socket closed. Reconnecting connections recover inside
+        # their iterator, so an in-flight response is only closed out on a final close.
+        if observe is _rt_on_server and type(error).__name__.startswith("ConnectionClosed") \
+                and getattr(self, "_make_ws", None) is None:
+            _rt_safe(lambda conn, _event, sc: _rt_state(conn, sc).close(), self, None, scrub)
+
+    if is_async:
+        @functools.wraps(original)
+        async def wrapped(self, *args, **kwargs):
+            before(self, args)
+            try:
+                result = await original(self, *args, **kwargs)
+            except BaseException as error:
+                failed(self, error)
+                raise
+            after(self, result)
+            return result
+    else:
+        @functools.wraps(original)
+        def wrapped(self, *args, **kwargs):
+            before(self, args)
+            try:
+                result = original(self, *args, **kwargs)
+            except BaseException as error:
+                failed(self, error)
+                raise
+            after(self, result)
+            return result
+    wrapped._generalcontext = True
+    return wrapped
+
+
+def _rt_safe(fn, conn, event, scrub):
+    try:
+        fn(conn, event, scrub)
+    except Exception as error:  # Never break the app.
+        _warn("realtime", "General Context could not observe a realtime event: %s", error)
+
+
+def _rt_state(conn, scrub=None):
+    state = conn.__dict__.get("_generalcontext_realtime")
+    if state is None:
+        state = conn.__dict__.setdefault("_generalcontext_realtime", _RealtimeState(scrub))
+    return state
+
+
+def _rt_on_server(conn, data, scrub):
+    if isinstance(data, (bytes, bytearray)):
+        data = data.decode("utf-8", "replace")
+    if not isinstance(data, str) or '"type"' not in data:
+        return
+    event = json.loads(data)
+    if isinstance(event, dict):
+        _rt_state(conn, scrub).server(event)
+
+
+def _rt_on_client(conn, event, scrub):
+    if event is None:
+        return
+    if hasattr(event, "model_dump"):
+        event = event.model_dump(mode="json", exclude_none=True)
+    if isinstance(event, dict) and event.get("type") != "input_audio_buffer.append":
+        _rt_state(conn, scrub).client(event)
+
+
+def _rt_on_client_raw(conn, data, scrub):
+    if isinstance(data, (bytes, bytearray)):
+        data = data.decode("utf-8", "replace")
+    if isinstance(data, str) and '"input_audio_buffer.append"' not in data:
+        event = json.loads(data)
+        if isinstance(event, dict):
+            _rt_state(conn, scrub).client(event)
+
+
+def _rt_text(item):
+    parts = []
+    for part in item.get("content") or []:
+        if isinstance(part, dict):
+            text = part.get("text") if isinstance(part.get("text"), str) else part.get("transcript")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "".join(parts) if parts else None
+
+
+def _rt_convert(item):
+    """A realtime item as a Responses item, text only. None when there is no text yet."""
+    if not isinstance(item, dict):
+        return None
+    kind = item.get("type")
+    if kind == "function_call":
+        return {"type": "function_call", "call_id": item.get("call_id"), "name": item.get("name"),
+                "arguments": item.get("arguments") or ""}
+    if kind == "function_call_output":
+        return {"type": "function_call_output", "call_id": item.get("call_id"), "output": item.get("output")}
+    if kind != "message":
+        return None
+    text = _rt_text(item)
+    if text is None:
+        return None
+    audio = any(isinstance(p, dict) and "audio" in str(p.get("type")) for p in item.get("content") or [])
+    if item.get("role") == "assistant":
+        out = {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}
+    else:
+        out = {"role": item.get("role") or "user", "content": [{"type": "input_text", "text": text}]}
+    if audio:
+        out["audio"] = True
+    return out
+
+
+def _rt_assistant(text, audio):
+    out = {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}
+    if audio:
+        out["audio"] = True
+    return out
+
+
+class _RealtimeResponse:
+    def __init__(self, response_id, seq, speech_stopped_at):
+        self.id = response_id if isinstance(response_id, str) else f"resp_{uuid.uuid4()}"
+        self.seq = seq
+        self.started_at = _now()
+        self.ended_at = None
+        self.usage = None
+        self.error = None
+        self.instructions = self.tools = None
+        self.has_overrides = False
+        self.output_ids = set()
+        self.voice = {"speech_stopped_at": speech_stopped_at, "first_audio_at": None, "interrupted": False}
+        self.first_audio = None  # monotonic seconds
+        self.audio_bytes = 0
+        self.timer = None
+
+
+class _RealtimeState:
+    """Per-connection state: session settings and the conversation so far, as text."""
+
+    def __init__(self, scrub):
+        self.lock = threading.RLock()
+        self.conversation, self.task = _session.get(), _task.get()
+        self.scrub = scrub or _config["scrub"]
+        self.model = self.instructions = None
+        self.tools = None
+        self.next = None
+        self.entries = []  # dicts: id, item, seq, response
+        self.seq = 0
+        self.speech_stopped_at = None
+        self.current = self.held = None
+        self.closed = False
+        self.bytes_per_ms = 48  # pcm16 at 24 kHz; G.711 is 8
+
+    # Items --------------------------------------------------------------------------------
+
+    def entry(self, item_id, match=None):
+        for e in self.entries:
+            if item_id and e["id"] == item_id:
+                return e
+        if match is not None:
+            for e in self.entries:
+                if not e["id"] and match(e):
+                    if item_id:
+                        e["id"] = item_id
+                    return e
+        self.seq += 1
+        e = {"id": item_id, "item": None, "seq": self.seq, "response": None}
+        self.entries.append(e)
+        del self.entries[:-REALTIME_MAX_ITEMS]
+        return e
+
+    def upsert(self, raw, response_id=None):
+        item_id = raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else None
+        converted = _rt_convert(raw)
+        e = self.entry(item_id, (lambda x: x["item"] == converted) if converted else None)
+        if converted:
+            e["item"] = dict(e["item"] or {}, **converted)
+        if response_id:
+            e["response"] = response_id
+
+    def response_for(self, response_id):
+        for r in (self.current, self.held):
+            if r is not None and (not response_id or r.id == response_id):
+                return r
+        return None
+
+    def own(self, response_id, item_id):
+        r = self.response_for(response_id)
+        if r is not None and isinstance(item_id, str):
+            r.output_ids.add(item_id)
+        return r
+
+    def settings(self, session):
+        if not isinstance(session, dict):
+            return
+        if isinstance(session.get("model"), str):
+            self.model = session["model"]
+        if "instructions" in session:
+            self.instructions = session["instructions"]
+        if "tools" in session:
+            self.tools = session["tools"]
+        fmt = ((session.get("audio") or {}).get("output") or {}).get("format") or {}
+        fmt = fmt.get("type") if isinstance(fmt, dict) else session.get("output_audio_format")
+        if isinstance(fmt, str):
+            self.bytes_per_ms = 8 if re.search(r"pcmu|pcma|g711", fmt) else 48
+
+    # Events -------------------------------------------------------------------------------
+
+    def server(self, event):
+        with self.lock:
+            self._server(event)
+
+    def _server(self, event):
+        kind = event.get("type")
+        if kind in ("session.created", "session.updated"):
+            self.settings(event.get("session"))
+        elif kind in ("conversation.item.added", "conversation.item.created", "conversation.item.done"):
+            item = event.get("item") or {}
+            r = self.current
+            self.upsert(item, r.id if r is not None and item.get("id") in r.output_ids else None)
+        elif kind == "conversation.item.input_audio_transcription.completed":
+            e = self.entry(event.get("item_id"))
+            e["item"] = {"role": "user", "content": [{"type": "input_text", "text": str(event.get("transcript") or "")}],
+                         "audio": True, "at": _now()}
+        elif kind == "input_audio_buffer.speech_started":
+            # Every user turn starts with speech_started. It interrupts the response being generated, or the
+            # last one while its audio still plays (length estimated from delta sizes, the bytes are not kept).
+            r = self.current or self.held
+            if r is not None and (r is self.current or time.monotonic() < self.playback_end(r)):
+                r.voice["interrupted"] = True
+        elif kind == "input_audio_buffer.speech_stopped":
+            self.speech_stopped_at = _now()
+        elif kind == "response.created":
+            self.release()
+            if self.current is not None:
+                self.finish("a new response started before response.done")
+            self.current = self.start((event.get("response") or {}).get("id"))
+        elif kind in ("response.output_item.added", "response.output_item.done"):
+            item = event.get("item") or {}
+            r = self.own(event.get("response_id"), item.get("id"))
+            self.upsert(item, r.id if r is not None else None)
+        elif kind in ("response.output_audio.delta", "response.audio.delta"):
+            r = self.response_for(event.get("response_id"))
+            if r is not None:
+                if r.voice["first_audio_at"] is None:
+                    r.voice["first_audio_at"], r.first_audio = _now(), time.monotonic()
+                delta = event.get("delta")
+                if isinstance(delta, str):
+                    r.audio_bytes += len(delta) * 3 // 4
+        elif kind in ("response.output_audio_transcript.done", "response.audio_transcript.done",
+                      "response.output_text.done", "response.text.done"):
+            r = self.own(event.get("response_id"), event.get("item_id"))
+            e = self.entry(event.get("item_id"))
+            e["item"] = _rt_assistant(str(event.get("transcript") or event.get("text") or ""), "audio" in kind)
+            if r is not None:
+                e["response"] = r.id
+        elif kind == "response.function_call_arguments.done":
+            r = self.own(event.get("response_id"), event.get("item_id"))
+            e = self.entry(event.get("item_id"))
+            e["item"] = {"type": "function_call", "call_id": event.get("call_id"), "name": event.get("name"),
+                         "arguments": event.get("arguments") or ""}
+            if r is not None:
+                e["response"] = r.id
+        elif kind == "conversation.item.truncated":
+            self.truncate(event.get("item_id"), event.get("audio_end_ms"))
+        elif kind == "error":
+            if self.current is not None:
+                err = event.get("error") or {}
+                code = f" ({err.get('code')})" if err.get("code") else ""
+                self.current.error = f"realtime error: {err.get('message') or 'unknown error'}{code}"
+        elif kind == "response.done":
+            res = event.get("response") or {}
+            r = self.response_for(res.get("id"))
+            if r is None:
+                r = self.current = self.start(res.get("id"))
+            for item in res.get("output") or []:
+                if isinstance(item, dict):
+                    self.own(r.id, item.get("id"))
+                    self.upsert(item, r.id)
+            r.ended_at = _now()
+            r.usage = res.get("usage")
+            if res.get("status") == "failed" and not r.error:
+                r.error = f"response failed: {json.dumps(res.get('status_details'))}"
+            if res.get("status") == "cancelled":
+                r.voice["interrupted"] = True
+            if self.current is r:
+                self.current = None
+            self.hold(r)
+
+    def client(self, event):
+        with self.lock:
+            kind = event.get("type")
+            if kind == "session.update":
+                self.settings(event.get("session"))
+            elif kind == "conversation.item.create":
+                self.upsert(event.get("item"))
+            elif kind == "response.create":
+                res = event.get("response") or {}
+                if "instructions" in res or "tools" in res:
+                    self.next = (res.get("instructions"), res.get("tools"))
+            elif kind == "response.cancel":
+                r = self.current or self.held
+                if r is not None:
+                    r.voice["interrupted"] = True
+            elif kind == "conversation.item.truncate":
+                self.truncate(event.get("item_id"), event.get("audio_end_ms"))
+
+    # Responses ----------------------------------------------------------------------------
+
+    def start(self, response_id):
+        self.seq += 1
+        r = _RealtimeResponse(response_id, self.seq, self.speech_stopped_at)
+        if self.next is not None:
+            r.instructions, r.tools = self.next
+            r.has_overrides = True
+            self.next = None
+        self.speech_stopped_at = None
+        _live_realtime.add(self)
+        return r
+
+    def playback_end(self, r):
+        return 0 if r.first_audio is None else r.first_audio + r.audio_bytes / self.bytes_per_ms / 1000
+
+    def truncate(self, item_id, ms):
+        candidates = [r for r in (self.current, self.held) if r is not None and item_id in r.output_ids]
+        r = candidates[0] if candidates else (self.current or self.held)
+        if r is None:
+            return
+        r.voice["interrupted"] = True
+        if isinstance(ms, (int, float)):
+            r.voice["truncated_at_ms"] = ms
+
+    def hold(self, r):
+        self.release()
+        self.held = r
+        r.timer = threading.Timer(REALTIME_HOLD_SECONDS, self._expire, args=(r,))
+        r.timer.daemon = True
+        r.timer.start()
+
+    def _expire(self, r):
+        with self.lock:
+            if self.held is r:
+                self.release()
+
+    def release(self):
+        r, self.held = self.held, None
+        if r is None:
+            return
+        if r.timer is not None:
+            r.timer.cancel()
+        self.record(r)
+        if self.current is None:
+            _live_realtime.discard(self)
+
+    def finish(self, error):
+        r, self.current = self.current, None
+        if r is None:
+            return
+        r.ended_at = _now()
+        r.error = r.error or error
+        self.record(r)
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            self.release()
+            self.finish("connection closed before response.done")
+            _live_realtime.discard(self)
+
+    def record(self, r):
+        try:
+            inputs, outputs = [], []
+            # Timing goes on the stored assistant item too, so every later call's input still carries it.
+            timing = {"latency_ms": _rt_latency(r.voice), "interrupted": r.voice["interrupted"]}
+            if "truncated_at_ms" in r.voice:
+                timing["truncated_at_ms"] = r.voice["truncated_at_ms"]
+            for e in self.entries:
+                if not e["item"]:
+                    continue
+                if e["response"] == r.id or (e["id"] and e["id"] in r.output_ids):
+                    if e["item"].get("role") == "assistant":
+                        e["item"] = dict(e["item"], voice=timing)
+                    outputs.append(e["item"])
+                elif e["seq"] < r.seq:
+                    inputs.append(e["item"])
+            request = {"model": self.model,
+                       "instructions": r.instructions if r.has_overrides and r.instructions is not None else self.instructions,
+                       "tools": (r.tools if r.has_overrides and r.tools is not None else self.tools) or [],
+                       "input": inputs}
+            conversation = self.conversation
+            if conversation is not None and not conversation.get("channel"):
+                conversation = dict(conversation, channel="voice")
+            call = {"api": "openai-realtime", "conversation": conversation, "task": self.task,
+                    "request": _plain(request), "response": _plain({"id": r.id, "output": outputs, "usage": r.usage}),
+                    "started_at": r.started_at, "ended_at": r.ended_at or _now(), "error": r.error,
+                    "voice": dict(r.voice)}
+            _sender.put(compact_for_recording(call), self.scrub)
+        except Exception as failure:
+            log.warning("General Context could not record a realtime response: %s", failure)
+
+
+def _rt_latency(voice):
+    """Milliseconds from the caller's speech stopping to the first reply audio, or None."""
+    try:
+        stopped = datetime.fromisoformat(voice["speech_stopped_at"])
+        audio = datetime.fromisoformat(voice["first_audio_at"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    return round((audio - stopped).total_seconds() * 1000)
+
+
+def _flush_realtime_at_exit():
+    for state in list(_live_realtime):
+        try:
+            with state.lock:
+                state.release()
+        except Exception:
+            pass
 
 
 # ---- Raw HTTP capture ----------------------------------------------------------------------

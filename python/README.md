@@ -39,6 +39,15 @@ not, from clients created before or after it. Call it in every process, includin
 | AWS Bedrock Converse | `boto3` `bedrock-runtime` (`converse`, `converse_stream`) |
 | Anything else | Send [OpenTelemetry](https://generalcontextlabs.com/docs/opentelemetry) |
 
+**Voice (OpenAI Realtime).** Connections from `client.realtime.connect()` (sync and async, needs
+`openai[realtime]`) are recorded too. Open the connection inside `session(...)` and the whole call lands
+in that conversation. Each `response.done` is recorded as one `openai-realtime` call shaped like a
+Responses call: the instructions and tools, the conversation so far as text (caller turns from the input
+transcription, agent turns from the output transcript, tool calls and their results), and a `voice` field
+with `speech_stopped_at`, `first_audio_at`, `interrupted` and `truncated_at_ms`. Turn on input audio
+transcription in the session to record what the caller said. Audio is never recorded. Pass a connection to
+`wrap()` to record only that one.
+
 Python 3.9 to 3.13. Supported client versions, redaction, outcomes and events, and every option:
 [SDK reference](https://generalcontextlabs.com/docs/sdk).
 
