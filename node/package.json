@@ -51,9 +51,9 @@
     "@aws-sdk/client-bedrock-runtime": "^3.1165.0",
     "@google/genai": "^3.0.0",
     "@smithy/node-http-handler": "^4.14.2",
-    "@types/node": "^22.20.5",
+    "@types/node": "^26.6.6",
     "openai": "^7.53.0",
-    "typescript": "^5.9.3"
+    "typescript": "^7.0.2"
   },
   "repository": {
     "type": "git",
