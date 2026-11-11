@@ -210,11 +210,11 @@ class SdkTest(unittest.TestCase):
 
     def test_account_groups_a_session_by_the_apps_own_customer(self):
         client = generalcontext.wrap(Client({}))
-        for sid, account in (("a1", "  greystar  "), ("a2", "  "), ("a3", None), ("a4", "x" * 200)):
+        for sid, account in (("a1", "  northwind  "), ("a2", "  "), ("a3", None), ("a4", "x" * 200)):
             with generalcontext.session(sid, account=account):
                 client.chat.completions.create(model="m", messages=[])
         calls = self.calls()
-        self.assertEqual([c["conversation"] for c in calls[:3]], [{"id": "a1", "account": "greystar"}, {"id": "a2"}, {"id": "a3"}])
+        self.assertEqual([c["conversation"] for c in calls[:3]], [{"id": "a1", "account": "northwind"}, {"id": "a2"}, {"id": "a3"}])
         self.assertEqual(len(calls[3]["conversation"]["account"]), 120)
 
     def test_an_exception_is_recorded_and_reraised_unchanged(self):

@@ -247,11 +247,11 @@ test('session and task tags survive awaits', async () => {
 });
 
 test('account groups a session by the app\'s own customer', async () => {
-  await sdk.withSession({ sessionId: 'a1', account: '  greystar  ' }, () => openai().chat.completions.create({ model: 'gpt-x', messages: [] }));
+  await sdk.withSession({ sessionId: 'a1', account: '  northwind  ' }, () => openai().chat.completions.create({ model: 'gpt-x', messages: [] }));
   await sdk.withSession({ sessionId: 'a2', account: '   ' }, () => openai().chat.completions.create({ model: 'gpt-x', messages: [] }));
   await sdk.withSession({ sessionId: 'a3', account: 'x'.repeat(200) }, () => openai().chat.completions.create({ model: 'gpt-x', messages: [] }));
   const calls = await drain();
-  assert.deepEqual(calls[0].conversation, { id: 'a1', account: 'greystar' });
+  assert.deepEqual(calls[0].conversation, { id: 'a1', account: 'northwind' });
   assert.deepEqual(calls[1].conversation, { id: 'a2' });
   assert.equal(calls[2].conversation.account.length, 120);
 });
