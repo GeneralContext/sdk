@@ -233,6 +233,31 @@ class SdkTest(unittest.TestCase):
         first = sent[0]["content"].split("<phone:")[1][:6]
         self.assertEqual(sent[1]["content"], f"<phone:{first}>")
 
+    def test_credentials_are_never_sent_even_with_redaction_off(self):
+        # A key pasted into a prompt, returned by a tool, or passed as a per-request option. The default
+        # client here has no redaction, so nothing but the always-on masking stands between them and us.
+        openai_key, aws_key, gc_key = "sk-proj-" + "a1B2" * 10, "AKIAIOSFODNN7EXAMPLE", "gck_" + "0f" * 24
+        client = generalcontext.wrap(Client({"choices": [{"message": {"role": "assistant", "content": "Your key " + gc_key + " is set."}}]}))
+        client.chat.completions.create(
+            model="m", messages=[{"role": "user", "content": "here is my key " + openai_key},
+                                 {"role": "tool", "tool_call_id": "t", "content": '{"AccessKeyId": "' + aws_key + '"}'}],
+            extra_headers={"Helicone-Auth": "Bearer sk-helicone-" + "z" * 30}, extra_query={"api-key": "azure-" + "q" * 32})
+        sent = json.dumps(self.calls()[0])
+        for secret in (openai_key, aws_key, gc_key, "sk-helicone", "azure-qqq"):
+            self.assertNotIn(secret, sent)
+        self.assertIn("<openai-key>", sent)
+        self.assertIn("<aws-key>", sent)
+        self.assertIn("<generalcontext-key>", sent)
+        self.assertNotIn("extra_query", sent)
+        self.assertTrue(generalcontext.report_outcome("s1", "fail", "customer read out " + openai_key))
+        self.assertNotIn(openai_key, json.dumps(Server.received[-1][2]))
+
+    def test_secret_masking_is_fast_on_adversarial_input(self):
+        for text in ("-----BEGIN RSA PRIVATE KEY-----\n" * 3000, "sk-" + "a" * 50_000, "Bearer " * 10_000, ("eyJ" + "a" * 10 + ".") * 5000):
+            started = time.perf_counter()
+            generalcontext.mask_secrets(text)
+            self.assertLess(time.perf_counter() - started, 0.5)
+
     def test_second_initialize_is_ignored(self):
         with self.assertLogs("generalcontext", "WARNING"):
             generalcontext.initialize(api_key="other")

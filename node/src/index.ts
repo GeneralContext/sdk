@@ -319,7 +319,7 @@ export function compactForRecording(value: unknown, key?: string, depth = 0): un
 function record(call: Omit<Call, 'conversation' | 'task'>, at: Scope | undefined, scrub?: Scrub | null) {
   try {
     if (!apiKey()) { warnLimited('no-key', 'GENERALCONTEXT_API_KEY is not set; a model call was not recorded'); return; }
-    const json = JSON.stringify(compactForRecording({ ...call, conversation: at?.tags ?? null, task: at?.task ?? null }));
+    const json = JSON.stringify(compactForRecording({ ...call, request: withoutRequestOptions(call.request), conversation: at?.tags ?? null, task: at?.task ?? null }));
     const bytes = Buffer.byteLength(json);
     if (bytes > MAX_CALL_BYTES) { warnLimited('oversized', `a model call of ${bytes} bytes is over the ${MAX_CALL_BYTES} byte limit and was dropped`); return; }
     if (queue.length >= MAX_QUEUE || queuedBytes + bytes > MAX_QUEUE_BYTES) { warnLimited('queue-full', 'queue is full; a model call was dropped'); return; }
@@ -343,6 +343,37 @@ function hookExit() {
   });
 }
 
+// Credentials are never sent, whatever `redact` says. They reach a recording when an app pastes a key into a
+// prompt, a tool returns one, or a request carries one in its options. Each pattern needs the provider's
+// fixed prefix, so ordinary text is never touched. The key name stays, so a reader knows one was there.
+const SECRETS: [string, RegExp][] = [
+  ['anthropic-key', /\bsk-ant-[A-Za-z0-9_-]{20,}/g],
+  ['openai-key', /\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}/g],
+  ['stripe-key', /\b[rsp]k_(?:live|test)_[A-Za-z0-9]{16,}/g],
+  ['google-key', /\bAIza[A-Za-z0-9_-]{35}\b/g],
+  ['aws-key', /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g],
+  ['github-token', /\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})/g],
+  ['slack-token', /\bxox[abposr]-[A-Za-z0-9-]{10,}/g],
+  ['generalcontext-key', /\bgck_[a-f0-9]{48}\b/g],
+  ['jwt', /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g],
+  ['bearer-token', /(?<=\bBearer\s)[A-Za-z0-9._~+/-]{20,}=*/g],
+  ['private-key', /-----BEGIN [A-Z ]{0,20}PRIVATE KEY-----(?:[A-Za-z0-9+/=\s:,]|-(?!-)){1,16384}?-----END [A-Z ]{0,20}PRIVATE KEY-----/g],
+];
+export function maskSecrets(text: string): string {
+  if (text.length < 16) return text;
+  return SECRETS.reduce((out, [kind, pattern]) => out.replace(pattern, `<${kind}>`), text);
+}
+// Request options that carry credentials or transport settings, not what the model was asked. Dropped from the
+// recorded request: Gemini's httpOptions (per-request headers) and anything spelled like a header map.
+const REQUEST_OPTIONS = new Set(['httpOptions', 'http_options', 'headers', 'extra_headers', 'extraHeaders', 'extra_query', 'extraQuery', 'abortSignal', 'signal']);
+function withoutRequestOptions(value: unknown, depth = 0): unknown {
+  if (!value || typeof value !== 'object' || depth > 3) return value;
+  if (Array.isArray(value)) return value;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value)) if (!REQUEST_OPTIONS.has(k)) out[k] = k === 'config' ? withoutRequestOptions(v, depth + 1) : v;
+  return out;
+}
+
 // Apply beforeSend and redaction. Returns the JSON to send, or null to drop.
 function prepare(entry: Entry): string | null {
   let call = JSON.parse(entry.json) as Call | null | undefined;
@@ -353,7 +384,8 @@ function prepare(entry: Entry): string | null {
     }
     if (call == null) return null;
   }
-  return JSON.stringify(scrubbed(call, entry.scrub === undefined ? config.scrub : entry.scrub));
+  const scrub = entry.scrub === undefined ? config.scrub : entry.scrub;
+  return JSON.stringify(scrubbed(call, scrub ? (text: string) => scrub(maskSecrets(text)) : maskSecrets));
 }
 
 type Reply = { ok: boolean; status: number };
@@ -474,7 +506,7 @@ export async function flush(timeoutMs = FLUSH_TIMEOUT_MS): Promise<boolean> {
   } catch { return false; } finally { clearTimeout(deadline); }
 }
 
-const scrubText = (value: string) => (config.scrub ? config.scrub(value) : value);
+const scrubText = (value: string) => (config.scrub ? config.scrub(maskSecrets(value)) : maskSecrets(value));
 
 /** Mark how a session ended. Returns true when the platform accepted it. Never throws. */
 export async function reportOutcome(sessionId: string, outcome: 'success' | 'fail', note?: string): Promise<boolean> {

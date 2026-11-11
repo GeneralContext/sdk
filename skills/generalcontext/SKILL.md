@@ -126,6 +126,8 @@ Both context managers follow `await`, so they work in `async def` bodies. They d
 
 ## Redaction and filtering
 
+Credentials are always masked, whatever `redact` says: API keys (OpenAI, Anthropic, Google, AWS, Stripe, GitHub, Slack, General Context), bearer tokens, JWTs and private keys become `<openai-key>`, `<jwt>` and so on before anything leaves the process, and per-request headers and query parameters are never recorded. Do not add code to strip keys from prompts for General Context's sake.
+
 `redact=True` (`redact: true` in Node) replaces emails, phone numbers and card or SSN-like numbers with stable placeholders such as `<email:3f9a1c>` before anything leaves the process. Set `GENERALCONTEXT_REDACT_SALT` to one secret in every process so the same value gets the same placeholder everywhere; without it, placeholders differ between processes. Redaction also covers outcomes and events, so a redacted session id still matches its calls. For anything else, `before_send` / `beforeSend` receives each call before it is sent: return it (edited or not), or `None`/`null` to drop it.
 
 ## Configuration

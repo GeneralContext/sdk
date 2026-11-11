@@ -254,6 +254,29 @@ test('redaction replaces personal details with stable placeholders', async () =>
   assert.match(text, /<email:[0-9a-f]{6}> or <phone:[0-9a-f]{6}>/);
 });
 
+test('credentials are never sent, even with redaction off, and request options are not recorded', async () => {
+  const openaiKey = 'sk-proj-' + 'a1B2'.repeat(10), awsKey = 'AKIAIOSFODNN7EXAMPLE', gcKey = 'gck_' + '0f'.repeat(24);
+  // This suite initializes with redact: true, and masking must hold without it too: the Python suite runs redaction off.
+  await openai().chat.completions.create({ model: 'gpt-x', messages: [{ role: 'user', content: `here is my key ${openaiKey}` },
+    { role: 'tool', tool_call_id: 't', content: JSON.stringify({ AccessKeyId: awsKey, note: gcKey }) }] },
+    { headers: { 'Helicone-Auth': 'Bearer sk-helicone-' + 'z'.repeat(30) } });
+  const [call] = await drain();
+  const sent = JSON.stringify(call);
+  for (const secret of [openaiKey, awsKey, gcKey, 'sk-helicone']) assert.ok(!sent.includes(secret), secret);
+  assert.match(sent, /<openai-key>/);
+  assert.match(sent, /<aws-key>/);
+  assert.equal(await sdk.reportOutcome('s1', 'fail', `customer read out ${openaiKey}`), true);
+  assert.ok(!JSON.stringify(collected.outcomes.at(-1)).includes(openaiKey));
+});
+
+test('secret masking is fast on adversarial input', () => {
+  for (const text of ['-----BEGIN RSA PRIVATE KEY-----\n'.repeat(3000), 'sk-' + 'a'.repeat(50_000), 'Bearer '.repeat(10_000), ('eyJ' + 'a'.repeat(10) + '.').repeat(5000)]) {
+    const started = performance.now();
+    sdk.maskSecrets(text);
+    assert.ok(performance.now() - started < 500);
+  }
+});
+
 test('reportOutcome and logEvent post to the collector', async () => {
   assert.equal(await sdk.reportOutcome('s1', 'success', 'booked'), true);
   assert.deepEqual(collected.outcomes.at(-1), { auth: 'Bearer gc_key', session_id: 's1', outcome: 'success', note: 'booked' });

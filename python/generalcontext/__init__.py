@@ -346,7 +346,7 @@ def _encode(call, scrub):
             if call is None:
                 return None
         # allow_nan=False: a NaN that before_send adds drops this call only, not the whole batch.
-        data = json.dumps(_scrubbed(call, scrub), default=str, allow_nan=False).encode()
+        data = json.dumps(_scrubbed(call, _masking(scrub)), default=str, allow_nan=False).encode()
     except Exception as error:
         _warn("encode", "General Context could not encode a model call: %s", error)
         return None
@@ -415,8 +415,7 @@ def _send_after_flush(path, body, what):
 
 
 def _scrub_text(value):
-    scrub = _config["scrub"]
-    return scrub(value) if scrub is not None and isinstance(value, str) else value
+    return _masking(_config["scrub"])(value) if isinstance(value, str) else value
 
 
 def report_outcome(session_id, outcome, note=None):
@@ -1622,9 +1621,45 @@ def _redactor(redact):
     return scrub
 
 
+# Credentials are never sent, whatever `redact` says. They reach a recording when an app pastes a key into a
+# prompt, a tool returns one, or a request carries one in its options. Each pattern needs the provider's
+# fixed prefix, so ordinary text is never touched. The key name stays, so a reader knows one was there.
+_SECRETS = [(kind, re.compile(pattern)) for kind, pattern in (
+    ("anthropic-key", r"\bsk-ant-[A-Za-z0-9_-]{20,}"),
+    ("openai-key", r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}"),
+    ("stripe-key", r"\b[rsp]k_(?:live|test)_[A-Za-z0-9]{16,}"),
+    ("google-key", r"\bAIza[A-Za-z0-9_-]{35}\b"),
+    ("aws-key", r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    ("github-token", r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})"),
+    ("slack-token", r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
+    ("generalcontext-key", r"\bgck_[a-f0-9]{48}\b"),
+    ("jwt", r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+    ("bearer-token", r"(?<=\bBearer )[A-Za-z0-9._~+/-]{20,}=*"),
+    ("private-key", r"-----BEGIN [A-Z ]{0,20}PRIVATE KEY-----(?:[A-Za-z0-9+/=\s:,]|-(?!-)){1,16384}?-----END [A-Z ]{0,20}PRIVATE KEY-----"),
+)]
+
+
+def mask_secrets(text):
+    """Credentials in `text` replaced by <kind>. Always applied before anything is sent."""
+    if len(text) < 16:
+        return text
+    for kind, pattern in _SECRETS:
+        text = pattern.sub("<" + kind + ">", text)
+    return text
+
+
+# Request options that carry credentials or transport settings, not what the model was asked: per-request
+# headers and query parameters (an Azure api-key, a gateway key), and google-genai's http_options.
+_REQUEST_OPTIONS = ("extra_headers", "extra_query", "http_options", "httpOptions", "timeout")
+
+
+def _masking(scrub):
+    """The text filter applied before sending: credentials always masked, then the app's redaction if any."""
+    return mask_secrets if scrub is None else (lambda text: scrub(mask_secrets(text)))
+
+
 def _scrubbed(value, scrub):
-    if scrub is None:
-        return value
+    """`value` with `scrub` applied to every string in it. Callers pass `_masking(...)`."""
     if isinstance(value, str):
         return scrub(value)
     if isinstance(value, dict):
@@ -1663,7 +1698,7 @@ def _plain(value, depth=0, _path=None, _budget=None):
         try:
             if isinstance(value, dict):
                 return {str(key): _plain(item, depth + 1, _path, _budget) for key, item in value.items()
-                        if not str(key).startswith(("extra_headers", "timeout"))}
+                        if not str(key).startswith(_REQUEST_OPTIONS)}
             return [_plain(item, depth + 1, _path, _budget) for item in value]
         finally:
             _path.discard(id(value))
