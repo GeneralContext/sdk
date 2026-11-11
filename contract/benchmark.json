@@ -32,8 +32,8 @@
     {
       "format": "generalcontext.task/v1",
       "id": "tst_contract_replay",
-      "slug": "late-fee-portal-outage",
-      "title": "Late fee charged during a portal outage",
+      "slug": "duplicate-charge-refund",
+      "title": "Charged twice during a checkout incident",
       "status": "ready",
       "origin": "failure",
       "split": "train",
@@ -43,8 +43,8 @@
       ],
       "severity": "medium",
       "workflow": {
-        "id": "wf_late_fees",
-        "name": "Late-fee disputes"
+        "id": "wf_refunds",
+        "name": "Refund requests"
       },
       "source": {
         "issue": "iss_contract_1",
@@ -52,75 +52,75 @@
           {
             "id": "conv_contract_1",
             "step": 3,
-            "explanation": "The agent waived the fee itself instead of routing the request to the manager."
+            "explanation": "The agent refunded the charge itself instead of routing the request to billing."
           }
         ]
       },
-      "prompt": "My late fee is wrong. I tried to pay but the portal was down.",
-      "expected": "Ask when the resident tried to pay, then route a waiver request to the manager without promising the waiver.",
+      "prompt": "I was charged twice for my order. The checkout glitched.",
+      "expected": "Ask which order it was, then route a refund request to billing without promising the refund.",
       "agent": {
-        "instructions": "You are the front desk assistant for a residential building.",
+        "instructions": "You are the support assistant for an online store.",
         "models": [
           "gpt-6.1-terra"
         ],
         "tools": [
-          "ledger__get",
-          "planner__create-task",
-          "sms__CreateMessage"
+          "orders__get",
+          "tasks__create",
+          "chat__send_message"
         ]
       },
       "environment": {
         "kind": "replay",
         "channel": "sms",
-        "context": "SMS from resident in unit 303: My late fee is wrong. I tried to pay but the portal was down.",
+        "context": "Chat message from a customer: I was charged twice for my order. The checkout glitched.",
         "metadata": {
-          "product": "front-desk"
+          "product": "support"
         },
         "person": {
-          "brief": "You are a resident who was charged a late fee during the payment portal outage.",
+          "brief": "You are a customer who was charged twice during a checkout incident.",
           "facts": [
             {
-              "id": "date",
-              "text": "You tried to pay on the 5th.",
+              "id": "order",
+              "text": "It was order 10442.",
               "disclose": "when_asked",
               "terms": [
-                "when",
-                "date",
-                "day"
+                "order",
+                "which",
+                "number"
               ]
             },
             {
-              "id": "unit",
-              "text": "You live in unit 303.",
+              "id": "card",
+              "text": "You paid by card.",
               "disclose": "volunteer",
               "terms": []
             }
           ],
           "turns": [
-            "It was the 5th.",
+            "It was order 10442.",
             "Thanks."
           ]
         },
         "tools": [
           {
-            "name": "ledger__get",
-            "description": "Read a unit's ledger.",
+            "name": "orders__get",
+            "description": "Read an order and its payments.",
             "parameters": {
               "type": "object",
               "properties": {
-                "unit": {
+                "order": {
                   "type": "string"
                 }
               },
               "required": [
-                "unit"
+                "order"
               ]
             },
             "source": "captured"
           },
           {
-            "name": "planner__create-task",
-            "description": "Create a task for staff.",
+            "name": "tasks__create",
+            "description": "Open a task for a team.",
             "parameters": {
               "type": "object",
               "properties": {
@@ -135,8 +135,8 @@
             "source": "captured"
           },
           {
-            "name": "sms__CreateMessage",
-            "description": "Send an SMS to the resident.",
+            "name": "chat__send_message",
+            "description": "Send a chat message to the customer.",
             "parameters": {
               "type": "object",
               "properties": {
@@ -153,16 +153,19 @@
         ],
         "observations": [
           {
-            "tool": "ledger__get",
+            "tool": "orders__get",
             "arguments": {
-              "unit": "303"
+              "order": "10442"
             },
             "result": {
-              "fees": [
+              "payments": [
                 {
-                  "date": "11-06",
-                  "amount": 75,
-                  "type": "late"
+                  "id": "pay_9120",
+                  "amount": 129
+                },
+                {
+                  "id": "pay_9121",
+                  "amount": 129
                 }
               ]
             },
@@ -175,16 +178,16 @@
       "grader": {
         "kind": "rubric",
         "facts": [
-          "A 75 dollar late fee was charged on 11-06, during the portal outage."
+          "Order 10442 was charged 129 dollars twice, during the checkout incident."
         ],
         "criteria": [
           {
-            "id": "asks-date",
-            "claim": "Asks when the resident tried to pay."
+            "id": "asks-order",
+            "claim": "Asks which order was charged twice."
           },
           {
             "id": "routes",
-            "claim": "Routes a waiver request to the manager instead of waiving the fee itself."
+            "claim": "Routes a refund request to billing instead of refunding the charge itself."
           }
         ]
       },
@@ -195,11 +198,11 @@
           "transcript": [
             {
               "from": "person",
-              "text": "My late fee is wrong. I tried to pay but the portal was down."
+              "text": "I was charged twice for my order. The checkout glitched."
             },
             {
               "from": "agent",
-              "text": "Sorry about that. I have removed the late fee from your account."
+              "text": "Sorry about that. I have refunded the extra charge."
             },
             {
               "from": "person",
@@ -208,16 +211,19 @@
           ],
           "tool_calls": [
             {
-              "name": "ledger__get",
+              "name": "orders__get",
               "arguments": {
-                "unit": "303"
+                "order": "10442"
               },
               "result": {
-                "fees": [
+                "payments": [
                   {
-                    "date": "11-06",
-                    "amount": 75,
-                    "type": "late"
+                    "id": "pay_9120",
+                    "amount": 129
+                  },
+                  {
+                    "id": "pay_9121",
+                    "amount": 129
                   }
                 ]
               }

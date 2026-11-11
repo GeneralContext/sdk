@@ -7,8 +7,8 @@
       "conversation": {
         "id": "conv_contract_1",
         "channel": "chat",
-        "product": "leasing",
-        "account": "acme-properties"
+        "product": "support",
+        "account": "acme-retail"
       },
       "task": null,
       "started_at": "2026-11-10T00:00:00Z",
@@ -17,13 +17,13 @@
         "input": [
           {
             "role": "user",
-            "content": "My late fee is wrong."
+            "content": "I was charged twice."
           }
         ],
         "tools": [
           {
             "type": "function",
-            "name": "ledger__get",
+            "name": "orders__get",
             "parameters": {
               "type": "object",
               "properties": {
@@ -42,8 +42,8 @@
           {
             "type": "function_call",
             "call_id": "call_1",
-            "name": "ledger__get",
-            "arguments": "{\"unit\": \"303\"}"
+            "name": "orders__get",
+            "arguments": "{\"order\": \"10442\"}"
           }
         ],
         "usage": {

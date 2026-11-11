@@ -7,7 +7,7 @@
       "passed": false,
       "reward": 0.5,
       "at": "2026-11-10T00:00:00+00:00",
-      "trial": "late-fee-portal-outage--openai-gpt-6.1-terra--1",
+      "trial": "duplicate-charge-refund--openai-gpt-6.1-terra--1",
       "note": "1/2 criteria; failed: routes",
       "origin": "failure"
     },

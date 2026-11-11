@@ -14,24 +14,24 @@ import unittest.mock
 from generalcontext import evals
 
 TASK = {
-    "format": "generalcontext.task/v1", "id": "tst_1", "slug": "late-fee", "split": "train",
+    "format": "generalcontext.task/v1", "id": "tst_1", "slug": "double-charge", "split": "train",
     "scenario": {
-        "channel": "sms", "context": "SMS from +1 612 555 0177: My late fee is wrong.", "opening": "My late fee is wrong.",
-        "requester": {"brief": "You were charged a late fee during the portal outage.", "turns": ["It was the 5th."],
-                      "facts": [{"id": "date", "text": "You tried to pay on the 5th.", "disclose": "when_asked", "terms": ["when", "date"]},
-                                {"id": "unit", "text": "You live in unit 303.", "disclose": "volunteer", "terms": []}]},
+        "channel": "sms", "context": "SMS from +1 612 555 0177: I was charged twice.", "opening": "I was charged twice.",
+        "requester": {"brief": "You were charged twice during the checkout incident.", "turns": ["It was order 10442."],
+                      "facts": [{"id": "order", "text": "It was order 10442.", "disclose": "when_asked", "terms": ["which", "order"]},
+                                {"id": "card", "text": "You paid by card.", "disclose": "volunteer", "terms": []}]},
     },
     "world": {
-        "tools": [{"name": "ledger__get", "description": "Read a ledger", "parameters": {"type": "object", "properties": {"unit": {"type": "string"}}}, "source": "captured"}],
+        "tools": [{"name": "orders__get", "description": "Read an order", "parameters": {"type": "object", "properties": {"order": {"type": "string"}}}, "source": "captured"}],
         "observations": [
-            {"tool": "ledger__get", "arguments": {"unit": "303"}, "result": {"fees": [{"date": "11-06", "amount": 75}]}, "error": False},
-            {"tool": "residents__search", "arguments": {"phone": "+16125550177", "property": "ly02"}, "result": {"resident": "t0303"}, "error": False},
+            {"tool": "orders__get", "arguments": {"order": "10442"}, "result": {"payments": [{"id": "pay_9120", "amount": 129}, {"id": "pay_9121", "amount": 129}]}, "error": False},
+            {"tool": "customers__search", "arguments": {"phone": "+16125550177", "store": "s02"}, "result": {"customer": "c0303"}, "error": False},
         ],
     },
-    "agent": {"instructions": "You are the front desk.", "tools": ["ledger__get"]},
-    "policies": [{"id": "p1", "title": "Late fees", "text": "Only outage fees may be waived."}],  # older tasks carried these; still read, unused
-    "expected": "Ask when they paid, then route a waiver request.",
-    "rubric": {"facts": ["Fee on 11-06 during outage."], "criteria": [{"id": "asks-date", "claim": "Asks when they paid."}, {"id": "routes", "claim": "Routes a waiver."}]},
+    "agent": {"instructions": "You are the support desk.", "tools": ["orders__get"]},
+    "policies": [{"id": "p1", "title": "Refunds", "text": "Only duplicate charges are refunded."}],  # older tasks carried these; still read, unused
+    "expected": "Ask which order it was, then route a refund request.",
+    "rubric": {"facts": ["Order 10442 charged twice during the incident."], "criteria": [{"id": "asks-order", "claim": "Asks which order it was."}, {"id": "routes", "claim": "Routes a refund."}]},
 }
 
 
@@ -50,21 +50,21 @@ def scripted(*replies):
 class ReplayWorld(unittest.TestCase):
     def test_exact_close_and_unrecorded_calls(self):
         box = evals.Toolbox(TASK)
-        self.assertEqual(box.call("ledger__get", {"unit": " 303 "}), {"fees": [{"date": "11-06", "amount": 75}]})
+        self.assertEqual(box.call("orders__get", {"order": " 10442 "}), {"payments": [{"id": "pay_9120", "amount": 129}, {"id": "pay_9121", "amount": 129}]})
         # Phone formatting differs and an extra argument is missing: still the recorded answer.
-        self.assertEqual(box.call("residents__search", {"phone": "(612) 555-0177"}), {"resident": "t0303"})
-        missing = box.call("ledger__get", {"unit": "404"})
+        self.assertEqual(box.call("customers__search", {"phone": "(612) 555-0177"}), {"customer": "c0303"})
+        missing = box.call("orders__get", {"order": "99999"})
         self.assertIn("No recorded result", missing["error"])
-        self.assertEqual(missing["recorded_arguments"], [{"unit": "303"}])
-        write = box.call("planner__create-task", {"title": "Waive fee"})
+        self.assertEqual(missing["recorded_arguments"], [{"order": "10442"}])
+        write = box.call("tasks__create", {"title": "Refund duplicate"})
         self.assertTrue(write["ok"])
         self.assertEqual(box.fidelity(), {"exact": 1, "close": 1, "unrecorded": 2, "unrecorded_reads": 1})
         self.assertEqual([c["write"] for c in box.calls], [False, False, False, True])
 
     def test_tools_offered_include_called_tools_without_a_spec(self):
         names = [spec["name"] for spec in evals.Toolbox(TASK).specs]
-        self.assertEqual(names, ["ledger__get", "residents__search"])
-        self.assertEqual(evals.Toolbox(TASK).anthropic_tools()[0]["input_schema"]["properties"], {"unit": {"type": "string"}})
+        self.assertEqual(names, ["orders__get", "customers__search"])
+        self.assertEqual(evals.Toolbox(TASK).anthropic_tools()[0]["input_schema"]["properties"], {"order": {"type": "string"}})
 
     def test_recorded_errors_replay_as_errors(self):
         task = {"world": {"observations": [{"tool": "x__get", "arguments": {}, "result": "Timeout", "error": True}]}}
@@ -73,7 +73,7 @@ class ReplayWorld(unittest.TestCase):
     def test_spoken_reads_messages_to_the_person_only(self):
         self.assertEqual(evals.spoken({"name": "sms__CreateMessage", "write": True, "arguments": {"Body": "Hi"}}), "Hi")
         self.assertEqual(evals.spoken({"name": "outlook__reply-mail", "write": True, "arguments": {"body": {"content": "Hello"}}}), "Hello")
-        self.assertIsNone(evals.spoken({"name": "planner__create-task", "write": True, "arguments": {"title": "x", "description": "y"}}))
+        self.assertIsNone(evals.spoken({"name": "tasks__create", "write": True, "arguments": {"title": "x", "description": "y"}}))
 
 
 class Person(unittest.TestCase):
@@ -82,8 +82,8 @@ class Person(unittest.TestCase):
         person = evals.Person(TASK, model)
         person.respond("Sorry about that, let me look.")
         notes = model.seen[-1]["system"]
-        self.assertIn("You tried to pay on the 5th. Tell them this only if they ask about it.", notes)
-        self.assertIn("You live in unit 303. Tell them this without waiting to be asked.", notes)
+        self.assertIn("It was order 10442. Tell them this only if they ask about it.", notes)
+        self.assertIn("You paid by card. Tell them this without waiting to be asked.", notes)
         person.respond("What date did you try to pay?")
         self.assertEqual([m["role"] for m in model.seen[-1]["messages"]], ["user", "assistant", "user"])
 
@@ -101,36 +101,36 @@ class Person(unittest.TestCase):
 class EndToEnd(unittest.TestCase):
     @staticmethod
     def agent_model(self=None):
-        # Turn 1: look up the ledger, then ask for the date. Turn 2: route a waiver and confirm by SMS.
+        # Turn 1: look up the order, then ask which one. Turn 2: route a refund and confirm by SMS.
         return scripted(
-            {"text": "", "tool_calls": [{"id": "a", "name": "ledger__get", "arguments": {"unit": "303"}}]},
-            {"text": "", "tool_calls": [{"id": "b", "name": "sms__CreateMessage", "arguments": {"Body": "When did you try to pay?"}}]},
+            {"text": "", "tool_calls": [{"id": "a", "name": "orders__get", "arguments": {"order": "10442"}}]},
+            {"text": "", "tool_calls": [{"id": "b", "name": "sms__CreateMessage", "arguments": {"Body": "Which order was it?"}}]},
             {"text": "Asked for the date.", "tool_calls": []},
-            {"text": "", "tool_calls": [{"id": "c", "name": "planner__create-task", "arguments": {"title": "Waive 11-06 fee"}},
-                                        {"id": "d", "name": "sms__CreateMessage", "arguments": {"Body": "I sent this to your manager."}}]},
+            {"text": "", "tool_calls": [{"id": "c", "name": "tasks__create", "arguments": {"title": "Refund duplicate on 10442"}},
+                                        {"id": "d", "name": "sms__CreateMessage", "arguments": {"Body": "I sent this to billing."}}]},
             {"text": "Routed.", "tool_calls": []},
         )
 
     def test_a_run_grades_every_criterion_and_reports_fidelity(self):
         person = scripted(
-            {"text": "", "tool_calls": [{"id": "1", "name": "reply", "arguments": {"message": "The 5th."}}]},
+            {"text": "", "tool_calls": [{"id": "1", "name": "reply", "arguments": {"message": "Order 10442."}}]},
             {"text": "", "tool_calls": [{"id": "2", "name": "leave", "arguments": {"message": "Thanks."}}]},
         )
-        judge = scripted({"text": json.dumps({"criteria": [{"id": "asks-date", "passed": True, "reason": "asked"}, {"id": "routes", "passed": True, "reason": "task"}]}), "tool_calls": []})
+        judge = scripted({"text": json.dumps({"criteria": [{"id": "asks-order", "passed": True, "reason": "asked"}, {"id": "routes", "passed": True, "reason": "task"}]}), "tool_calls": []})
         agent_model = self.agent_model()
         result = evals.run_task(TASK, evals.reference_agent(agent_model, TASK), person, judge)
         self.assertTrue(result["passed"])
         self.assertEqual(result["reward"], 1.0)
         self.assertEqual([t["from"] for t in result["transcript"]], ["person", "agent", "person", "agent", "person"])
-        self.assertEqual(agent_model.seen[0]["system"], "You are the front desk.")
-        self.assertIn("planner__create-task", json.dumps(judge.seen[0]["messages"]))
-        self.assertIn("Fee on 11-06 during outage.", judge.seen[0]["messages"][0]["content"])
-        self.assertNotIn("Only outage fees may be waived.", judge.seen[0]["messages"][0]["content"], "an older task's policies are not graded")
+        self.assertEqual(agent_model.seen[0]["system"], "You are the support desk.")
+        self.assertIn("tasks__create", json.dumps(judge.seen[0]["messages"]))
+        self.assertIn("Order 10442 charged twice during the incident.", judge.seen[0]["messages"][0]["content"])
+        self.assertNotIn("Only duplicate charges are refunded.", judge.seen[0]["messages"][0]["content"], "an older task's policies are not graded")
         self.assertEqual(result["fidelity"]["unrecorded_reads"], 0)
 
     def test_a_criterion_the_judge_skips_fails(self):
         person = scripted({"text": "", "tool_calls": [{"id": "1", "name": "leave", "arguments": {"message": "bye"}}]})
-        judge = scripted({"text": '{"criteria": [{"id": "asks-date", "passed": true, "reason": "x"}]}', "tool_calls": []})
+        judge = scripted({"text": '{"criteria": [{"id": "asks-order", "passed": true, "reason": "x"}]}', "tool_calls": []})
         result = evals.run_task(TASK, evals.reference_agent(self.agent_model(), TASK), person, judge)
         self.assertFalse(result["passed"])
         self.assertEqual(result["reward"], 0.5)
@@ -145,7 +145,7 @@ class EndToEnd(unittest.TestCase):
     def test_the_cli_writes_runs_for_import(self):
         def fake_model(spec):
             if "judge" in spec:
-                return scripted({"text": '{"criteria": [{"id": "asks-date", "passed": true, "reason": "x"}, {"id": "routes", "passed": false, "reason": "y"}]}', "tool_calls": []})
+                return scripted({"text": '{"criteria": [{"id": "asks-order", "passed": true, "reason": "x"}, {"id": "routes", "passed": false, "reason": "y"}]}', "tool_calls": []})
             if "person" in spec:
                 return scripted({"text": "", "tool_calls": [{"id": "1", "name": "leave", "arguments": {"message": "bye"}}]})
             return self.agent_model()
@@ -174,12 +174,12 @@ class ClaudeCode(unittest.TestCase):
             with open(fake, "w") as handle:
                 handle.write("#!/usr/bin/env python3\nimport json, os, sys\nsys.stdin.read()\n"
                              "print(json.dumps({'structured_output': {'text': 'key' if os.environ.get('ANTHROPIC_API_KEY') else 'no key',"
-                             " 'tool_calls': [{'name': 'ledger__get', 'arguments': {'unit': '303'}}]}}))\n")
+                             " 'tool_calls': [{'name': 'orders__get', 'arguments': {'order': '10442'}}]}}))\n")
             os.chmod(fake, 0o700)
             with unittest.mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-test", "PATH": directory + os.pathsep + os.environ["PATH"]}):
                 reply = evals.model("claude-code:claude-haiku-5-5")("system", [{"role": "user", "content": "hi"}], evals.Toolbox(TASK).specs)
         self.assertEqual(reply["text"], "no key")
-        self.assertEqual([(c["name"], c["arguments"]) for c in reply["tool_calls"]], [("ledger__get", {"unit": "303"})])
+        self.assertEqual([(c["name"], c["arguments"]) for c in reply["tool_calls"]], [("orders__get", {"order": "10442"})])
 
 
 class Upload(unittest.TestCase):
@@ -230,7 +230,7 @@ class Upload(unittest.TestCase):
 
 # The same task in the revised shape. TASK above stays in the older shape to prove both are read.
 NEW_TASK = {
-    "format": "generalcontext.task/v1", "id": "tst_2", "slug": "late-fee-new", "split": "held_out", "origin": "failure",
+    "format": "generalcontext.task/v1", "id": "tst_2", "slug": "double-charge-new", "split": "held_out", "origin": "failure",
     "tags": ["scope"], "prompt": TASK["scenario"]["opening"], "expected": TASK["expected"],
     "agent": TASK["agent"],
     "environment": {"kind": "replay", "channel": "sms", "context": TASK["scenario"]["context"],
@@ -296,7 +296,7 @@ def all_pass_judge():
 class TaskShape(unittest.TestCase):
     def test_old_shape_maps_to_the_new_one(self):
         view = evals._task_view(dict(TASK, set="fees", failure_modes=["scope"], status="requested"))
-        self.assertEqual(view["prompt"], "My late fee is wrong.")
+        self.assertEqual(view["prompt"], "I was charged twice.")
         self.assertEqual(view["environment"]["kind"], "replay")
         self.assertEqual(view["environment"]["context"], TASK["scenario"]["context"])
         self.assertEqual(view["environment"]["person"], TASK["scenario"]["requester"])
@@ -325,14 +325,14 @@ class TaskShape(unittest.TestCase):
 
 class NewShape(unittest.TestCase):
     def test_new_shape_replay_task_end_to_end(self):
-        person = scripted({"text": "", "tool_calls": [{"id": "1", "name": "reply", "arguments": {"message": "The 5th."}}]},
+        person = scripted({"text": "", "tool_calls": [{"id": "1", "name": "reply", "arguments": {"message": "Order 10442."}}]},
                           {"text": "", "tool_calls": [{"id": "2", "name": "leave", "arguments": {"message": "Thanks."}}]})
         judge = all_pass_judge()
         result = evals.run_task(NEW_TASK, evals.reference_agent(EndToEnd.agent_model(None), NEW_TASK), person, judge)
         self.assertTrue(result["passed"])
         self.assertEqual(result["origin"], "failure")
         self.assertEqual(result["fidelity"]["unrecorded_reads"], 0)
-        self.assertEqual(result["transcript"][0], {"from": "person", "text": "My late fee is wrong."})
+        self.assertEqual(result["transcript"][0], {"from": "person", "text": "I was charged twice."})
 
     def test_positional_signature_is_unchanged(self):
         person = scripted({"text": "", "tool_calls": [{"id": "1", "name": "leave", "arguments": {"message": "bye"}}]})
@@ -419,7 +419,7 @@ class Check(unittest.TestCase):
 
     def test_check_reports_a_failure_reference_the_judge_passes(self):
         task = dict(NEW_TASK, reference=[{"label": "production", "expect": "fail", "transcript": [
-            {"from": "person", "text": "My late fee is wrong."}, {"from": "agent", "text": "Removed it."}], "tool_calls": []}])
+            {"from": "person", "text": "I was charged twice."}, {"from": "agent", "text": "Refunded it."}], "tool_calls": []}])
         with tempfile.TemporaryDirectory() as directory:
             path = self.write(directory, [task])
             output = io.StringIO()
@@ -427,7 +427,7 @@ class Check(unittest.TestCase):
                 self.assertEqual(evals.main(["check", path]), 1)
             self.assertIn("DISAGREE", output.getvalue())
             self.assertIn("1 reference run checked, 1 disagrees with expect.", output.getvalue())
-            strict = scripted({"text": '{"criteria": [{"id": "asks-date", "passed": false, "reason": "no"}]}', "tool_calls": []})
+            strict = scripted({"text": '{"criteria": [{"id": "asks-order", "passed": false, "reason": "no"}]}', "tool_calls": []})
             with unittest.mock.patch.object(evals, "model", lambda spec: strict), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(evals.main(["check", path]), 0)
 
@@ -467,7 +467,7 @@ class Contract(unittest.TestCase):
         self.assertEqual(summary["tasks"], len(tasks))
         replay, custom = tasks
         person = scripted({"text": "", "tool_calls": [{"id": "1", "name": "leave", "arguments": {"message": "Thanks."}}]})
-        result = evals.run_task(replay, lambda messages, toolbox: (toolbox.call("ledger__get", {"unit": "303"}), "When did you try to pay?")[1],
+        result = evals.run_task(replay, lambda messages, toolbox: (toolbox.call("orders__get", {"order": "10442"}), "Which order was it?")[1],
                                 person, all_pass_judge())
         self.assertTrue(result["passed"])
         self.assertEqual(result["origin"], "failure")

@@ -316,8 +316,8 @@ test('a busy or failing collector loses nothing, and a refused key is not retrie
 test('reportOutcome and logEvent post to the collector', async () => {
   assert.equal(await sdk.reportOutcome('s1', 'success', 'booked'), true);
   assert.deepEqual(collected.outcomes.at(-1), { auth: 'Bearer gc_key', session_id: 's1', outcome: 'success', note: 'booked' });
-  assert.equal(await sdk.logEvent({ sessionId: 's1', eventType: 'tour.booked', eventId: 'e1', properties: { unit: '4B' }, timestamp: '2026-01-01T00:00:00.000Z' }), true);
-  assert.deepEqual(collected.events.at(-1), { events: [{ event_id: 'e1', event_type: 'tour.booked', timestamp: '2026-01-01T00:00:00.000Z', session_id: 's1', properties: { unit: '4B' } }] });
+  assert.equal(await sdk.logEvent({ sessionId: 's1', eventType: 'order.placed', eventId: 'e1', properties: { unit: '4B' }, timestamp: '2026-01-01T00:00:00.000Z' }), true);
+  assert.deepEqual(collected.events.at(-1), { events: [{ event_id: 'e1', event_type: 'order.placed', timestamp: '2026-01-01T00:00:00.000Z', session_id: 's1', properties: { unit: '4B' } }] });
 });
 
 test('reportOutcome and logEvent apply redaction so scrubbed session ids match', async () => {
@@ -920,11 +920,11 @@ async function fakeRealtime(script) {
 // Turn 1: the caller asks, the model calls a tool. Turn 2: the app sends the tool result, the model answers
 // in audio, and the caller barges in while it plays.
 function twoTurnScript() {
-  const tools = [{ type: 'function', name: 'get_rent', description: 'Rent for a unit', parameters: { type: 'object', properties: { unit: { type: 'string' } } } }];
+  const tools = [{ type: 'function', name: 'get_plan', description: 'Plan for an account', parameters: { type: 'object', properties: { account: { type: 'string' } } } }];
   const usage = (i, o) => ({ total_tokens: i + o, input_tokens: i, output_tokens: o });
-  const fc = { id: 'item_fc', type: 'function_call', call_id: 'call_rent', name: 'get_rent', arguments: '{"unit":"4B"}', status: 'completed' };
+  const fc = { id: 'item_fc', type: 'function_call', call_id: 'call_plan', name: 'get_plan', arguments: '{"account":"4B"}', status: 'completed' };
   const preamble = { id: 'item_a1', type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_audio', transcript: 'Let me check.' }] };
-  const answer = { id: 'item_a2', type: 'message', role: 'assistant', status: 'incomplete', content: [{ type: 'output_audio', transcript: 'Unit 4B rents for 2100 dollars a month.' }] };
+  const answer = { id: 'item_a2', type: 'message', role: 'assistant', status: 'incomplete', content: [{ type: 'output_audio', transcript: 'Account 4B is on Fiber 500.' }] };
   let appended = false;
   return {
     tools,
@@ -943,7 +943,7 @@ function twoTurnScript() {
         send({ type: 'response.output_audio.delta', event_id: 'e8b', response_id: 'resp_1', item_id: 'item_a1', output_index: 0, content_index: 0, delta: AUDIO });
         send({ type: 'response.output_audio_transcript.done', event_id: 'e8c', response_id: 'resp_1', item_id: 'item_a1', output_index: 0, content_index: 0, transcript: 'Let me check.' });
         send({ type: 'response.output_item.added', event_id: 'e8', response_id: 'resp_1', output_index: 1, item: { ...fc, arguments: '', status: 'in_progress' } });
-        send({ type: 'response.function_call_arguments.done', event_id: 'e9', response_id: 'resp_1', item_id: 'item_fc', output_index: 1, call_id: 'call_rent', name: 'get_rent', arguments: fc.arguments });
+        send({ type: 'response.function_call_arguments.done', event_id: 'e9', response_id: 'resp_1', item_id: 'item_fc', output_index: 1, call_id: 'call_plan', name: 'get_plan', arguments: fc.arguments });
         send({ type: 'response.output_item.done', event_id: 'e10', response_id: 'resp_1', output_index: 1, item: fc });
         send({ type: 'response.done', event_id: 'e11', response: { id: 'resp_1', object: 'realtime.response', status: 'completed', output: [preamble, fc], usage: usage(120, 15) } });
       }
@@ -973,7 +973,7 @@ async function runVoiceApp(rt, tools, sessionDone) {
   let playing = null;
   rt.on('response.output_audio.delta', e => { playing ??= e.item_id; });
   rt.on('response.function_call_arguments.done', e => {
-    rt.send({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: e.call_id, output: '{"rent":2100}' } });
+    rt.send({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: e.call_id, output: '{"plan":"Fiber 500"}' } });
     rt.send({ type: 'response.create' });
   });
   rt.on('input_audio_buffer.speech_started', () => {
@@ -985,7 +985,7 @@ async function runVoiceApp(rt, tools, sessionDone) {
   let doneCount = 0;
   rt.on('response.done', () => { if (++doneCount === 2) sessionDone(); });
   await new Promise(r => rt.socket.once('open', r));
-  rt.send({ type: 'session.update', session: { type: 'realtime', instructions: 'You are a leasing agent.', tools, audio: { output: { format: { type: 'audio/pcm', rate: 24000 } } } } });
+  rt.send({ type: 'session.update', session: { type: 'realtime', instructions: 'You are a support agent.', tools, audio: { output: { format: { type: 'audio/pcm', rate: 24000 } } } } });
   rt.send({ type: 'input_audio_buffer.append', audio: AUDIO });
   return seen;
 }
@@ -1022,8 +1022,8 @@ test('OpenAI Realtime: a two-turn voice call records one Responses-shaped call p
   for (const c of calls) {
     assert.deepEqual(c.conversation, { id: 'call-1', channel: 'voice' });
     assert.equal(c.request.model, 'gpt-realtime');
-    assert.equal(c.request.instructions, 'You are a leasing agent.');
-    assert.equal(c.request.tools[0].name, 'get_rent');
+    assert.equal(c.request.instructions, 'You are a support agent.');
+    assert.equal(c.request.tools[0].name, 'get_plan');
     assert.ok(c.voice && 'speech_stopped_at' in c.voice && 'first_audio_at' in c.voice && 'interrupted' in c.voice);
     assert.ok(c.started_at <= c.ended_at);
   }
@@ -1032,9 +1032,9 @@ test('OpenAI Realtime: a two-turn voice call records one Responses-shaped call p
   assert.match(user.at, /^\d{4}-/);
   const firstLatency = Date.parse(first.voice.first_audio_at) - Date.parse(first.voice.speech_stopped_at);
   const said = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Let me check.' }], audio: true, voice: { latency_ms: firstLatency, interrupted: false } };
-  const call = { type: 'function_call', call_id: 'call_rent', name: 'get_rent', arguments: '{"unit":"4B"}' };
-  const result = { type: 'function_call_output', call_id: 'call_rent', output: '{"rent":2100}' };
-  const reply = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Unit 4B rents for 2100 dollars a month.' }], audio: true, voice: { latency_ms: null, interrupted: true, truncated_at_ms: 640 } };
+  const call = { type: 'function_call', call_id: 'call_plan', name: 'get_plan', arguments: '{"account":"4B"}' };
+  const result = { type: 'function_call_output', call_id: 'call_plan', output: '{"plan":"Fiber 500"}' };
+  const reply = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Account 4B is on Fiber 500.' }], audio: true, voice: { latency_ms: null, interrupted: true, truncated_at_ms: 640 } };
   assert.deepEqual(first.request.input, [user]);
   assert.deepEqual(first.response, { id: 'resp_1', output: [said, call], usage: { total_tokens: 135, input_tokens: 120, output_tokens: 15 } });
   assert.equal(first.error, null);

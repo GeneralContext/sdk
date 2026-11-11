@@ -234,7 +234,7 @@ class SdkTest(unittest.TestCase):
         self.assertFalse(generalcontext.flush(1))
         self.assertLess(time.perf_counter() - started, 2)
         self.assertFalse(generalcontext.report_outcome("s1", "success"))
-        self.assertFalse(generalcontext.log_event("s1", "tour.booked"))
+        self.assertFalse(generalcontext.log_event("s1", "order.placed"))
         Server.status, Server.fail_times = 200, 0  # the collector is back: the held call goes out
         self.assertTrue(generalcontext.flush(5))
         self.assertEqual(len(self.calls()), 1)
@@ -316,14 +316,14 @@ class SdkTest(unittest.TestCase):
         self.assertFalse(generalcontext.report_outcome("sms:thread-1", "maybe"))
 
     def test_log_event_posts_to_events(self):
-        self.assertTrue(generalcontext.log_event("sms:thread-1", "tour.booked", {"unit": "402", "beds": 2},
+        self.assertTrue(generalcontext.log_event("sms:thread-1", "order.placed", {"unit": "402", "beds": 2},
                                                  event_id="evt-1", timestamp="2026-11-09T00:00:00+00:00"))
         path, authorization, body = Server.received[-1]
         self.assertEqual((path, authorization), ("/api/platform-collect/events", "Bearer " + KEY))
-        self.assertEqual(body, {"events": [{"event_id": "evt-1", "event_type": "tour.booked",
+        self.assertEqual(body, {"events": [{"event_id": "evt-1", "event_type": "order.placed",
                                             "timestamp": "2026-11-09T00:00:00+00:00", "session_id": "sms:thread-1",
                                             "properties": {"unit": "402", "beds": 2}}]})
-        generalcontext.log_event("s", "lease.signed")
+        generalcontext.log_event("s", "order.placed")
         event = Server.received[-1][2]["events"][0]
         self.assertTrue(event["event_id"] and event["timestamp"])
 
@@ -982,15 +982,15 @@ AUDIO = __import__("base64").b64encode(b"\x07" * 6000).decode()  # 8000 base64 c
 
 
 def _two_turn_server(sent, received):
-    tools = [{"type": "function", "name": "get_rent", "description": "Rent for a unit",
-              "parameters": {"type": "object", "properties": {"unit": {"type": "string"}}}}]
+    tools = [{"type": "function", "name": "get_plan", "description": "Plan for an account",
+              "parameters": {"type": "object", "properties": {"order": {"type": "string"}}}}]
     usage = lambda i, o: {"total_tokens": i + o, "input_tokens": i, "output_tokens": o}  # noqa: E731
-    fc = {"id": "item_fc", "type": "function_call", "call_id": "call_rent", "name": "get_rent",
+    fc = {"id": "item_fc", "type": "function_call", "call_id": "call_plan", "name": "get_plan",
           "arguments": "{\"unit\":\"4B\"}", "status": "completed"}
     preamble = {"id": "item_a1", "type": "message", "role": "assistant", "status": "completed",
                 "content": [{"type": "output_audio", "transcript": "Let me check."}]}
     answer = {"id": "item_a2", "type": "message", "role": "assistant", "status": "incomplete",
-              "content": [{"type": "output_audio", "transcript": "Unit 4B rents for 2100 dollars a month."}]}
+              "content": [{"type": "output_audio", "transcript": "Account 4B is on Fiber 500."}]}
 
     def handler(ws):
         def send(event):
@@ -1017,7 +1017,7 @@ def _two_turn_server(sent, received):
                     {"type": "response.output_audio.delta", "response_id": "resp_1", "item_id": "item_a1", "output_index": 0, "content_index": 0, "delta": AUDIO},
                     {"type": "response.output_audio_transcript.done", "response_id": "resp_1", "item_id": "item_a1", "output_index": 0, "content_index": 0, "transcript": "Let me check."},
                     {"type": "response.output_item.added", "response_id": "resp_1", "output_index": 1, "item": dict(fc, arguments="", status="in_progress")},
-                    {"type": "response.function_call_arguments.done", "response_id": "resp_1", "item_id": "item_fc", "output_index": 1, "call_id": "call_rent", "name": "get_rent", "arguments": fc["arguments"]},
+                    {"type": "response.function_call_arguments.done", "response_id": "resp_1", "item_id": "item_fc", "output_index": 1, "call_id": "call_plan", "name": "get_plan", "arguments": fc["arguments"]},
                     {"type": "response.output_item.done", "response_id": "resp_1", "output_index": 1, "item": fc},
                     {"type": "response.done", "response": {"id": "resp_1", "object": "realtime.response", "status": "completed", "output": [preamble, fc], "usage": usage(120, 15)}},
                 ]:
@@ -1084,14 +1084,14 @@ class RealtimeTest(unittest.TestCase):
         with generalcontext.session("call-1"):
             connection = client.realtime.connect(model="gpt-realtime").enter()
         with generalcontext.session("other-scope"):  # the session at connect time is the one that counts
-            connection.session.update(session={"type": "realtime", "instructions": "You are a leasing agent.", "tools": tools,
+            connection.session.update(session={"type": "realtime", "instructions": "You are a support agent.", "tools": tools,
                                                "audio": {"output": {"format": {"type": "audio/pcm", "rate": 24000}}}})
             connection.input_audio_buffer.append(audio=AUDIO)
             playing, done = None, 0
             for event in connection:
                 seen.append(event.type)
                 if event.type == "response.function_call_arguments.done":
-                    connection.conversation.item.create(item={"type": "function_call_output", "call_id": event.call_id, "output": "{\"rent\":2100}"})
+                    connection.conversation.item.create(item={"type": "function_call_output", "call_id": event.call_id, "output": "{\"plan\":\"Fiber 500\"}"})
                     connection.response.create()
                 elif event.type == "response.output_audio.delta":
                     playing = playing or event.item_id
@@ -1114,8 +1114,8 @@ class RealtimeTest(unittest.TestCase):
         for c in calls:
             self.assertEqual(c["conversation"], {"id": "call-1", "channel": "voice"})
             self.assertEqual(c["request"]["model"], "gpt-realtime")
-            self.assertEqual(c["request"]["instructions"], "You are a leasing agent.")
-            self.assertEqual(c["request"]["tools"][0]["name"], "get_rent")
+            self.assertEqual(c["request"]["instructions"], "You are a support agent.")
+            self.assertEqual(c["request"]["tools"][0]["name"], "get_plan")
             self.assertTrue({"speech_stopped_at", "first_audio_at", "interrupted"} <= set(c["voice"]))
         first, second = calls
         user = {"role": "user", "content": [{"type": "input_text", "text": "What is the rent for 4B?"}], "audio": True,
@@ -1125,9 +1125,9 @@ class RealtimeTest(unittest.TestCase):
         self.assertIsInstance(latency, int)
         said = {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Let me check."}], "audio": True,
                 "voice": {"latency_ms": latency, "interrupted": False}}
-        call = {"type": "function_call", "call_id": "call_rent", "name": "get_rent", "arguments": "{\"unit\":\"4B\"}"}
-        result = {"type": "function_call_output", "call_id": "call_rent", "output": "{\"rent\":2100}"}
-        reply = {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Unit 4B rents for 2100 dollars a month."}], "audio": True,
+        call = {"type": "function_call", "call_id": "call_plan", "name": "get_plan", "arguments": "{\"unit\":\"4B\"}"}
+        result = {"type": "function_call_output", "call_id": "call_plan", "output": "{\"plan\":\"Fiber 500\"}"}
+        reply = {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Account 4B is on Fiber 500."}], "audio": True,
                  "voice": {"latency_ms": None, "interrupted": True, "truncated_at_ms": 640}}
         self.assertEqual(first["request"]["input"], [user])
         self.assertEqual(first["response"], {"id": "resp_1", "output": [said, call], "usage": {"total_tokens": 135, "input_tokens": 120, "output_tokens": 15}})
