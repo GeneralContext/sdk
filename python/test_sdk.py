@@ -202,11 +202,20 @@ class SdkTest(unittest.TestCase):
         self.assertEqual(set(fixture), set(body))
         for example in fixture["calls"]:
             self.assertEqual(set(example), set(call))
-            self.assertTrue(example["conversation"] is None or set(example["conversation"]) <= {"id", "user_id", "channel", "product", "metadata"})
+            self.assertTrue(example["conversation"] is None or set(example["conversation"]) <= {"id", "user_id", "channel", "product", "account", "metadata"})
 
     def test_conversation_is_an_alias_of_session(self):
         self.assertIs(generalcontext.conversation, generalcontext.session)
         self.assertIs(generalcontext.with_session, generalcontext.session)
+
+    def test_account_groups_a_session_by_the_apps_own_customer(self):
+        client = generalcontext.wrap(Client({}))
+        for sid, account in (("a1", "  greystar  "), ("a2", "  "), ("a3", None), ("a4", "x" * 200)):
+            with generalcontext.session(sid, account=account):
+                client.chat.completions.create(model="m", messages=[])
+        calls = self.calls()
+        self.assertEqual([c["conversation"] for c in calls[:3]], [{"id": "a1", "account": "greystar"}, {"id": "a2"}, {"id": "a3"}])
+        self.assertEqual(len(calls[3]["conversation"]["account"]), 120)
 
     def test_an_exception_is_recorded_and_reraised_unchanged(self):
         client = generalcontext.wrap(Client({}))
@@ -1166,7 +1175,7 @@ class RealtimeTest(unittest.TestCase):
                     ws.close()
                     return
         client = self.serve(handler)
-        with generalcontext.session("call-2"):
+        with generalcontext.session("call-2", account="acme-properties"):
             with client.realtime.connect(model="gpt-realtime") as connection:
                 connection.conversation.item.create(item={"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]})
                 connection.response.create()
@@ -1174,7 +1183,7 @@ class RealtimeTest(unittest.TestCase):
         self.assertEqual(kinds[-1], "error")
         calls = self.realtime_calls()
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["conversation"], {"id": "call-2", "channel": "voice"})
+        self.assertEqual(calls[0]["conversation"], {"id": "call-2", "account": "acme-properties", "channel": "voice"})
         self.assertEqual(calls[0]["request"]["input"], [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}])
         self.assertRegex(calls[0]["error"], "overloaded")
         self.assertEqual(calls[0]["request"]["instructions"], "Be brief.")

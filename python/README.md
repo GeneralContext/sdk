@@ -28,6 +28,9 @@ with generalcontext.session(conversation_id, user_id=customer_id, channel="chat"
 generalcontext.flush()   # before a serverless function, job or script exits
 ```
 
+If your app serves several companies of its own, pass `account=` to `session()` (the id or name you
+already use for that company) so conversations are grouped by account.
+
 `initialize()` records every call these clients make in the process, sync and async, streamed or
 not, from clients created before or after it. Call it in every process, including workers.
 

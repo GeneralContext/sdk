@@ -189,10 +189,15 @@ def wrap(client, *, redact=False):
 # ---- Sessions and tasks --------------------------------------------------------------------
 
 @contextmanager
-def session(session_id, user_id=None, channel=None, product=None, metadata=None):
-    """Tag every call inside the block as part of conversation `session_id`. Safe across threads and asyncio."""
+def session(session_id, user_id=None, channel=None, product=None, account=None, metadata=None):
+    """Tag every call inside the block as part of conversation `session_id`. Safe across threads and asyncio.
+
+    `account` is your own customer this conversation belongs to (an id or name you already use), so
+    conversations can be grouped by account."""
+    account = str(account).strip()[:120] if account is not None else ""
     tags = {key: value for key, value in dict(id=str(session_id), user_id=user_id, channel=channel,
-                                               product=product, metadata=metadata).items() if value is not None}
+                                               product=product, account=account or None,
+                                               metadata=metadata).items() if value is not None}
     token = _session.set(tags)
     try:
         yield

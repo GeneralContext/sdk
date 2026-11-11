@@ -29,6 +29,8 @@ await withSession({ sessionId: conversationId, userId: customerId, channel: 'cha
 await flush(); // before a serverless function, job or script exits
 ```
 
+If your app serves several companies of its own, pass `account` to `withSession` (the id or name you already use for that company) so conversations are grouped by account.
+
 | Provider | Package | `instrumentModules` key |
 | - | - | - |
 | OpenAI, including Azure OpenAI | `openai` | `openAI` |

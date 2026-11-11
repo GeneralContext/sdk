@@ -7,7 +7,8 @@
       "conversation": {
         "id": "conv_contract_1",
         "channel": "chat",
-        "product": "leasing"
+        "product": "leasing",
+        "account": "acme-properties"
       },
       "task": null,
       "started_at": "2026-11-10T00:00:00Z",

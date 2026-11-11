@@ -246,6 +246,16 @@ test('session and task tags survive awaits', async () => {
   assert.equal(calls[2].conversation.id, 'legacy');
 });
 
+test('account groups a session by the app\'s own customer', async () => {
+  await sdk.withSession({ sessionId: 'a1', account: '  greystar  ' }, () => openai().chat.completions.create({ model: 'gpt-x', messages: [] }));
+  await sdk.withSession({ sessionId: 'a2', account: '   ' }, () => openai().chat.completions.create({ model: 'gpt-x', messages: [] }));
+  await sdk.withSession({ sessionId: 'a3', account: 'x'.repeat(200) }, () => openai().chat.completions.create({ model: 'gpt-x', messages: [] }));
+  const calls = await drain();
+  assert.deepEqual(calls[0].conversation, { id: 'a1', account: 'greystar' });
+  assert.deepEqual(calls[1].conversation, { id: 'a2' });
+  assert.equal(calls[2].conversation.account.length, 120);
+});
+
 test('rejected calls are recorded and rethrown unchanged', async () => {
   await assert.rejects(openai().chat.completions.create({ model: 'bad', messages: [] }), err => err instanceof OpenAI.BadRequestError);
   const [call] = await drain();
@@ -1084,7 +1094,7 @@ test('OpenAI Realtime: an error event and a socket closed mid-response are recor
     },
   });
   const client = new OpenAI({ apiKey: 'k', baseURL: `http://127.0.0.1:${fake.port}/v1`, maxRetries: 0 });
-  const rt = sdk.withSession('call-2', () => new realtimeWS.OpenAIRealtimeWS({ model: 'gpt-realtime', options: { createConnection: () => net.connect({ host: '127.0.0.1', port: fake.port }) } }, client));
+  const rt = sdk.withSession({ sessionId: 'call-2', account: 'acme-properties' }, () => new realtimeWS.OpenAIRealtimeWS({ model: 'gpt-realtime', options: { createConnection: () => net.connect({ host: '127.0.0.1', port: fake.port }) } }, client));
   const errors = [];
   rt.on('error', e => errors.push(e.message));
   const sawError = new Promise(r => rt.on('event', e => { if (e.type === 'error') setTimeout(r, 5); }));
@@ -1098,7 +1108,7 @@ test('OpenAI Realtime: an error event and a socket closed mid-response are recor
   await fake.close();
   assert.equal(errors.length, 1); // the app's own error listener still fires
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].conversation, { id: 'call-2', channel: 'voice' });
+  assert.deepEqual(calls[0].conversation, { id: 'call-2', account: 'acme-properties', channel: 'voice' });
   assert.deepEqual(calls[0].request.input, [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }]);
   assert.match(calls[0].error, /overloaded/);
   assert.equal(calls[0].request.instructions, 'Be brief.');

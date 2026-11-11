@@ -46,7 +46,8 @@ initialize({ instrumentModules: { openAI: OpenAI, anthropic: Anthropic } });
 
 Already tracing with OpenTelemetry? You don't need this SDK: point an OTLP exporter at
 `https://generalcontextlabs.com/api/platform-collect/v1/traces`. See the
-[docs](https://generalcontextlabs.com/docs/opentelemetry).
+[docs](https://generalcontextlabs.com/docs/opentelemetry). To group conversations by your own
+customer, set the span or resource attribute `generalcontext.account` to that customer's id or name.
 
 ## What is sent
 

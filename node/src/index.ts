@@ -32,8 +32,8 @@ const FLUSH_TIMEOUT_MS = 10_000; // flush() default, like the Python SDK
 const RETRY_PAUSE_MS = 30_000; // after the collector fails to answer, wait this long before sending again
 
 type Metadata = Record<string, string | number | boolean>;
-export type Session = { sessionId: string; userId?: string; channel?: string; product?: string; metadata?: Metadata };
-type Tags = { id: string; user_id?: string; channel?: string; product?: string; metadata?: Metadata };
+export type Session = { sessionId: string; userId?: string; channel?: string; product?: string; account?: string; metadata?: Metadata };
+type Tags = { id: string; user_id?: string; channel?: string; product?: string; account?: string; metadata?: Metadata };
 type Api = 'openai-chat' | 'openai-responses' | 'anthropic' | 'gemini' | 'bedrock-converse' | 'openai-realtime';
 /** Voice timing on 'openai-realtime' calls. Timestamps are ISO strings, null when not seen. */
 export type VoiceTiming = {
@@ -258,12 +258,14 @@ export function withSession<T>(session: Session | string, run: () => T): T {
   if (s.userId) tags.user_id = s.userId;
   if (s.channel) tags.channel = s.channel;
   if (s.product) tags.product = s.product;
+  const account = s.account == null ? '' : String(s.account).trim().slice(0, 120);
+  if (account) tags.account = account;
   if (s.metadata) tags.metadata = s.metadata;
   return scope.run({ ...scope.getStore(), tags }, run);
 }
 
 /** Older name for withSession. Accepts { id } as well as { sessionId }. */
-export function conversation<T>(tags: Session | { id: string; channel?: string; product?: string; metadata?: Metadata } | string, run: () => T): T {
+export function conversation<T>(tags: Session | { id: string; channel?: string; product?: string; account?: string; metadata?: Metadata } | string, run: () => T): T {
   if (typeof tags === 'object' && 'id' in tags) {
     const { id, ...rest } = tags;
     return withSession({ ...rest, sessionId: id }, run);

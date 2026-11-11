@@ -70,7 +70,7 @@ await withSession({ sessionId: conversation.id, userId: customer.id, channel: "s
 });
 ```
 
-`channel` and `product` are free-form labels the console filters by. Without a session, calls are grouped by their first message, which every later call in the same conversation repeats; that works for a single process but breaks as soon as a conversation spans requests or workers.
+`channel` and `product` are free-form labels the console filters by. If the app serves several companies or accounts of its own, pass `account` (the id the app already uses for that company) so General Context can group conversations by account. With OpenTelemetry, set the span or resource attribute `generalcontext.account` instead. Without a session, calls are grouped by their first message, which every later call in the same conversation repeats; that works for a single process but breaks as soon as a conversation spans requests or workers.
 
 ### Serverless: flush before returning
 
