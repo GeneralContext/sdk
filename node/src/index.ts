@@ -19,7 +19,7 @@ import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { createRequire } from 'node:module';
 
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 const BATCH = 20;
 const MAX_QUEUE = 5000;
 const MAX_CALL_BYTES = 4_000_000; // the server rejects larger calls
