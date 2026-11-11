@@ -58,13 +58,6 @@
       },
       "prompt": "My late fee is wrong. I tried to pay but the portal was down.",
       "expected": "Ask when the resident tried to pay, then route a waiver request to the manager without promising the waiver.",
-      "policies": [
-        {
-          "id": "pol_late_fees",
-          "title": "Late fees",
-          "text": "Only fees charged during a confirmed portal outage may be waived, and only by the manager."
-        }
-      ],
       "agent": {
         "instructions": "You are the front desk assistant for a residential building.",
         "models": [
@@ -259,7 +252,6 @@
       },
       "prompt": "Increment the counter until it reaches 3, then report the total.",
       "expected": "Calls increment three times and reports 3.",
-      "policies": [],
       "agent": {
         "instructions": "",
         "models": [],

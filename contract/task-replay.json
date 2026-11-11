@@ -12,7 +12,6 @@
   "source": {"issue": "iss_contract_1", "conversations": [{"id": "conv_contract_1", "step": 3, "explanation": "The agent waived the fee itself instead of routing the request to the manager."}]},
   "prompt": "My late fee is wrong. I tried to pay but the portal was down.",
   "expected": "Ask when the resident tried to pay, then route a waiver request to the manager without promising the waiver.",
-  "policies": [{"id": "pol_late_fees", "title": "Late fees", "text": "Only fees charged during a confirmed portal outage may be waived, and only by the manager."}],
   "agent": {"instructions": "You are the front desk assistant for a residential building.", "models": ["gpt-6.1-terra"], "tools": ["ledger__get", "planner__create-task", "sms__CreateMessage"]},
   "environment": {
     "kind": "replay",

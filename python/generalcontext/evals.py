@@ -7,8 +7,7 @@
     generalcontext evals check benchmark.json
 
 A task (format generalcontext.task/v1, exported from the platform's Tasks page) has a small core:
-the `prompt` the agent is given, what the agent should do (`expected`), the policies, and an
-`origin`. A task from a `failure` catches a confirmed issue: the agent got it wrong. A task from a
+the `prompt` the agent is given, what the agent should do (`expected`), and an `origin`. A task from a `failure` catches a confirmed issue: the agent got it wrong. A task from a
 `success` keeps a good example right. Everything specific to one kind of agent lives in two
 parts, each with a `kind`: the `environment` the agent works in, and the `grader` that scores it.
 
@@ -21,7 +20,7 @@ instruction to share `when_asked` facts only when the agent asks for them. With 
 person's recorded replies are replayed in order.
 
 Built-in grader `rubric`. A judge model grades each criterion against the transcript, the agent's
-writes and the task's ground-truth facts and policies. The reward is the share of criteria met,
+writes and the task's ground-truth facts. The reward is the share of criteria met,
 from 0 to 1, and the task passes when every criterion does.
 
 Any other kind is your own code, named on the command line and never in the file, so a downloaded
@@ -414,7 +413,7 @@ class Person:
 
 # ---- Judge ---------------------------------------------------------------------------------
 
-JUDGE = """You grade one run of an AI agent against a rubric. You see the ground truth, the policies,
+JUDGE = """You grade one run of an AI agent against a rubric. You see the ground truth,
 what the agent should have done, what it said to the person, and every tool call it made with
 the result. Judge only from this evidence. A criterion about what the agent told the person is
 met only by what reached the person. A criterion about an action is met only by a tool call that
@@ -435,7 +434,6 @@ def judge(task, transcript, toolbox, model_call):
         for call in toolbox.calls) or "(none)"
     evidence = "\n\n".join([
         "Ground truth:\n" + ("\n".join(f"- {fact}" for fact in rubric.get("facts") or []) or "(none given)"),
-        "Policies:\n" + ("\n\n".join(f"{p['title']}: {p['text']}" for p in task.get("policies") or []) or "(none given)"),
         "What the agent should have done:\n" + (_task_view(task).get("expected") or "(not given)"),
         "Conversation (what reached each side):\n" + "\n".join(f"{who}: {text}" for who, text in transcript),
         "Tool calls, in order:\n" + calls,

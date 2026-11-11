@@ -1,7 +1,7 @@
 # generalcontext
 
 Record your AI agent's model calls for [General Context](https://generalcontextlabs.com/docs). We
-read your agent's production conversations against your policies, and each failure you confirm
+read your agent's production conversations and find where it goes wrong, and each failure you confirm
 becomes an RL and eval task built from the conversation. Your tasks together are your benchmark.
 
 Recording never gets in your agent's way: calls are sent in the background, a failure on our side

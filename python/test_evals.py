@@ -29,7 +29,7 @@ TASK = {
         ],
     },
     "agent": {"instructions": "You are the front desk.", "tools": ["ledger__get"]},
-    "policies": [{"id": "p1", "title": "Late fees", "text": "Only outage fees may be waived."}],
+    "policies": [{"id": "p1", "title": "Late fees", "text": "Only outage fees may be waived."}],  # older tasks carried these; still read, unused
     "expected": "Ask when they paid, then route a waiver request.",
     "rubric": {"facts": ["Fee on 11-06 during outage."], "criteria": [{"id": "asks-date", "claim": "Asks when they paid."}, {"id": "routes", "claim": "Routes a waiver."}]},
 }
@@ -124,7 +124,8 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual([t["from"] for t in result["transcript"]], ["person", "agent", "person", "agent", "person"])
         self.assertEqual(agent_model.seen[0]["system"], "You are the front desk.")
         self.assertIn("planner__create-task", json.dumps(judge.seen[0]["messages"]))
-        self.assertIn("Only outage fees may be waived.", judge.seen[0]["messages"][0]["content"])
+        self.assertIn("Fee on 11-06 during outage.", judge.seen[0]["messages"][0]["content"])
+        self.assertNotIn("Only outage fees may be waived.", judge.seen[0]["messages"][0]["content"], "an older task's policies are not graded")
         self.assertEqual(result["fidelity"]["unrecorded_reads"], 0)
 
     def test_a_criterion_the_judge_skips_fails(self):
@@ -230,7 +231,7 @@ class Upload(unittest.TestCase):
 # The same task in the revised shape. TASK above stays in the older shape to prove both are read.
 NEW_TASK = {
     "format": "generalcontext.task/v1", "id": "tst_2", "slug": "late-fee-new", "split": "held_out", "origin": "failure",
-    "tags": ["scope"], "prompt": TASK["scenario"]["opening"], "expected": TASK["expected"], "policies": TASK["policies"],
+    "tags": ["scope"], "prompt": TASK["scenario"]["opening"], "expected": TASK["expected"],
     "agent": TASK["agent"],
     "environment": {"kind": "replay", "channel": "sms", "context": TASK["scenario"]["context"],
                     "person": TASK["scenario"]["requester"], "tools": TASK["world"]["tools"], "observations": TASK["world"]["observations"]},
