@@ -1261,6 +1261,7 @@ class _RealtimeState:
         self.current = self.held = None
         self.closed = False
         self.bytes_per_ms = 48  # pcm16 at 24 kHz; G.711 is 8
+        self.last_id, self.sent_seq = None, 0  # last recorded response, and the newest item it covered
 
     # Items --------------------------------------------------------------------------------
 
@@ -1488,7 +1489,7 @@ class _RealtimeState:
 
     def record(self, r):
         try:
-            inputs, outputs = [], []
+            inputs, outputs, covered = [], [], 0
             # Timing goes on the stored assistant item too, so every later call's input still carries it.
             timing = {"latency_ms": _rt_latency(r.voice), "interrupted": r.voice["interrupted"]}
             if "truncated_at_ms" in r.voice:
@@ -1500,12 +1501,20 @@ class _RealtimeState:
                     if e["item"].get("role") == "assistant":
                         e["item"] = dict(e["item"], voice=timing)
                     outputs.append(e["item"])
+                    covered = max(covered, e["seq"])
                 elif e["seq"] < r.seq:
-                    inputs.append(e["item"])
+                    covered = max(covered, e["seq"])
+                    if e["seq"] > self.sent_seq:
+                        inputs.append(e["item"])
             request = {"model": self.model,
                        "instructions": r.instructions if r.has_overrides and r.instructions is not None else self.instructions,
                        "tools": (r.tools if r.has_overrides and r.tools is not None else self.tools) or [],
                        "input": inputs}
+            # After the first reply, only what is new since the last one, chained to it, as the Responses API
+            # does. A long call then costs one item per item, not the square of its length.
+            if self.last_id:
+                request["previous_response_id"] = self.last_id
+            self.last_id, self.sent_seq = r.id, max(self.sent_seq, covered)
             conversation = self.conversation
             if conversation is not None and not conversation.get("channel"):
                 conversation = dict(conversation, channel="voice")

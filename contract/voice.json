@@ -36,10 +36,9 @@
         "instructions": "You answer the leasing line for Maple Court.",
         "tools": [{ "type": "function", "name": "units__search", "parameters": { "type": "object", "properties": { "beds": { "type": "integer" } } } }],
         "input": [
-          { "role": "user", "content": [{ "type": "input_text", "text": "Do you have a two bedroom?" }], "audio": true, "at": "2026-11-10T00:00:00.000Z" },
-          { "type": "function_call", "call_id": "call_rt_1", "name": "units__search", "arguments": "{\"beds\": 2}" },
           { "type": "function_call_output", "call_id": "call_rt_1", "output": "{\"units\": [\"204\"]}" }
-        ]
+        ],
+        "previous_response_id": "resp_rt_1"
       },
       "response": {
         "id": "resp_rt_2",

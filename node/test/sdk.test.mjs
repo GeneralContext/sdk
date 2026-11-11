@@ -1032,8 +1032,11 @@ test('OpenAI Realtime: a two-turn voice call records one Responses-shaped call p
   assert.match(first.voice.first_audio_at, /^\d{4}-/);
   assert.equal(first.voice.interrupted, false);
   // The first reply's timing is still on its item in the second call's history.
-  assert.deepEqual(second.request.input, [user, said, call, result]);
-  assert.deepEqual(second.request.input[1].voice, { latency_ms: firstLatency, interrupted: false });
+  // Each later reply sends only what is new since the last one, chained to it: here the tool result.
+  assert.equal(first.request.previous_response_id, undefined);
+  assert.equal(second.request.previous_response_id, 'resp_1');
+  assert.deepEqual(second.request.input, [result]);
+  assert.deepEqual(first.response.output[0].voice, { latency_ms: firstLatency, interrupted: false });
   assert.deepEqual(second.response.output, [reply]);
   assert.equal(second.response.id, 'resp_2');
   assert.match(second.voice.first_audio_at, /^\d{4}-/);
@@ -1043,11 +1046,13 @@ test('OpenAI Realtime: a two-turn voice call records one Responses-shaped call p
   // The shared voice fixture has the shape this SDK sends, key for key. Values may differ.
   const fixture = JSON.parse(readFileSync(new URL('../../contract/voice.json', import.meta.url), 'utf8')).calls.filter(c => c.api === 'openai-realtime');
   const keys = o => Object.keys(o).sort().join(',');
-  for (const c of calls) {
-    assert.equal(keys(c), keys(fixture[0]));
-    assert.equal(keys(c.request), keys(fixture[0].request));
-    assert.equal(keys(c.response), keys(fixture[0].response));
-  }
+  // The first reply carries the history so far, later ones only what is new, chained by previous_response_id.
+  calls.forEach((c, i) => {
+    const like = fixture[Math.min(i, fixture.length - 1)];
+    assert.equal(keys(c), keys(like));
+    assert.equal(keys(c.request), keys(like.request));
+    assert.equal(keys(c.response), keys(like.response));
+  });
   const shapes = list => {
     const out = {};
     for (const c of list) for (const item of [...c.request.input, ...c.response.output]) {
@@ -1171,8 +1176,41 @@ test('OpenAI Realtime: a caller turn with no transcript still shows, and a late 
   reply('r2', 'Done.');
   rt.close();
   const calls = (await drain()).filter(c => c.api === 'openai-realtime');
-  const users = calls[1].request.input.filter(item => item.role === 'user');
+  const users = calls.flatMap(c => c.request.input).filter(item => item.role === 'user');
   assert.deepEqual(users.map(item => [item.content[0].text, item.audio]), [['', true], ['Book me in.', true]]);
+});
+
+test('OpenAI Realtime: a long call sends each item once, not its whole history every turn', async () => {
+  // Found under load: 50 calls of 120 turns sent the full history with every reply, 74 MB and a full queue.
+  const mod = await optional('openai/realtime/websocket');
+  if (!mod) return;
+  await drain();
+  const Real = globalThis.WebSocket;
+  class FakeSocket extends EventTarget {
+    constructor(url) { super(); this.url = url; this.readyState = 1; }
+    send() {}
+    close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
+    server(e) { const m = new Event('message'); m.data = JSON.stringify(e); this.dispatchEvent(m); }
+  }
+  globalThis.WebSocket = FakeSocket;
+  let rt;
+  try {
+    const client = new OpenAI({ apiKey: 'k', baseURL: 'http://127.0.0.1:9/v1', dangerouslyAllowBrowser: true });
+    rt = sdk.withSession('call-6', () => new mod.OpenAIRealtimeWebSocket({ model: 'gpt-realtime', dangerouslyAllowBrowser: true }, client));
+  } finally { globalThis.WebSocket = Real; }
+  const s = rt.socket;
+  for (let turn = 1; turn <= 60; turn++) {
+    s.server({ type: 'conversation.item.added', item: { id: `u${turn}`, type: 'message', role: 'user', content: [{ type: 'input_audio', transcript: null }] } });
+    s.server({ type: 'conversation.item.input_audio_transcription.completed', item_id: `u${turn}`, content_index: 0, transcript: `line ${turn}` });
+    s.server({ type: 'response.created', response: { id: `r${turn}` } });
+    s.server({ type: 'response.output_text.done', response_id: `r${turn}`, item_id: `a${turn}`, text: `reply ${turn}` });
+    s.server({ type: 'response.done', response: { id: `r${turn}`, status: 'completed', output: [], usage: null } });
+  }
+  rt.close();
+  const calls = (await drain()).filter(c => c.api === 'openai-realtime');
+  assert.equal(calls.length, 60);
+  assert.equal(calls.reduce((n, c) => n + c.request.input.length, 0), 60, 'each caller line sent exactly once');
+  assert.deepEqual(calls.slice(1).map(c => c.request.previous_response_id), calls.slice(0, -1).map(c => c.response.id));
 });
 
 test('OpenAI Realtime: OpenAIRealtimeWebSocket is patched too, and state keeps at most 200 items', async () => {

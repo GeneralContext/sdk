@@ -935,6 +935,9 @@ type RtState = {
   at: Scope | undefined; scrub?: Scrub | null; model?: string; instructions?: unknown; tools?: unknown;
   next?: { instructions?: unknown; tools?: unknown }; entries: RtEntry[]; seq: number; speechStoppedAt: string | null;
   current: RtResponse | null; held: RtResponse | null; closed: boolean; bytesPerMs: number;
+  // The id of the last response recorded, and the highest item seq it covered. Later responses send only
+  // newer items, chained by previous_response_id, so a long call costs one item per item, not the square.
+  lastId?: string; sentSeq: number;
 };
 
 const RT_STATE = Symbol.for('generalcontext.realtime');
@@ -987,7 +990,7 @@ function patchRealtimeMethods(owner: any, scrub: Scrub | null | undefined) {
 function rtState(conn: any, scrub: Scrub | null | undefined): RtState {
   let state: RtState = conn[RT_STATE];
   if (!state) {
-    state = { at: scope.getStore(), scrub, entries: [], seq: 0, speechStoppedAt: null, current: null, held: null, closed: false, bytesPerMs: 48 };
+    state = { at: scope.getStore(), scrub, entries: [], seq: 0, speechStoppedAt: null, current: null, held: null, closed: false, bytesPerMs: 48, sentSeq: 0 };
     try { state.model = new URL(String(conn.url)).searchParams.get('model') ?? undefined; } catch { /* no url yet */ }
     Object.defineProperty(conn, RT_STATE, { value: state, configurable: true });
   } else if (scrub !== undefined && state.scrub === undefined) state.scrub = scrub;
@@ -1259,14 +1262,18 @@ function rtRecord(state: RtState, r: RtResponse) {
       const mine = e.response === r.id || (e.id && r.output_ids.has(e.id));
       if (mine && e.item.role === 'assistant') e.item = { ...e.item, voice: timing };
       if (mine) output.push(e.item);
-      else if (e.seq < r.seq) input.push(e.item);
+      else if (e.seq < r.seq && e.seq > state.sentSeq) input.push(e.item);
     }
-    const request = {
+    const request: Record<string, unknown> = {
       model: state.model ?? null,
       instructions: r.instructions ?? state.instructions ?? null,
       tools: r.tools ?? state.tools ?? [],
       input,
     };
+    // After the first reply, only what is new since the last one, chained to it, as the Responses API does.
+    if (state.lastId) request.previous_response_id = state.lastId;
+    state.lastId = r.id;
+    state.sentSeq = Math.max(state.sentSeq, ...state.entries.filter(e => e.item && (e.seq < r.seq || e.response === r.id || (e.id && r.output_ids.has(e.id)))).map(e => e.seq));
     record({
       api: 'openai-realtime', request, response: { id: r.id, output, usage: r.usage ?? null },
       started_at: r.started_at, ended_at: r.ended_at ?? new Date().toISOString(), error: r.error, voice: { ...r.voice },

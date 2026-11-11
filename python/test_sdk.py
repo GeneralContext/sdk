@@ -1127,8 +1127,11 @@ class RealtimeTest(unittest.TestCase):
         self.assertIsNotNone(first["voice"]["first_audio_at"])
         self.assertFalse(first["voice"]["interrupted"])
         # The first reply's timing is still on its item in the second call's history.
-        self.assertEqual(second["request"]["input"], [user, said, call, result])
-        self.assertEqual(second["request"]["input"][1]["voice"], {"latency_ms": latency, "interrupted": False})
+        # Each later reply sends only what is new since the last one, chained to it: here the tool result.
+        self.assertNotIn("previous_response_id", first["request"])
+        self.assertEqual(second["request"]["previous_response_id"], "resp_1")
+        self.assertEqual(second["request"]["input"], [result])
+        self.assertEqual(first["response"]["output"][0]["voice"], {"latency_ms": latency, "interrupted": False})
         self.assertEqual(second["response"]["output"], [reply])
         self.assertIsNotNone(second["voice"]["first_audio_at"])
         self.assertTrue(second["voice"]["interrupted"])
@@ -1136,10 +1139,12 @@ class RealtimeTest(unittest.TestCase):
         recorded = json.dumps(calls)
         # The shared voice fixture has the shape this SDK sends, key for key. Values may differ.
         fixture = _voice_contract()
-        for c in calls:
-            self.assertEqual(set(c), set(fixture[0]))
-            self.assertEqual(set(c["request"]), set(fixture[0]["request"]))
-            self.assertEqual(set(c["response"]), set(fixture[0]["response"]))
+        # The first reply carries the history so far, later ones only what is new, chained by previous_response_id.
+        for index, c in enumerate(calls):
+            like = fixture[min(index, len(fixture) - 1)]
+            self.assertEqual(set(c), set(like))
+            self.assertEqual(set(c["request"]), set(like["request"]))
+            self.assertEqual(set(c["response"]), set(like["response"]))
         expected, actual = _item_shapes(fixture), _item_shapes(calls)
         self.assertEqual(set(actual), {"user", "message", "function_call", "function_call_output"})
         for kind, shapes in actual.items():
@@ -1231,7 +1236,7 @@ class RealtimeTest(unittest.TestCase):
                 for _ in connection:
                     pass
         calls = self.realtime_calls()
-        users = [item for item in calls[1]["request"]["input"] if item.get("role") == "user"]
+        users = [item for c in calls for item in c["request"]["input"] if item.get("role") == "user"]
         self.assertEqual([(item["content"][0]["text"], item.get("audio")) for item in users], [("", True), ("Book me in.", True)])
 
     def test_async_connection_and_bounded_state(self):
