@@ -792,6 +792,17 @@ def check(tasks, judge_model=None, grader=None):
     return rows
 
 
+def _model_or_exit(parser, spec, role):
+    """The model for `spec`, or a usage error naming what is missing (exit 2), never a traceback."""
+    try:
+        return model(spec)
+    except ImportError as missing:
+        parser.error(f"the {role} {spec} needs the {getattr(missing, 'name', None) or spec.split(':')[0]} package: pip install {spec.split(':')[0]}")
+    except Exception as failure:
+        hint = {"openai": "set OPENAI_API_KEY", "anthropic": "set ANTHROPIC_API_KEY"}.get(spec.partition(":")[0])
+        parser.error(f"the {role} {spec} cannot start: {failure}" + (f" ({hint}, or choose another with --{role})" if hint else ""))
+
+
 def check_main(argv=None, prog="generalcontext evals check"):
     parser = argparse.ArgumentParser(prog=prog, description="Grade each task's reference runs and report any that disagree with expect.")
     parser.add_argument("benchmark", help="a generalcontext.benchmark/v1 or task/v1 file")
@@ -802,7 +813,7 @@ def check_main(argv=None, prog="generalcontext evals check"):
     tasks = [task for task in load_tasks(args.benchmark) if not args.task or task.get("id") in args.task or task.get("slug") in args.task]
     grader = load_callable(args.grader, "grader") if args.grader else None
     needs_judge = any(_task_view(task)["grader"]["kind"] == "rubric" and _task_view(task)["reference"] for task in tasks) and grader is None
-    judge_model = model(args.judge) if needs_judge else None
+    judge_model = _model_or_exit(parser, args.judge, "judge") if needs_judge else None
     rows = check(tasks, judge_model, grader)
     disagree = 0
     for row in rows:
@@ -815,7 +826,7 @@ def check_main(argv=None, prog="generalcontext evals check"):
         print(f"{verdict:<9} {row['task']}  {row['label']}  expect {row['expect']}, got {'pass' if row['passed'] else 'fail'}"
               f" (reward {round(row['reward'], 3)})" + (f"  {row['note']}" if row["note"] else ""), flush=True)
     checked = sum(1 for row in rows if not row["skipped"])
-    print(f"{checked} reference runs checked, {disagree} disagree with expect." if rows else "No task has reference runs.")
+    print(f"{checked} reference run{'' if checked == 1 else 's'} checked, {disagree} disagree{'s' if disagree == 1 else ''} with expect." if rows else "No task has reference runs.")
     return 1 if disagree else 0
 
 
@@ -862,7 +873,7 @@ def main(argv=None, prog="python -m generalcontext.evals"):
             runnable.append(task)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    person_model, judge_model = model(args.person), model(args.judge)
+    person_model, judge_model = _model_or_exit(parser, args.person, "person"), _model_or_exit(parser, args.judge, "judge")
     runs = []
     for agent_spec in args.agent:
         for task in runnable:

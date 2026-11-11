@@ -102,7 +102,7 @@ def benchmark_pull(args):
     tasks = data.get("tasks") or []
     splits = Counter(task.get("split") or "unsplit" for task in tasks)
     detail = ", ".join(f"{count} {name}" for name, count in sorted(splits.items()))
-    print(f"Wrote {args.out}: {len(tasks)} tasks" + (f" ({detail})." if detail else "."))
+    print(f"Wrote {args.out}: {len(tasks)} task{'' if len(tasks) == 1 else 's'}" + (f" ({detail})." if detail else "."))
     return 0
 
 

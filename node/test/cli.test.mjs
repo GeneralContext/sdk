@@ -83,7 +83,7 @@ test('benchmark pull writes the file and prints counts by split', async () => {
   const out = await run(['benchmark', 'pull', '--out', file], { GENERALCONTEXT_API_KEY: 'evals' });
   assert.equal(out.code, 0, out.stderr);
   assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), benchmark);
-  assert.match(out.stdout, /Wrote 3 tasks to .*b\.json \(train 2, held_out 1\)\./);
+  assert.match(out.stdout, /Wrote .*b\.json: 3 tasks \(1 held_out, 2 train\)\./);
 });
 
 test('benchmark pull with an ingest-only key prints the 403 message and exits 1', async () => {

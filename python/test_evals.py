@@ -425,6 +425,7 @@ class Check(unittest.TestCase):
             with unittest.mock.patch.object(evals, "model", lambda spec: all_pass_judge()), contextlib.redirect_stdout(output):
                 self.assertEqual(evals.main(["check", path]), 1)
             self.assertIn("DISAGREE", output.getvalue())
+            self.assertIn("1 reference run checked, 1 disagrees with expect.", output.getvalue())
             strict = scripted({"text": '{"criteria": [{"id": "asks-date", "passed": false, "reason": "no"}]}', "tool_calls": []})
             with unittest.mock.patch.object(evals, "model", lambda spec: strict), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(evals.main(["check", path]), 0)
@@ -438,6 +439,19 @@ class Check(unittest.TestCase):
                 self.assertEqual(cli.main(["evals", "check", path, "--grader", "x:y"]), 0)
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cli.main(["evals", "check", path]), 0)  # skipped, not a disagreement
+
+
+    def test_a_judge_that_cannot_start_is_a_setup_error_not_a_traceback(self):
+        def missing_key(spec):
+            raise RuntimeError("Missing credentials")
+        task = dict(NEW_TASK, reference=[{"label": "production", "expect": "fail", "transcript": [], "tool_calls": []}])
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, [task])
+            error = io.StringIO()
+            with unittest.mock.patch.object(evals, "model", missing_key), contextlib.redirect_stderr(error):
+                from generalcontext import cli
+                self.assertEqual(cli.main(["evals", "check", path]), 2)
+            self.assertIn("set OPENAI_API_KEY", error.getvalue())
 
 
 class Contract(unittest.TestCase):
