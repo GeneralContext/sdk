@@ -1,6 +1,6 @@
 [project]
 name = "generalcontext"
-version = "0.2.0"
+version = "0.3.0"
 description = "Record your agent's model calls so General Context can turn them into RL and eval tasks, and run your benchmark."
 readme = "README.md"
 requires-python = ">=3.9"
