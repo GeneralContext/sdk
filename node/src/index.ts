@@ -34,10 +34,14 @@ const RETRY_PAUSE_MS = 30_000; // after the collector fails to answer, wait this
 type Metadata = Record<string, string | number | boolean>;
 export type Session = { sessionId: string; userId?: string; channel?: string; product?: string; metadata?: Metadata };
 type Tags = { id: string; user_id?: string; channel?: string; product?: string; metadata?: Metadata };
-type Api = 'openai-chat' | 'openai-responses' | 'anthropic' | 'gemini' | 'bedrock-converse';
+type Api = 'openai-chat' | 'openai-responses' | 'anthropic' | 'gemini' | 'bedrock-converse' | 'openai-realtime';
+/** Voice timing on 'openai-realtime' calls. Timestamps are ISO strings, null when not seen. */
+export type VoiceTiming = {
+  speech_stopped_at: string | null; first_audio_at: string | null; interrupted: boolean; truncated_at_ms?: number;
+};
 export type Call = {
   api: Api; conversation: Tags | null; task: string | null; request: unknown; response: unknown;
-  started_at: string; ended_at: string; error: string | null;
+  started_at: string; ended_at: string; error: string | null; voice?: VoiceTiming;
 };
 type Scrub = (text: string) => string;
 type BeforeSend = (call: Call) => Call | null | undefined;
@@ -134,13 +138,22 @@ export function initialize(options: InitializeOptions = {}): void {
   // The imports settle a few ticks after initialize() returns, before an app's own `await import(...)` of the
   // same module resumes. A call made synchronously right after initialize(), before any await, can run
   // unrecorded: await ready() first in that case.
+  // OpenAI Realtime (voice) connection classes live in their own entry points. openai/realtime/ws needs the
+  // optional `ws` package, so either may be missing.
+  if (!options.instrumentModules || options.instrumentModules.openAI) {
+    const require = createRequire(import.meta.url);
+    for (const name of REALTIME_MODULES) { try { patchRealtime(require(name)); } catch { /* not installed */ } }
+    const realtime = Promise.all(REALTIME_MODULES.map(name => import(name).then(patchRealtime, () => {}))).then(() => {});
+    pending = pending.then(() => realtime);
+  }
   if (!options.instrumentModules) {
     const esm: [string, (m: unknown) => void][] = [['openai', patchOpenAI], ['@anthropic-ai/sdk', patchAnthropic]];
     if (modules.googleGenAI) esm.push(['@google/genai', patchGemini]);
     // @aws-sdk/client-bedrock-runtime resolves to one class from both require() and import(), so it needs nothing here.
     let found = Object.values(modules).some(Boolean);
+    const realtime = pending;
     pending = Promise.all(esm.map(([name, patch]) => import(name as string).then(m => { found = true; patch(m); }, () => {})))
-      .then(() => { if (!found) warn(NO_SDK); });
+      .then(() => { if (!found) warn(NO_SDK); }).then(() => realtime);
   }
   if (modules.openAI) patchOpenAI(modules.openAI);
   if (modules.anthropic) patchAnthropic(modules.anthropic);
@@ -843,6 +856,351 @@ function converseAssembler(): Assembler {
   };
 }
 
+// ---- OpenAI Realtime (voice) ----------------------------------------------------------------
+//
+// A realtime session is one WebSocket carrying many responses. Each response.done becomes one 'openai-realtime'
+// call shaped like a Responses call: request { model, instructions, tools, input } and response { id, output, usage },
+// so the platform folds a whole phone call into one conversation. Only text is kept: transcripts, text, tool calls
+// and tool results. Audio bytes are never read into this state. Events are observed, never changed or delayed.
+
+const REALTIME_MODULES = ['openai/realtime/ws', 'openai/realtime/websocket'];
+const REALTIME_MAX_ITEMS = 200;
+// A finished response is recorded once the next response starts, the socket closes, or this long after
+// response.done, so an interruption that arrives while its audio is still playing is on the call.
+const REALTIME_HOLD_MS = 60_000;
+
+type RtItem = Record<string, unknown>;
+type RtEntry = { id: string | null; item: RtItem | null; seq: number; response?: string };
+type RtResponse = {
+  id: string; seq: number; started_at: string; ended_at?: string; usage?: unknown; error: string | null;
+  instructions?: unknown; tools?: unknown; voice: VoiceTiming; output_ids: Set<string>; timer?: ReturnType<typeof setTimeout>;
+  firstAudioMs?: number; audioBytes: number;
+};
+type RtState = {
+  at: Scope | undefined; scrub?: Scrub | null; model?: string; instructions?: unknown; tools?: unknown;
+  next?: { instructions?: unknown; tools?: unknown }; entries: RtEntry[]; seq: number; speechStoppedAt: string | null;
+  current: RtResponse | null; held: RtResponse | null; closed: boolean; bytesPerMs: number;
+};
+
+const RT_STATE = Symbol.for('generalcontext.realtime');
+const rtLive = new Set<RtState>();
+let rtExitHooked = false;
+
+function patchRealtime(value: unknown) {
+  const v = value as any;
+  for (const cls of [v?.OpenAIRealtimeWS, v?.OpenAIRealtimeWebSocket, v?.default?.OpenAIRealtimeWS, v?.default?.OpenAIRealtimeWebSocket]) {
+    const proto = cls?.prototype;
+    if (!proto || typeof proto.send !== 'function' || typeof proto._emit !== 'function' || Object.prototype.hasOwnProperty.call(proto, MARK)) continue;
+    Object.defineProperty(proto, MARK, { value: true });
+    patchRealtimeMethods(proto, undefined);
+    // The constructor assigns this.socket in the app's async scope, so that is where the session id is read.
+    // Automatic reconnects assign it again; the state (and its session) stays the same.
+    const SOCKET = Symbol('socket');
+    Object.defineProperty(proto, 'socket', {
+      configurable: true,
+      get(this: any) { return this[SOCKET]; },
+      set(this: any, socket: unknown) {
+        Object.defineProperty(this, SOCKET, { value: socket, writable: true, configurable: true });
+        try { watchSocketClose(this, rtState(this, undefined), socket); } catch { /* never break the app */ }
+      },
+    });
+  }
+}
+
+function patchRealtimeMethods(owner: any, scrub: Scrub | null | undefined) {
+  const emit = owner._emit, send = owner.send, sendRef = owner.sendResponseCreate;
+  if (typeof emit === 'function' && !emit[MARK]) {
+    owner._emit = function (this: any, name: string, ...args: unknown[]) {
+      try {
+        if (name === 'event') rtServerEvent(rtState(this, scrub), args[0] as any);
+        else if (name === 'close') rtClose(rtState(this, scrub)); // connections with automatic reconnects
+      } catch { /* never break the app */ }
+      return emit.call(this, name, ...args);
+    };
+    owner._emit[MARK] = true;
+  }
+  for (const [key, original] of [['send', send], ['sendResponseCreate', sendRef]] as const) {
+    if (typeof original !== 'function' || original[MARK]) continue;
+    owner[key] = function (this: any, event: unknown, ...rest: unknown[]) {
+      try { rtClientEvent(rtState(this, scrub), event as any); } catch { /* never break the app */ }
+      return original.call(this, event, ...rest);
+    };
+    owner[key][MARK] = true;
+  }
+}
+
+function rtState(conn: any, scrub: Scrub | null | undefined): RtState {
+  let state: RtState = conn[RT_STATE];
+  if (!state) {
+    state = { at: scope.getStore(), scrub, entries: [], seq: 0, speechStoppedAt: null, current: null, held: null, closed: false, bytesPerMs: 48 };
+    try { state.model = new URL(String(conn.url)).searchParams.get('model') ?? undefined; } catch { /* no url yet */ }
+    Object.defineProperty(conn, RT_STATE, { value: state, configurable: true });
+  } else if (scrub !== undefined && state.scrub === undefined) state.scrub = scrub;
+  return state;
+}
+
+const rtWatched = new WeakSet<object>();
+function watchSocketClose(conn: any, state: RtState, socket: any) {
+  if (!socket || typeof socket !== 'object' || rtWatched.has(socket)) return;
+  rtWatched.add(socket);
+  const onClose = () => { if (conn.socket === socket || conn.socket === undefined) rtClose(state); };
+  if (typeof socket.on === 'function') socket.on('close', onClose);
+  else if (typeof socket.addEventListener === 'function') socket.addEventListener('close', onClose);
+}
+
+const rtText = (item: any): string | null => {
+  const parts: string[] = [];
+  for (const part of Array.isArray(item?.content) ? item.content : []) {
+    const text = typeof part?.text === 'string' ? part.text : typeof part?.transcript === 'string' ? part.transcript : null;
+    if (text) parts.push(text);
+  }
+  return parts.length ? parts.join('') : null;
+};
+const rtHasAudio = (item: any) => (Array.isArray(item?.content) ? item.content : []).some((p: any) => /audio/.test(String(p?.type)));
+
+// A realtime item as a Responses item, text only. Returns null when there is no text yet (audio awaiting its transcript).
+function rtConvert(item: any): RtItem | null {
+  if (!item || typeof item !== 'object') return null;
+  if (item.type === 'function_call') return { type: 'function_call', call_id: item.call_id, name: item.name, arguments: item.arguments ?? '' };
+  if (item.type === 'function_call_output') return { type: 'function_call_output', call_id: item.call_id, output: item.output };
+  if (item.type !== 'message') return null;
+  const text = rtText(item);
+  if (text == null) return null;
+  const audio = rtHasAudio(item);
+  if (item.role === 'assistant') return { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }], ...(audio ? { audio: true } : {}) };
+  return { role: item.role ?? 'user', content: [{ type: 'input_text', text }], ...(audio ? { audio: true } : {}) };
+}
+
+function rtEntry(state: RtState, id: string | null | undefined, match?: (e: RtEntry) => boolean): RtEntry {
+  let entry = id ? state.entries.find(e => e.id === id) : undefined;
+  if (!entry && match) entry = state.entries.find(e => !e.id && match(e));
+  if (entry) { if (id) entry.id = id; return entry; }
+  entry = { id: id ?? null, item: null, seq: ++state.seq };
+  state.entries.push(entry);
+  if (state.entries.length > REALTIME_MAX_ITEMS) state.entries.splice(0, state.entries.length - REALTIME_MAX_ITEMS);
+  return entry;
+}
+
+function rtUpsert(state: RtState, raw: any, responseId?: string) {
+  const id = typeof raw?.id === 'string' ? raw.id : null;
+  const converted = rtConvert(raw);
+  // The app's own conversation.item.create usually has no id. Match the server's echo of it by content.
+  const same = converted && JSON.stringify(converted);
+  const entry = rtEntry(state, id, e => !!same && !!e.item && JSON.stringify(e.item) === same);
+  if (converted) entry.item = { ...entry.item, ...converted };
+  if (responseId) entry.response = responseId;
+}
+
+function rtServerEvent(state: RtState, event: any) {
+  const type = typeof event?.type === 'string' ? event.type : '';
+  const now = new Date().toISOString();
+  switch (type) {
+    case 'session.created': case 'session.updated': {
+      const s = event.session ?? {};
+      if (typeof s.model === 'string') state.model = s.model;
+      if ('instructions' in s) state.instructions = s.instructions;
+      if ('tools' in s) state.tools = s.tools;
+      rtFormat(state, s);
+      break;
+    }
+    case 'conversation.item.added': case 'conversation.item.created': case 'conversation.item.done': {
+      const r = state.current;
+      const own = r && typeof event.item?.id === 'string' && r.output_ids.has(event.item.id) ? r.id : undefined;
+      rtUpsert(state, event.item, own);
+      break;
+    }
+    case 'conversation.item.input_audio_transcription.completed': {
+      const entry = rtEntry(state, event.item_id);
+      entry.item = { role: 'user', content: [{ type: 'input_text', text: String(event.transcript ?? '') }], audio: true };
+      break;
+    }
+    // Every user turn starts with speech_started. It interrupts the response being generated, or the last one
+    // while its audio is still playing (audio length estimated from the delta sizes, the bytes are not kept).
+    case 'input_audio_buffer.speech_started': {
+      const r = state.current ?? state.held;
+      if (r && (r === state.current || Date.now() < rtPlaybackEnd(state, r))) r.voice.interrupted = true;
+      break;
+    }
+    case 'input_audio_buffer.speech_stopped': state.speechStoppedAt = now; break;
+    case 'response.created': {
+      rtRelease(state);
+      if (state.current) rtFinish(state, 'a new response started before response.done');
+      state.current = rtStart(state, event.response?.id, now);
+      break;
+    }
+    case 'response.output_item.added': case 'response.output_item.done':
+      rtOwn(state, event.response_id, event.item?.id);
+      rtUpsert(state, event.item, rtResponseFor(state, event.response_id)?.id);
+      break;
+    case 'response.output_audio.delta': case 'response.audio.delta': {
+      const r = rtResponseFor(state, event.response_id);
+      if (r && !r.voice.first_audio_at) { r.voice.first_audio_at = now; r.firstAudioMs = Date.now(); }
+      if (r && typeof event.delta === 'string') r.audioBytes += Math.floor(event.delta.length * 3 / 4);
+      break;
+    }
+    case 'response.output_audio_transcript.done': case 'response.audio_transcript.done': case 'response.output_text.done': case 'response.text.done': {
+      const r = rtResponseFor(state, event.response_id);
+      rtOwn(state, event.response_id, event.item_id);
+      const entry = rtEntry(state, event.item_id);
+      const text = String(event.transcript ?? event.text ?? '');
+      const audio = type.includes('audio');
+      entry.item = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }], ...(audio ? { audio: true } : {}) };
+      if (r) entry.response = r.id;
+      break;
+    }
+    case 'response.function_call_arguments.done': {
+      rtOwn(state, event.response_id, event.item_id);
+      const entry = rtEntry(state, event.item_id);
+      entry.item = { type: 'function_call', call_id: event.call_id, name: event.name, arguments: event.arguments ?? '' };
+      const r = rtResponseFor(state, event.response_id);
+      if (r) entry.response = r.id;
+      break;
+    }
+    case 'conversation.item.truncated': rtTruncate(state, event.item_id, event.audio_end_ms); break;
+    case 'error': {
+      const r = state.current;
+      if (r) r.error = `realtime error: ${String(event.error?.message ?? 'unknown error')}${event.error?.code ? ` (${event.error.code})` : ''}`;
+      break;
+    }
+    case 'response.done': {
+      const res = event.response ?? {};
+      let r = rtResponseFor(state, res.id);
+      if (!r) r = state.current = rtStart(state, res.id, now);
+      for (const item of Array.isArray(res.output) ? res.output : []) { rtOwn(state, r.id, item?.id); rtUpsert(state, item, r.id); }
+      r.ended_at = now;
+      r.usage = res.usage ?? null;
+      if (res.status === 'failed' && !r.error) r.error = `response failed: ${JSON.stringify(res.status_details ?? null)}`;
+      if (res.status === 'cancelled') r.voice.interrupted = true;
+      if (state.current === r) state.current = null;
+      rtHold(state, r);
+      break;
+    }
+  }
+}
+
+function rtClientEvent(state: RtState, event: any) {
+  switch (event?.type) {
+    case 'session.update': {
+      const s = event.session ?? {};
+      if (typeof s.model === 'string') state.model = s.model;
+      if ('instructions' in s) state.instructions = s.instructions;
+      if ('tools' in s) state.tools = s.tools;
+      rtFormat(state, s);
+      break;
+    }
+    case 'conversation.item.create': rtUpsert(state, event.item); break;
+    case 'response.create': {
+      const r = event.response ?? {};
+      if ('instructions' in r || 'tools' in r) state.next = { instructions: r.instructions, tools: r.tools };
+      break;
+    }
+    case 'response.cancel': rtInterrupt(state); break;
+    case 'conversation.item.truncate': rtTruncate(state, event.item_id, event.audio_end_ms); break;
+  }
+}
+
+function rtStart(state: RtState, id: unknown, now: string): RtResponse {
+  const r: RtResponse = {
+    id: typeof id === 'string' ? id : `resp_${randomUUID()}`, seq: ++state.seq, started_at: now, error: null, output_ids: new Set(), audioBytes: 0,
+    voice: { speech_stopped_at: state.speechStoppedAt, first_audio_at: null, interrupted: false },
+  };
+  if (state.next) { r.instructions = state.next.instructions; r.tools = state.next.tools; state.next = undefined; }
+  state.speechStoppedAt = null;
+  rtLive.add(state);
+  return r;
+}
+
+// Output audio is pcm16 at 24 kHz (48 bytes per ms) unless the session picked G.711 (8 bytes per ms).
+function rtFormat(state: RtState, session: any) {
+  const format = session?.audio?.output?.format?.type ?? session?.output_audio_format;
+  if (typeof format === 'string') state.bytesPerMs = /pcmu|pcma|g711/.test(format) ? 8 : 48;
+}
+
+const rtPlaybackEnd = (state: RtState, r: RtResponse) =>
+  r.firstAudioMs === undefined ? 0 : r.firstAudioMs + r.audioBytes / state.bytesPerMs;
+
+const rtResponseFor = (state: RtState, id: unknown): RtResponse | null =>
+  [state.current, state.held].find(r => r && (!id || r.id === id)) ?? null;
+
+function rtOwn(state: RtState, responseId: unknown, itemId: unknown) {
+  const r = rtResponseFor(state, responseId);
+  if (r && typeof itemId === 'string') r.output_ids.add(itemId);
+}
+
+// The response the caller is hearing: the one in flight, else the last finished one still playing.
+function rtInterrupt(state: RtState) {
+  const r = state.current ?? state.held;
+  if (r) r.voice.interrupted = true;
+}
+
+function rtTruncate(state: RtState, itemId: unknown, ms: unknown) {
+  const r = [state.current, state.held].find(x => x && typeof itemId === 'string' && x.output_ids.has(itemId)) ?? state.current ?? state.held;
+  if (!r) return;
+  r.voice.interrupted = true;
+  if (typeof ms === 'number') r.voice.truncated_at_ms = ms;
+}
+
+function rtHold(state: RtState, r: RtResponse) {
+  rtRelease(state);
+  state.held = r;
+  r.timer = setTimeout(() => { if (state.held === r) rtRelease(state); }, REALTIME_HOLD_MS);
+  r.timer.unref?.();
+  if (!rtExitHooked) {
+    rtExitHooked = true;
+    process.once('beforeExit', () => {
+      for (const s of rtLive) { rtRelease(s); }
+      if (queue.length) void flush(EXIT_FLUSH_MS);
+    });
+  }
+}
+
+function rtRelease(state: RtState) {
+  const r = state.held;
+  if (!r) return;
+  state.held = null;
+  if (r.timer) clearTimeout(r.timer);
+  rtRecord(state, r);
+  if (!state.current) rtLive.delete(state);
+}
+
+function rtFinish(state: RtState, error: string) {
+  const r = state.current;
+  if (!r) return;
+  state.current = null;
+  r.ended_at = new Date().toISOString();
+  r.error ??= error;
+  rtRecord(state, r);
+}
+
+function rtClose(state: RtState) {
+  if (state.closed) return;
+  state.closed = true;
+  rtRelease(state);
+  rtFinish(state, 'connection closed before response.done');
+  rtLive.delete(state);
+}
+
+function rtRecord(state: RtState, r: RtResponse) {
+  try {
+    const input: RtItem[] = [], output: RtItem[] = [];
+    for (const e of state.entries) {
+      if (!e.item) continue;
+      if (e.response === r.id || (e.id && r.output_ids.has(e.id))) output.push(e.item);
+      else if (e.seq < r.seq) input.push(e.item);
+    }
+    const request = {
+      model: state.model ?? null,
+      instructions: r.instructions ?? state.instructions ?? null,
+      tools: r.tools ?? state.tools ?? [],
+      input,
+    };
+    record({
+      api: 'openai-realtime', request, response: { id: r.id, output, usage: r.usage ?? null },
+      started_at: r.started_at, ended_at: r.ended_at ?? new Date().toISOString(), error: r.error, voice: { ...r.voice },
+    }, state.at, state.scrub);
+  } catch (error) { warnLimited('record', `could not record a realtime response: ${(error as Error).message}`); }
+}
+
 const PATTERNS: [string, RegExp][] = [
   // Bounded repeats and a token-start lookbehind keep this linear on adversarial input.
   ['email', /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}/g],
@@ -891,7 +1249,14 @@ export function wrap<C extends object>(client: C, options: { redact?: boolean | 
   const models = target.models;
   const gemini = typeof models?.generateContent === 'function';
   const bedrock = typeof target.send === 'function' && target.config && !gemini && !owners.length;
-  if (!owners.length && !gemini && !bedrock) throw new TypeError('wrap expects an OpenAI, Anthropic, Google Gen AI or Bedrock Runtime client');
+  // An OpenAIRealtimeWS or OpenAIRealtimeWebSocket connection. Its session is the one wrap() runs in.
+  const realtime = typeof target.send === 'function' && typeof target._emit === 'function' && 'socket' in target;
+  if (realtime) {
+    patchRealtimeMethods(target, scrub);
+    try { watchSocketClose(target, rtState(target, scrub), target.socket); } catch { /* never break the app */ }
+    return client;
+  }
+  if (!owners.length && !gemini && !bedrock) throw new TypeError('wrap expects an OpenAI, Anthropic, Google Gen AI or Bedrock Runtime client, or an OpenAI Realtime connection');
   for (const [owner, api] of owners) {
     if (!owner.create[MARK]) owner.create = recording(owner.create.bind(owner), api, scrub);
   }

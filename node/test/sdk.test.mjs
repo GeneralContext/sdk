@@ -835,3 +835,226 @@ test('plain initialize() warns once when no model SDK resolves, and not with ins
   const found = await child(`initialize({ apiKey: 'k', baseUrl: BASE + '/child/found' }); const { ready } = await import(${JSON.stringify(dist)}); await ready();`);
   assert.doesNotMatch(found.stderr, /found no model SDK/);
 });
+
+// ---- OpenAI Realtime (voice) ------------------------------------------------------------------
+// A fake Realtime server (ws over plain TCP) drives a real OpenAIRealtimeWS from the installed openai.
+// The client builds a wss:// URL, so the test hands it a plain TCP connection through the `ws` createConnection option.
+
+const realtimeWS = await optional('openai/realtime/ws');
+const wsLib = await optional('ws');
+const AUDIO = Buffer.alloc(6000, 7).toString('base64'); // 8000 base64 characters, never to be recorded
+
+async function fakeRealtime(script) {
+  const wss = new wsLib.WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await new Promise(r => wss.once('listening', r));
+  const sent = [];
+  const received = [];
+  wss.on('connection', socket => {
+    const send = e => { sent.push(e.type); socket.send(JSON.stringify(e)); };
+    script.onOpen(send);
+    socket.on('message', data => { const e = JSON.parse(String(data)); received.push(e); script.onClient(e, send); });
+  });
+  return { port: wss.address().port, sent, received, close: () => new Promise(r => wss.close(r)) };
+}
+
+// Turn 1: the caller asks, the model calls a tool. Turn 2: the app sends the tool result, the model answers
+// in audio, and the caller barges in while it plays.
+function twoTurnScript() {
+  const tools = [{ type: 'function', name: 'get_rent', description: 'Rent for a unit', parameters: { type: 'object', properties: { unit: { type: 'string' } } } }];
+  const usage = (i, o) => ({ total_tokens: i + o, input_tokens: i, output_tokens: o });
+  const fc = { id: 'item_fc', type: 'function_call', call_id: 'call_rent', name: 'get_rent', arguments: '{"unit":"4B"}', status: 'completed' };
+  const answer = { id: 'item_a2', type: 'message', role: 'assistant', status: 'incomplete', content: [{ type: 'output_audio', transcript: 'Unit 4B rents for 2100 dollars a month.' }] };
+  let appended = false;
+  return {
+    tools,
+    onOpen(send) { send({ type: 'session.created', event_id: 'e0', session: { type: 'realtime', model: 'gpt-realtime', instructions: '', tools: [] } }); },
+    onClient(e, send) {
+      if (e.type === 'session.update') send({ type: 'session.updated', event_id: 'e1', session: { type: 'realtime', model: 'gpt-realtime', ...e.session } });
+      if (e.type === 'input_audio_buffer.append' && !appended) {
+        appended = true;
+        send({ type: 'input_audio_buffer.speech_started', event_id: 'e2', audio_start_ms: 0, item_id: 'item_u1' });
+        send({ type: 'input_audio_buffer.speech_stopped', event_id: 'e3', audio_end_ms: 1800, item_id: 'item_u1' });
+        send({ type: 'input_audio_buffer.committed', event_id: 'e4', item_id: 'item_u1', previous_item_id: null });
+        send({ type: 'conversation.item.added', event_id: 'e5', previous_item_id: null, item: { id: 'item_u1', type: 'message', role: 'user', content: [{ type: 'input_audio', transcript: null }] } });
+        send({ type: 'conversation.item.input_audio_transcription.completed', event_id: 'e6', item_id: 'item_u1', content_index: 0, transcript: 'What is the rent for 4B?', usage: { type: 'duration', seconds: 2 } });
+        send({ type: 'response.created', event_id: 'e7', response: { id: 'resp_1', object: 'realtime.response', status: 'in_progress', output: [] } });
+        send({ type: 'response.output_item.added', event_id: 'e8', response_id: 'resp_1', output_index: 0, item: { ...fc, arguments: '', status: 'in_progress' } });
+        send({ type: 'response.function_call_arguments.done', event_id: 'e9', response_id: 'resp_1', item_id: 'item_fc', output_index: 0, call_id: 'call_rent', name: 'get_rent', arguments: fc.arguments });
+        send({ type: 'response.output_item.done', event_id: 'e10', response_id: 'resp_1', output_index: 0, item: fc });
+        send({ type: 'response.done', event_id: 'e11', response: { id: 'resp_1', object: 'realtime.response', status: 'completed', output: [fc], usage: usage(120, 15) } });
+      }
+      if (e.type === 'conversation.item.create') send({ type: 'conversation.item.added', event_id: 'e12', previous_item_id: 'item_fc', item: { id: 'item_fco', ...e.item } });
+      if (e.type === 'response.create') {
+        send({ type: 'response.created', event_id: 'e13', response: { id: 'resp_2', object: 'realtime.response', status: 'in_progress', output: [] } });
+        send({ type: 'response.output_item.added', event_id: 'e14', response_id: 'resp_2', output_index: 0, item: { ...answer, status: 'in_progress', content: [] } });
+        for (let i = 0; i < 3; i++) send({ type: 'response.output_audio.delta', event_id: `e15${i}`, response_id: 'resp_2', item_id: 'item_a2', output_index: 0, content_index: 0, delta: AUDIO });
+        send({ type: 'response.output_audio_transcript.done', event_id: 'e16', response_id: 'resp_2', item_id: 'item_a2', output_index: 0, content_index: 0, transcript: answer.content[0].transcript });
+        send({ type: 'input_audio_buffer.speech_started', event_id: 'e17', audio_start_ms: 2600, item_id: 'item_u2' });
+      }
+      if (e.type === 'conversation.item.truncate') send({ type: 'conversation.item.truncated', event_id: 'e18', item_id: e.item_id, content_index: 0, audio_end_ms: e.audio_end_ms });
+      if (e.type === 'response.cancel') {
+        send({ type: 'response.output_item.done', event_id: 'e19', response_id: 'resp_2', output_index: 0, item: answer });
+        send({ type: 'response.done', event_id: 'e20', response: { id: 'resp_2', object: 'realtime.response', status: 'cancelled', output: [answer], usage: usage(160, 30) } });
+      }
+    },
+  };
+}
+
+// The app: a voice agent loop. It streams microphone audio, answers tool calls, and stops playback on barge-in.
+async function runVoiceApp(rt, tools, sessionDone) {
+  const seen = { all: [], typed: [] };
+  rt.on('event', e => seen.all.push(e.type));
+  for (const t of ['session.created', 'response.function_call_arguments.done', 'response.output_audio.delta', 'input_audio_buffer.speech_started', 'response.done', 'conversation.item.truncated']) rt.on(t, e => seen.typed.push(e.type));
+  rt.on('error', () => {});
+  let playing = null;
+  rt.on('response.output_audio.delta', e => { playing ??= e.item_id; });
+  rt.on('response.function_call_arguments.done', e => {
+    rt.send({ type: 'conversation.item.create', item: { type: 'function_call_output', call_id: e.call_id, output: '{"rent":2100}' } });
+    rt.send({ type: 'response.create' });
+  });
+  rt.on('input_audio_buffer.speech_started', () => {
+    if (!playing) return;
+    rt.send({ type: 'conversation.item.truncate', item_id: playing, content_index: 0, audio_end_ms: 640 });
+    rt.send({ type: 'response.cancel' });
+    playing = null;
+  });
+  let doneCount = 0;
+  rt.on('response.done', () => { if (++doneCount === 2) sessionDone(); });
+  await new Promise(r => rt.socket.once('open', r));
+  rt.send({ type: 'session.update', session: { type: 'realtime', instructions: 'You are a leasing agent.', tools, audio: { output: { format: { type: 'audio/pcm', rate: 24000 } } } } });
+  rt.send({ type: 'input_audio_buffer.append', audio: AUDIO });
+  return seen;
+}
+
+const LONG_BASE64 = /[A-Za-z0-9+/]{100,}/;
+
+test('OpenAI Realtime: a two-turn voice call records one Responses-shaped call per response, no audio', { skip: (!realtimeWS || !wsLib) && 'openai/realtime/ws or ws not installed' }, async () => {
+  await sdk.ready();
+  await drain();
+  const script = twoTurnScript();
+  const fake = await fakeRealtime(script);
+  const client = new OpenAI({ apiKey: 'k', baseURL: `http://127.0.0.1:${fake.port}/v1`, maxRetries: 0 });
+  let finished;
+  const done = new Promise(r => { finished = r; });
+  const rt = sdk.withSession('call-1', () => new realtimeWS.OpenAIRealtimeWS({
+    model: 'gpt-realtime', options: { createConnection: () => net.connect({ host: '127.0.0.1', port: fake.port }) },
+  }, client));
+  const seen = await sdk.withSession('other-scope', () => runVoiceApp(rt, script.tools, finished));
+  await done;
+  rt.close();
+  await new Promise(r => rt.socket.once('close', r));
+  const calls = (await drain()).filter(c => c.api === 'openai-realtime');
+  await fake.close();
+
+  // App-visible behavior: every server event reached the app's 'event' listener in order, and the typed listeners too.
+  assert.deepEqual(seen.all, fake.sent);
+  assert.equal(seen.typed.filter(t => t === 'response.output_audio.delta').length, 3);
+  assert.equal(seen.typed.filter(t => t === 'response.done').length, 2);
+  // The client events went out unchanged, audio included.
+  assert.equal(fake.received.find(e => e.type === 'input_audio_buffer.append').audio, AUDIO);
+  assert.deepEqual(fake.received.map(e => e.type), ['session.update', 'input_audio_buffer.append', 'conversation.item.create', 'response.create', 'conversation.item.truncate', 'response.cancel']);
+
+  assert.equal(calls.length, 2);
+  for (const c of calls) {
+    assert.deepEqual(c.conversation, { id: 'call-1' });
+    assert.equal(c.request.model, 'gpt-realtime');
+    assert.equal(c.request.instructions, 'You are a leasing agent.');
+    assert.equal(c.request.tools[0].name, 'get_rent');
+    assert.ok(c.voice && 'speech_stopped_at' in c.voice && 'first_audio_at' in c.voice && 'interrupted' in c.voice);
+    assert.ok(c.started_at <= c.ended_at);
+  }
+  const [first, second] = calls;
+  const user = { role: 'user', content: [{ type: 'input_text', text: 'What is the rent for 4B?' }], audio: true };
+  const call = { type: 'function_call', call_id: 'call_rent', name: 'get_rent', arguments: '{"unit":"4B"}' };
+  const result = { type: 'function_call_output', call_id: 'call_rent', output: '{"rent":2100}' };
+  const reply = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Unit 4B rents for 2100 dollars a month.' }], audio: true };
+  assert.deepEqual(first.request.input, [user]);
+  assert.deepEqual(first.response, { id: 'resp_1', output: [call], usage: { total_tokens: 135, input_tokens: 120, output_tokens: 15 } });
+  assert.equal(first.error, null);
+  assert.match(first.voice.speech_stopped_at, /^\d{4}-/);
+  assert.equal(first.voice.first_audio_at, null);
+  assert.equal(first.voice.interrupted, false);
+  assert.deepEqual(second.request.input, [user, call, result]);
+  assert.deepEqual(second.response.output, [reply]);
+  assert.equal(second.response.id, 'resp_2');
+  assert.match(second.voice.first_audio_at, /^\d{4}-/);
+  assert.equal(second.voice.interrupted, true);
+  assert.equal(second.voice.truncated_at_ms, 640);
+  const json = JSON.stringify(calls);
+  assert.doesNotMatch(json, LONG_BASE64);
+  assert.ok(!json.includes(AUDIO.slice(0, 64)));
+  assert.doesNotMatch(json, /omitted \d+ bytes/); // dropped at the source, not even a placeholder
+  if (process.env.GC_PRINT_REALTIME) console.log(JSON.stringify(second, null, 2));
+});
+
+test('OpenAI Realtime: an error event and a socket closed mid-response are recorded with an error', { skip: (!realtimeWS || !wsLib) && 'openai/realtime/ws or ws not installed' }, async () => {
+  await drain();
+  const fake = await fakeRealtime({
+    onOpen(send) { send({ type: 'session.created', event_id: 'e0', session: { model: 'gpt-realtime', instructions: 'Be brief.', tools: [] } }); },
+    onClient(e, send) {
+      if (e.type === 'conversation.item.create') send({ type: 'conversation.item.added', event_id: 'e1', item: { id: 'item_u', ...e.item } });
+      if (e.type === 'response.create') {
+        send({ type: 'response.created', event_id: 'e2', response: { id: 'resp_x', status: 'in_progress', output: [] } });
+        send({ type: 'response.output_audio.delta', event_id: 'e3', response_id: 'resp_x', item_id: 'item_x', output_index: 0, content_index: 0, delta: AUDIO });
+        send({ type: 'error', event_id: 'e4', error: { type: 'server_error', code: 'overloaded', message: 'The server is overloaded' } });
+      }
+    },
+  });
+  const client = new OpenAI({ apiKey: 'k', baseURL: `http://127.0.0.1:${fake.port}/v1`, maxRetries: 0 });
+  const rt = sdk.withSession('call-2', () => new realtimeWS.OpenAIRealtimeWS({ model: 'gpt-realtime', options: { createConnection: () => net.connect({ host: '127.0.0.1', port: fake.port }) } }, client));
+  const errors = [];
+  rt.on('error', e => errors.push(e.message));
+  const sawError = new Promise(r => rt.on('event', e => { if (e.type === 'error') setTimeout(r, 5); }));
+  await new Promise(r => rt.socket.once('open', r));
+  rt.send({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] } });
+  rt.send({ type: 'response.create' });
+  await sawError;
+  rt.close();
+  await new Promise(r => rt.socket.once('close', r));
+  const calls = (await drain()).filter(c => c.api === 'openai-realtime');
+  await fake.close();
+  assert.equal(errors.length, 1); // the app's own error listener still fires
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].conversation, { id: 'call-2' });
+  assert.deepEqual(calls[0].request.input, [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }]);
+  assert.match(calls[0].error, /overloaded/);
+  assert.equal(calls[0].request.instructions, 'Be brief.');
+  assert.doesNotMatch(JSON.stringify(calls), LONG_BASE64);
+});
+
+test('OpenAI Realtime: OpenAIRealtimeWebSocket is patched too, and state keeps at most 200 items', async () => {
+  // Node's global WebSocket needs a real wss:// server, so this drives the patched class through a stand-in
+  // global WebSocket instead of the network. The observer and the app's listeners are the same code path.
+  const mod = await optional('openai/realtime/websocket');
+  if (!mod) return;
+  await drain();
+  const Real = globalThis.WebSocket;
+  class FakeSocket extends EventTarget {
+    constructor(url) { super(); this.url = url; this.readyState = 1; this.out = []; }
+    send(data) { this.out.push(JSON.parse(data)); }
+    close() { this.readyState = 3; this.dispatchEvent(new Event('close')); }
+    server(e) { const m = new Event('message'); m.data = JSON.stringify(e); this.dispatchEvent(m); }
+  }
+  globalThis.WebSocket = FakeSocket;
+  let rt;
+  try {
+    const client = new OpenAI({ apiKey: 'k', baseURL: 'http://127.0.0.1:9/v1', dangerouslyAllowBrowser: true });
+    rt = sdk.withSession('call-3', () => new mod.OpenAIRealtimeWebSocket({ model: 'gpt-realtime', dangerouslyAllowBrowser: true }, client));
+  } finally { globalThis.WebSocket = Real; }
+  const heard = [];
+  rt.on('event', e => heard.push(e.type));
+  const s = rt.socket;
+  for (let i = 0; i < 250; i++) rt.send({ type: 'conversation.item.create', item: { id: `u${i}`, type: 'message', role: 'user', content: [{ type: 'input_text', text: `t${i}` }] } });
+  s.server({ type: 'response.created', response: { id: 'r' } });
+  s.server({ type: 'response.output_text.done', response_id: 'r', item_id: 'a', text: 'ok' });
+  s.server({ type: 'response.done', response: { id: 'r', status: 'completed', output: [], usage: null } });
+  rt.close();
+  const calls = (await drain()).filter(c => c.api === 'openai-realtime');
+  assert.deepEqual(heard, ['response.created', 'response.output_text.done', 'response.done']);
+  assert.equal(s.out.length, 250);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].conversation, { id: 'call-3' });
+  assert.equal(calls[0].request.input.length, 199); // 200 kept, one of them the reply
+  assert.equal(calls[0].request.input[0].content[0].text, 't51');
+  assert.deepEqual(calls[0].response.output, [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }]);
+});
