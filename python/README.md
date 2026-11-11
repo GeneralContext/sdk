@@ -1,83 +1,74 @@
 # generalcontext
 
-Record your agent's model calls for the General Context platform. No dependencies, and never
-in your agent's way: calls are sent from a background thread, and our failures are logged, not raised.
+Record your AI agent's model calls for [General Context](https://generalcontextlabs.com/docs). We
+read your agent's production conversations and find where it goes wrong, and each failure you confirm
+becomes an RL and eval task built from the conversation. Your tasks together are your benchmark.
+
+Recording never gets in your agent's way: calls are sent in the background, a failure on our side
+is logged and dropped, never raised, and there are no runtime dependencies.
+
+## Install
 
 ```bash
 pip install generalcontext
 export GENERALCONTEXT_API_KEY=gck_...   # from your workspace's Connect page
 ```
 
+## Record
+
 ```python
 import generalcontext
+
 generalcontext.initialize(app_name="support-agent")   # once per process, at startup
 
-# Optional: group every call in one conversation under your own id
+# Group every call in one conversation under the id you already use for it
 with generalcontext.session(conversation_id, user_id=customer_id, channel="chat"):
-    with generalcontext.task("triage"):
-        reply = client.chat.completions.create(...)   # any OpenAI or Anthropic client
+    reply = handle(message)
+
+generalcontext.flush()   # before a serverless function, job or script exits
 ```
 
-`initialize()` records every OpenAI (`chat.completions`, `responses`) and Anthropic (`messages`)
-call in the process, sync and async, streamed or not, from clients created before or after it.
-SDK clients are always recorded. Raw `httpx` and `requests` POSTs to `/chat/completions`
-are recorded only with `instrument_http=True`. Call it in every process: queue workers and forked
-children do not inherit it.
+If your app serves several companies of its own, pass `account=` to `session()` (the id or name you
+already use for that company) so conversations are grouped by account.
 
-## Flush before exit
+`initialize()` records every call these clients make in the process, sync and async, streamed or
+not, from clients created before or after it. Call it in every process, including workers.
 
-On serverless, in jobs, and before `os._exit()`, send what is queued:
-
-```python
-generalcontext.flush()   # synchronous, waits up to 10s, never raises
-```
-
-## Outcomes and events
-
-```python
-generalcontext.report_outcome(conversation_id, "fail", note="customer reopened the ticket")   # or "success"
-generalcontext.log_event(conversation_id, "order.refunded", {"amount": 42.5}, event_id=f"refund:{refund.id}")
-generalcontext.log_event(conversation_id, "handoff.to_human", {"reason": "billing"})
-```
-
-Both need the conversation to exist on our side first, so they flush pending calls before
-sending. Both return `True` when accepted and never raise. Pass a stable `event_id` so a
-retried event is counted once. Properties are flat strings, numbers and booleans.
-
-## Redaction
-
-```python
-generalcontext.initialize(redact=True)   # emails, phones, card- and SSN-like numbers
-generalcontext.initialize(redact=fn)     # or your own: str -> str, applied to every string
-```
-
-Values become stable placeholders (`<phone:3f2a1c>`) before anything leaves your process. Set
-`GENERALCONTEXT_REDACT_SALT` to one secret in every process so placeholders match.
-
-## Configuration
-
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `api_key` | `GENERALCONTEXT_API_KEY` | Workspace key. Without it nothing is sent. |
-| `base_url` | `GENERALCONTEXT_BASE_URL`, else `https://generalcontextlabs.com` | Must be `https://` (plain `http://` only for localhost). |
-| `app_name` | `None` | Label for this app. |
-| `redact` | `False` | `True` for built-in PII redaction, or a `str -> str` function. Also applied to outcomes and events. |
-| `before_send` | `None` | `fn(call) -> dict or None`, runs on the sender thread before redaction. `None` or an exception drops the call. |
-| `instrument_http` | `False` | Also record raw `httpx`/`requests` POSTs to `/chat/completions`. |
-| `disable_batch` | `False` | Send each call on its own. |
-
-| Env var | Meaning |
+| Provider | Client |
 | --- | --- |
-| `GENERALCONTEXT_API_KEY` | Default `api_key`. |
-| `GENERALCONTEXT_BASE_URL` | Default `base_url`. |
-| `GENERALCONTEXT_REDACT_SALT` | Shared secret so redaction placeholders match across processes. |
-| `GENERALCONTEXT_DISABLED` | `1`, `true` or `yes` makes `initialize()` do nothing. |
+| OpenAI, including Azure OpenAI | `openai` (chat completions and responses, with parse and stream) |
+| Anthropic, including Bedrock and Vertex | `anthropic` (messages and beta messages) |
+| Google Gemini | `google-genai` |
+| AWS Bedrock Converse | `boto3` `bedrock-runtime` (`converse`, `converse_stream`) |
+| Anything else | Send [OpenTelemetry](https://generalcontextlabs.com/docs/opentelemetry) |
 
-`HTTPS_PROXY` and `SSL_CERT_FILE` are honored via `urllib`. Redirects are never followed.
-Calls over 4 MB are dropped, and the in-memory queue is capped at 64 MB. A second `initialize()`
-is ignored. `wrap(client)` and `conversation(...)` from 0.1 still work.
+**Voice (OpenAI Realtime).** Connections from `client.realtime.connect()` (sync and async, needs
+`openai[realtime]`) are recorded too. Open the connection inside `session(...)` and the whole call lands
+in that conversation. Each `response.done` is recorded as one `openai-realtime` call shaped like a
+Responses call: the instructions and tools, the conversation so far as text (caller turns from the input
+transcription, agent turns from the output transcript, tool calls and their results), and a `voice` field
+with `speech_stopped_at`, `first_audio_at`, `interrupted` and `truncated_at_ms`. Turn on input audio
+transcription in the session to record what the caller said. Audio is never recorded. Pass a connection to
+`wrap()` to record only that one.
 
-Tests: `cd python && python -m unittest test_sdk -v`.
+Python 3.9 to 3.13. Supported client versions, redaction, outcomes and events, and every option:
+[SDK reference](https://generalcontextlabs.com/docs/sdk).
+
+## Run your benchmark
+
+Each task runs anywhere, with no access to your systems: it carries what your agent's tools
+returned in production, a model plays the person, and a judge grades the rubric for a reward from
+0 to 1.
+
+```bash
+pip install generalcontext openai anthropic
+generalcontext benchmark pull --out benchmark.json   # needs a key that can run the benchmark
+generalcontext evals run benchmark.json --agent my_agent:handle --trials 3 --upload
+```
+
+`my_agent:handle` is your agent, called as `handle(messages, toolbox)`. See
+[Tasks and environments](https://generalcontextlabs.com/docs/tasks) and the
+[command line](https://generalcontextlabs.com/docs/cli).
 
 ## License
 

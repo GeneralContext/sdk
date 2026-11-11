@@ -1,0 +1,32 @@
+{
+  "format": "generalcontext.task/v1",
+  "id": "tst_contract_counter",
+  "slug": "counter-to-three",
+  "title": "Count to three",
+  "status": "ready",
+  "origin": "success",
+  "split": "held_out",
+  "tags": ["tools"],
+  "severity": null,
+  "workflow": null,
+  "source": {"issue": null, "conversations": [{"id": "conv_contract_2", "step": 1, "explanation": "The agent incremented the counter exactly three times and reported the total."}]},
+  "prompt": "Increment the counter until it reaches 3, then report the total.",
+  "expected": "Calls increment three times and reports 3.",
+  "agent": {"instructions": "", "models": [], "tools": ["increment"]},
+  "environment": {"kind": "counter", "start": 0, "target": 3},
+  "grader": {"kind": "counter-check", "target": 3},
+  "reference": [
+    {
+      "label": "production",
+      "expect": "pass",
+      "transcript": [],
+      "tool_calls": [
+        {"name": "increment", "arguments": {}, "result": {"count": 1}},
+        {"name": "increment", "arguments": {}, "result": {"count": 2}},
+        {"name": "increment", "arguments": {}, "result": {"count": 3}}
+      ],
+      "output": "3"
+    }
+  ],
+  "anonymized": true
+}

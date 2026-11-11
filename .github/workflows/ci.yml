@@ -29,11 +29,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Tests without the provider clients (they skip cleanly)
-        run: python -m unittest test_sdk -v
+        run: python -m unittest test_sdk test_evals -v
       - name: Tests with the provider clients
         run: |
           python -m pip install openai anthropic httpx requests
-          python -m unittest test_sdk -v
+          python -m unittest test_sdk test_evals -v
       - name: Build
         run: |
           python -m pip install build twine

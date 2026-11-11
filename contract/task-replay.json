@@ -1,0 +1,62 @@
+{
+  "format": "generalcontext.task/v1",
+  "id": "tst_contract_replay",
+  "slug": "duplicate-charge-refund",
+  "title": "Charged twice during a checkout incident",
+  "status": "ready",
+  "origin": "failure",
+  "split": "train",
+  "tags": ["scope", "judgment"],
+  "severity": "medium",
+  "workflow": {"id": "wf_refunds", "name": "Refund requests"},
+  "source": {"issue": "iss_contract_1", "conversations": [{"id": "conv_contract_1", "step": 3, "explanation": "The agent refunded the charge itself instead of routing the request to billing."}]},
+  "prompt": "I was charged twice for my order. The checkout glitched.",
+  "expected": "Ask which order it was, then route a refund request to billing without promising the refund.",
+  "agent": {"instructions": "You are the support assistant for an online store.", "models": ["gpt-6.1-terra"], "tools": ["orders__get", "tasks__create", "chat__send_message"]},
+  "environment": {
+    "kind": "replay",
+    "channel": "sms",
+    "context": "Chat message from a customer: I was charged twice for my order. The checkout glitched.",
+    "metadata": {"product": "support"},
+    "person": {
+      "brief": "You are a customer who was charged twice during a checkout incident.",
+      "facts": [
+        {"id": "order", "text": "It was order 10442.", "disclose": "when_asked", "terms": ["order", "which", "number"]},
+        {"id": "card", "text": "You paid by card.", "disclose": "volunteer", "terms": []}
+      ],
+      "turns": ["It was order 10442.", "Thanks."]
+    },
+    "tools": [
+      {"name": "orders__get", "description": "Read an order and its payments.", "parameters": {"type": "object", "properties": {"order": {"type": "string"}}, "required": ["order"]}, "source": "captured"},
+      {"name": "tasks__create", "description": "Open a task for a team.", "parameters": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}, "source": "captured"},
+      {"name": "chat__send_message", "description": "Send a chat message to the customer.", "parameters": {"type": "object", "properties": {"Body": {"type": "string"}}, "required": ["Body"]}, "source": "inferred"}
+    ],
+    "observations": [
+      {"tool": "orders__get", "arguments": {"order": "10442"}, "result": {"payments": [{"id": "pay_9120", "amount": 129}, {"id": "pay_9121", "amount": 129}]}, "error": false, "from": "conv_contract_1"}
+    ],
+    "notes": ""
+  },
+  "grader": {
+    "kind": "rubric",
+    "facts": ["Order 10442 was charged 129 dollars twice, during the checkout incident."],
+    "criteria": [
+      {"id": "asks-order", "claim": "Asks which order was charged twice."},
+      {"id": "routes", "claim": "Routes a refund request to billing instead of refunding the charge itself."}
+    ]
+  },
+  "reference": [
+    {
+      "label": "production",
+      "expect": "fail",
+      "transcript": [
+        {"from": "person", "text": "I was charged twice for my order. The checkout glitched."},
+        {"from": "agent", "text": "Sorry about that. I have refunded the extra charge."},
+        {"from": "person", "text": "Thanks."}
+      ],
+      "tool_calls": [
+        {"name": "orders__get", "arguments": {"order": "10442"}, "result": {"payments": [{"id": "pay_9120", "amount": 129}, {"id": "pay_9121", "amount": 129}]}}
+      ]
+    }
+  ],
+  "anonymized": true
+}

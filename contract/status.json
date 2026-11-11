@@ -1,0 +1,22 @@
+{
+  "workspace": "acme",
+  "key": {
+    "label": "ci",
+    "scopes": [
+      "ingest",
+      "evals"
+    ]
+  },
+  "last_call_at": "2026-11-10T00:00:02Z",
+  "last_source": "sdk",
+  "last_sdk": "python/0.3.0",
+  "session": {
+    "id": "conv_contract_1",
+    "found": true,
+    "calls": 1,
+    "models": [
+      "gpt-6.1-terra"
+    ],
+    "received_at": "2026-11-10T00:00:03Z"
+  }
+}
