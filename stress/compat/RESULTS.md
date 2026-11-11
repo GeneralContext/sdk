@@ -153,6 +153,6 @@ Notes:
     node stress/compat/node/run.mjs               # needs fnm with Node 18/20/22/24; ~2 min
     # one runtime only, no fnm (what CI does): node stress/compat/node/run.mjs --current-node
 
-Environments go under `$STRESS_SCRATCH` (or `$JCODE_SCRATCH_DIR`, or the OS temp dir). At most
+Environments go under `$STRESS_SCRATCH`, or the OS temp dir. At most
 4 run at once. Each run writes `matrix-*.md` (committed) and `results-*.json` (ignored, also
 uploaded by CI).

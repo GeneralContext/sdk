@@ -1,7 +1,7 @@
 {
   "format": "generalcontext.benchmark/v1",
-  "workspace": "elise",
-  "name": "EliseAI benchmark",
+  "workspace": "acme",
+  "name": "Acme benchmark",
   "exported_at": "2026-11-10T00:00:00Z",
   "exported_by": "key:ci",
   "summary": {

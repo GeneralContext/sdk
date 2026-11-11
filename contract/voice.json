@@ -4,21 +4,21 @@
   "calls": [
     {
       "api": "openai-realtime",
-      "conversation": { "id": "call_contract_voice", "channel": "voice", "product": "leasing" },
+      "conversation": { "id": "call_contract_voice", "channel": "voice", "product": "support" },
       "task": null,
       "started_at": "2026-11-10T00:00:00.000Z",
       "request": {
         "model": "gpt-realtime",
-        "instructions": "You answer the leasing line for Maple Court.",
-        "tools": [{ "type": "function", "name": "units__search", "parameters": { "type": "object", "properties": { "beds": { "type": "integer" } } } }],
+        "instructions": "You answer the support line for Northwind Internet.",
+        "tools": [{ "type": "function", "name": "plans__search", "parameters": { "type": "object", "properties": { "speed": { "type": "integer" } } } }],
         "input": [
-          { "role": "user", "content": [{ "type": "input_text", "text": "Do you have a two bedroom?" }], "audio": true, "at": "2026-11-10T00:00:00.000Z" }
+          { "role": "user", "content": [{ "type": "input_text", "text": "Do you have a faster plan?" }], "audio": true, "at": "2026-11-10T00:00:00.000Z" }
         ]
       },
       "response": {
         "id": "resp_rt_1",
         "output": [
-          { "type": "function_call", "call_id": "call_rt_1", "name": "units__search", "arguments": "{\"beds\": 2}" }
+          { "type": "function_call", "call_id": "call_rt_1", "name": "plans__search", "arguments": "{\"speed\": 500}" }
         ],
         "usage": { "input_tokens": 410, "output_tokens": 22 }
       },
@@ -28,22 +28,22 @@
     },
     {
       "api": "openai-realtime",
-      "conversation": { "id": "call_contract_voice", "channel": "voice", "product": "leasing" },
+      "conversation": { "id": "call_contract_voice", "channel": "voice", "product": "support" },
       "task": null,
       "started_at": "2026-11-10T00:00:00.700Z",
       "request": {
         "model": "gpt-realtime",
-        "instructions": "You answer the leasing line for Maple Court.",
-        "tools": [{ "type": "function", "name": "units__search", "parameters": { "type": "object", "properties": { "beds": { "type": "integer" } } } }],
+        "instructions": "You answer the support line for Northwind Internet.",
+        "tools": [{ "type": "function", "name": "plans__search", "parameters": { "type": "object", "properties": { "speed": { "type": "integer" } } } }],
         "input": [
-          { "type": "function_call_output", "call_id": "call_rt_1", "output": "{\"units\": [\"204\"]}" }
+          { "type": "function_call_output", "call_id": "call_rt_1", "output": "{\"plans\": [\"Fiber 500\"]}" }
         ],
         "previous_response_id": "resp_rt_1"
       },
       "response": {
         "id": "resp_rt_2",
         "output": [
-          { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Unit 204 is a two bedroom. Want to see it Saturday?" }], "audio": true, "voice": { "latency_ms": 1350, "interrupted": true, "truncated_at_ms": 2100 } }
+          { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "Fiber 500 is available at your address. Want me to switch you today?" }], "audio": true, "voice": { "latency_ms": 1350, "interrupted": true, "truncated_at_ms": 2100 } }
         ],
         "usage": { "input_tokens": 455, "output_tokens": 31 }
       },
@@ -60,7 +60,7 @@
         "model": "gpt-audio",
         "modalities": ["text", "audio"],
         "messages": [
-          { "role": "system", "content": "You answer the leasing line." },
+          { "role": "system", "content": "You answer the support line." },
           { "role": "user", "content": [{ "type": "input_audio", "input_audio": { "data": "[omitted 48211 bytes sha256:ab12cd34ef56]", "format": "wav" } }] }
         ]
       },
@@ -68,7 +68,7 @@
         "id": "chatcmpl_audio_1",
         "model": "gpt-audio",
         "choices": [{ "index": 0, "message": { "role": "assistant", "content": null,
-          "audio": { "id": "audio_1", "data": "[omitted 90112 bytes sha256:0f0f0f0f0f0f]", "expires_at": 0, "transcript": "Unit 204 is available. Want to book a tour?" } } }],
+          "audio": { "id": "audio_1", "data": "[omitted 90112 bytes sha256:0f0f0f0f0f0f]", "expires_at": 0, "transcript": "Fiber 500 is available. Want me to switch you over?" } } }],
         "usage": { "prompt_tokens": 300, "completion_tokens": 40 }
       },
       "ended_at": "2026-11-10T00:01:02.000Z",

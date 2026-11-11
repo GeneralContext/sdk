@@ -39,7 +39,7 @@ class Collector(BaseHTTPRequestHandler):
                 found = "session=chat%3A1" in self.path or "session=chat%3A3" in self.path
                 session = {"id": "chat:1", "found": found, "calls": (1 if "chat%3A3" in self.path else 3) if found else 0,
                            "models": ["gpt-test"] if found else [], "received_at": None}
-            return self.reply(200, {"workspace": "elise", "key": {"label": "ci", "scopes": ["evals"] if key == EVALS_KEY else ["ingest"]},
+            return self.reply(200, {"workspace": "acme", "key": {"label": "ci", "scopes": ["evals"] if key == EVALS_KEY else ["ingest"]},
                                     "last_call_at": "2026-11-09T00:00:00Z", "last_source": "sdk", "session": session})
         if self.path == "/api/platform-collect/benchmark":
             return self.reply(200, BENCHMARK) if key == EVALS_KEY else self.reply(403, FORBIDDEN)
@@ -85,7 +85,7 @@ class CliTest(unittest.TestCase):
     def test_verify_prints_workspace_scopes_and_last_call(self):
         code, out, _ = self.run_cli("verify", key=INGEST_KEY)
         self.assertEqual(code, 0)
-        self.assertIn('Workspace elise. Key "ci" sends traffic.', out)
+        self.assertIn('Workspace acme. Key "ci" sends traffic.', out)
         self.assertIn("from sdk", out)
 
     def test_verify_session_found_and_not_found(self):
@@ -103,7 +103,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(out)["session"]["found"], False)
         code, out, _ = self.run_cli("verify", "--json")
-        self.assertEqual((code, json.loads(out)["workspace"]), (0, "elise"))
+        self.assertEqual((code, json.loads(out)["workspace"]), (0, "acme"))
 
     def test_config_errors_exit_2_and_a_bad_key_exits_1(self):
         self.assertEqual(self.run_cli("verify", key="")[0], 2)

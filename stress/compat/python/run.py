@@ -3,7 +3,7 @@
     python3 stress/compat/python/run.py            # full matrix
     python3 stress/compat/python/run.py --quick    # latest version of each package, one Python
 
-Needs `uv`. Virtualenvs go under $STRESS_SCRATCH (default $JCODE_SCRATCH_DIR or a temp dir),
+Needs `uv`. Virtualenvs go under $STRESS_SCRATCH (default a temp dir),
 never in the repository. At most --jobs (default 4) environments run at once. Writes
 results-python.json and matrix-python.md next to this file, and exits 1 on any failure.
 No network calls except package downloads: providers and the collector are a local fake.
@@ -43,7 +43,7 @@ def key(version):
 
 
 def scratch():
-    root = os.environ.get("STRESS_SCRATCH") or os.environ.get("JCODE_SCRATCH_DIR") or tempfile.gettempdir()
+    root = os.environ.get("STRESS_SCRATCH") or tempfile.gettempdir()
     path = os.path.join(root, "gc-compat-python")
     os.makedirs(path, exist_ok=True)
     return path

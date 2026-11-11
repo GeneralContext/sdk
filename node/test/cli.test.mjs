@@ -25,7 +25,7 @@ before(async () => {
         ? { id, found: true, calls: 3, models: ['gpt-x', 'claude-x'], received_at: '2026-11-10T00:00:00Z' }
         : id === 'conv-one' ? { id, found: true, calls: 1, models: ['gpt-x'], received_at: '2026-11-10T00:00:00Z' }
         : { id, found: false, calls: 0, models: [], received_at: null };
-      return reply(200, { workspace: 'elise', key: { label: 'prod', scopes: ['ingest'] }, last_call_at: '2026-11-10T00:00:00Z', last_source: 'sdk', session });
+      return reply(200, { workspace: 'acme', key: { label: 'prod', scopes: ['ingest'] }, last_call_at: '2026-11-10T00:00:00Z', last_source: 'sdk', session });
     }
     if (url.pathname === '/api/platform-collect/benchmark') {
       if (key !== 'Bearer evals') return reply(403, { error: 'This key cannot download the benchmark. On API keys, create a key that can run the benchmark.' });
@@ -55,7 +55,7 @@ test('dist/cli.js starts with a node shebang', () => {
 test('verify prints workspace, scopes and last call', async () => {
   const out = await run(['verify']);
   assert.equal(out.code, 0, out.stderr);
-  assert.match(out.stdout, /Workspace elise\. Key "prod" sends traffic\./);
+  assert.match(out.stdout, /Workspace acme\. Key "prod" sends traffic\./);
   assert.match(out.stdout, /Last call arrived 2026-11-10T00:00:00Z from sdk\./);
   assert.equal(seen.at(-1).auth, 'Bearer k');
 });
