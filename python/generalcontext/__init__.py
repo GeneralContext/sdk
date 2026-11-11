@@ -1173,10 +1173,14 @@ def _rt_convert(item):
         return {"type": "function_call_output", "call_id": item.get("call_id"), "output": item.get("output")}
     if kind != "message":
         return None
+    audio = any(isinstance(p, dict) and "audio" in str(p.get("type")) for p in item.get("content") or [])
+    # Caller audio with no transcript (input transcription is off, or it has not arrived yet) is kept as an
+    # empty spoken turn, so the call still shows that the caller spoke. A transcript fills it in later.
     text = _rt_text(item)
+    if text is None and audio and item.get("role") != "assistant":
+        text = ""
     if text is None:
         return None
-    audio = any(isinstance(p, dict) and "audio" in str(p.get("type")) for p in item.get("content") or [])
     if item.get("role") == "assistant":
         out = {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}
     else:
@@ -1249,7 +1253,9 @@ class _RealtimeState:
         item_id = raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else None
         converted = _rt_convert(raw)
         e = self.entry(item_id, (lambda x: x["item"] == converted) if converted else None)
-        if converted:
+        # An untranscribed echo of an item never erases a transcript that already arrived.
+        blank = converted is not None and converted.get("role") not in (None, "assistant") and not converted["content"][0]["text"]
+        if converted and not (blank and e["item"]):
             e["item"] = dict(e["item"] or {}, **converted)
         if response_id:
             e["response"] = response_id

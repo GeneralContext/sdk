@@ -1148,6 +1148,34 @@ class RealtimeTest(unittest.TestCase):
         reply = next(item for item in spoken["response"]["output"] if item.get("role") == "assistant")
         self.assertGreaterEqual(reply["voice"]["latency_ms"], 100)
 
+    def test_a_caller_turn_with_no_transcript_still_shows_and_a_late_transcript_fills_it_in(self):
+        def handler(ws):
+            send = lambda event: ws.send(json.dumps(event))
+            spoke = lambda i: send({"type": "conversation.item.added", "event_id": "x" + i, "previous_item_id": None, "item": {"id": i, "type": "message", "role": "user", "content": [{"type": "input_audio", "transcript": None}]}})
+            def reply(r, text):
+                send({"type": "response.created", "event_id": "c" + r, "response": {"id": r, "status": "in_progress", "output": []}})
+                send({"type": "response.output_text.done", "event_id": "t" + r, "response_id": r, "item_id": "a" + r, "output_index": 0, "content_index": 0, "text": text})
+                send({"type": "response.done", "event_id": "d" + r, "response": {"id": r, "status": "completed", "output": [], "usage": None}})
+            for message in ws:
+                if json.loads(message)["type"] == "response.create":
+                    spoke("u1")
+                    reply("r1", "Hello.")
+                    spoke("u2")
+                    send({"type": "conversation.item.input_audio_transcription.completed", "event_id": "tr", "item_id": "u2", "content_index": 0, "transcript": "Book me in."})
+                    spoke("u2")
+                    reply("r2", "Done.")
+                    ws.close()
+                    return
+        client = self.serve(handler)
+        with generalcontext.session("call-5"):
+            with client.realtime.connect(model="gpt-realtime") as connection:
+                connection.response.create()
+                for _ in connection:
+                    pass
+        calls = self.realtime_calls()
+        users = [item for item in calls[1]["request"]["input"] if item.get("role") == "user"]
+        self.assertEqual([(item["content"][0]["text"], item.get("audio")) for item in users], [("", True), ("Book me in.", True)])
+
     def test_async_connection_and_bounded_state(self):
         def handler(ws):
             count = 0

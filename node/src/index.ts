@@ -964,9 +964,11 @@ function rtConvert(item: any): RtItem | null {
   if (item.type === 'function_call') return { type: 'function_call', call_id: item.call_id, name: item.name, arguments: item.arguments ?? '' };
   if (item.type === 'function_call_output') return { type: 'function_call_output', call_id: item.call_id, output: item.output };
   if (item.type !== 'message') return null;
-  const text = rtText(item);
-  if (text == null) return null;
   const audio = rtHasAudio(item);
+  // Caller audio with no transcript (input transcription is off, or it has not arrived yet) is kept as an
+  // empty spoken turn, so the call still shows that the caller spoke. A transcript fills it in later.
+  const text = rtText(item) ?? (audio && item.role !== 'assistant' ? '' : null);
+  if (text == null) return null;
   if (item.role === 'assistant') return { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }], ...(audio ? { audio: true } : {}) };
   return { role: item.role ?? 'user', content: [{ type: 'input_text', text }], ...(audio ? { audio: true } : {}) };
 }
@@ -987,7 +989,9 @@ function rtUpsert(state: RtState, raw: any, responseId?: string) {
   // The app's own conversation.item.create usually has no id. Match the server's echo of it by content.
   const same = converted && JSON.stringify(converted);
   const entry = rtEntry(state, id, e => !!same && !!e.item && JSON.stringify(e.item) === same);
-  if (converted) entry.item = { ...entry.item, ...converted };
+  // An untranscribed echo of an item never erases a transcript that already arrived.
+  const blank = converted && 'role' in converted && converted.role !== 'assistant' && !(converted as any).content?.[0]?.text;
+  if (converted && !(blank && entry.item)) entry.item = { ...entry.item, ...converted };
   if (responseId) entry.response = responseId;
 }
 
