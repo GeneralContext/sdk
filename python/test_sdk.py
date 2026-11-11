@@ -972,6 +972,25 @@ def _two_turn_server(sent, received):
     return handler, tools
 
 
+def _voice_contract():
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "contract", "voice.json")) as handle:
+        return [c for c in json.load(handle)["calls"] if c["api"] == "openai-realtime"]
+
+
+def _item_kind(item):
+    return item.get("type") or item.get("role")
+
+
+def _item_shapes(calls):
+    """Item kind to its keys, and to its voice keys without the optional truncated_at_ms."""
+    shapes = {}
+    for call in calls:
+        for item in call["request"]["input"] + call["response"]["output"]:
+            voice = sorted(set(item["voice"]) - {"truncated_at_ms"}) if "voice" in item else None
+            shapes.setdefault(_item_kind(item), set()).add((tuple(sorted(item)), tuple(voice) if voice else None))
+    return shapes
+
+
 @unittest.skipIf(REALTIME_SKIP, REALTIME_SKIP or "")
 class RealtimeTest(unittest.TestCase):
     # The collector and setup from SdkTest, without inheriting its tests.
@@ -1057,6 +1076,16 @@ class RealtimeTest(unittest.TestCase):
         self.assertTrue(second["voice"]["interrupted"])
         self.assertEqual(second["voice"]["truncated_at_ms"], 640)
         recorded = json.dumps(calls)
+        # The shared voice fixture has the shape this SDK sends, key for key. Values may differ.
+        fixture = _voice_contract()
+        for c in calls:
+            self.assertEqual(set(c), set(fixture[0]))
+            self.assertEqual(set(c["request"]), set(fixture[0]["request"]))
+            self.assertEqual(set(c["response"]), set(fixture[0]["response"]))
+        expected, actual = _item_shapes(fixture), _item_shapes(calls)
+        self.assertEqual(set(actual), {"user", "message", "function_call", "function_call_output"})
+        for kind, shapes in actual.items():
+            self.assertLessEqual(shapes, expected[kind], kind)
         self.assertIsNone(__import__("re").search(r"[A-Za-z0-9+/]{100,}", recorded))
         self.assertNotIn("omitted", recorded)  # dropped at the source, not even a placeholder
 

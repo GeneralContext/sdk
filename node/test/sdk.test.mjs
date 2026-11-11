@@ -6,6 +6,7 @@ import net from 'node:net';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import { AzureOpenAI } from 'openai';
@@ -990,6 +991,25 @@ test('OpenAI Realtime: a two-turn voice call records one Responses-shaped call p
   assert.equal(second.voice.interrupted, true);
   assert.equal(second.voice.truncated_at_ms, 640);
   const json = JSON.stringify(calls);
+  // The shared voice fixture has the shape this SDK sends, key for key. Values may differ.
+  const fixture = JSON.parse(readFileSync(new URL('../../contract/voice.json', import.meta.url), 'utf8')).calls.filter(c => c.api === 'openai-realtime');
+  const keys = o => Object.keys(o).sort().join(',');
+  for (const c of calls) {
+    assert.equal(keys(c), keys(fixture[0]));
+    assert.equal(keys(c.request), keys(fixture[0].request));
+    assert.equal(keys(c.response), keys(fixture[0].response));
+  }
+  const shapes = list => {
+    const out = {};
+    for (const c of list) for (const item of [...c.request.input, ...c.response.output]) {
+      const voice = item.voice ? Object.keys(item.voice).filter(k => k !== 'truncated_at_ms').sort().join(',') : '';
+      (out[item.type ?? item.role] ??= new Set()).add(`${keys(item)}|${voice}`);
+    }
+    return out;
+  };
+  const expected = shapes(fixture), actual = shapes(calls);
+  assert.deepEqual(Object.keys(actual).sort(), ['function_call', 'function_call_output', 'message', 'user']);
+  for (const [kind, set] of Object.entries(actual)) for (const shape of set) assert.ok(expected[kind]?.has(shape), `${kind} ${shape}`);
   assert.doesNotMatch(json, LONG_BASE64);
   assert.ok(!json.includes(AUDIO.slice(0, 64)));
   assert.doesNotMatch(json, /omitted \d+ bytes/); // dropped at the source, not even a placeholder
