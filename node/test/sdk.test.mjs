@@ -265,6 +265,7 @@ test('credentials are never sent, even with redaction off, and request options a
   for (const secret of [openaiKey, awsKey, gcKey, 'sk-helicone']) assert.ok(!sent.includes(secret), secret);
   assert.match(sent, /<openai-key>/);
   assert.match(sent, /<aws-key>/);
+  assert.equal(sdk.maskSecrets('postgres://app:Hunter2pass@db:5432/x'), 'postgres://app:<password>@db:5432/x');
   assert.equal(await sdk.reportOutcome('s1', 'fail', `customer read out ${openaiKey}`), true);
   assert.ok(!JSON.stringify(collected.outcomes.at(-1)).includes(openaiKey));
 });

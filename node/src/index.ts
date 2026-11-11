@@ -357,6 +357,8 @@ const SECRETS: [string, RegExp][] = [
   ['generalcontext-key', /\bgck_[a-f0-9]{48}\b/g],
   ['jwt', /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g],
   ['bearer-token', /(?<=\bBearer\s)[A-Za-z0-9._~+/-]{20,}=*/g],
+  // A password inside a connection string or URL: postgres://user:PASSWORD@host. Only the password goes.
+  ['password', /(?<=\b[a-z][a-z0-9+.-]{1,20}:\/\/[^\s:/@]{1,64}:)[^\s@/]{1,128}(?=@)/g],
   ['private-key', /-----BEGIN [A-Z ]{0,20}PRIVATE KEY-----(?:[A-Za-z0-9+/=\s:,]|-(?!-)){1,16384}?-----END [A-Z ]{0,20}PRIVATE KEY-----/g],
 ];
 export function maskSecrets(text: string): string {

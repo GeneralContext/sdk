@@ -1635,6 +1635,8 @@ _SECRETS = [(kind, re.compile(pattern)) for kind, pattern in (
     ("generalcontext-key", r"\bgck_[a-f0-9]{48}\b"),
     ("jwt", r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
     ("bearer-token", r"(?<=\bBearer )[A-Za-z0-9._~+/-]{20,}=*"),
+    # A password inside a connection string or URL: postgres://user:PASSWORD@host. Only the password goes.
+    ("password", r"(?<=://)([^\s:/@]{1,64}):[^\s@/]{1,128}(?=@)"),
     ("private-key", r"-----BEGIN [A-Z ]{0,20}PRIVATE KEY-----(?:[A-Za-z0-9+/=\s:,]|-(?!-)){1,16384}?-----END [A-Z ]{0,20}PRIVATE KEY-----"),
 )]
 
@@ -1644,7 +1646,8 @@ def mask_secrets(text):
     if len(text) < 16:
         return text
     for kind, pattern in _SECRETS:
-        text = pattern.sub("<" + kind + ">", text)
+        # The password pattern keeps the user name it captured; the others replace the whole match.
+        text = pattern.sub((lambda m, k=kind: m.group(1) + ":<" + k + ">") if pattern.groups else "<" + kind + ">", text)
     return text
 
 

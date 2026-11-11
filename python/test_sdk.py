@@ -248,6 +248,7 @@ class SdkTest(unittest.TestCase):
         self.assertIn("<openai-key>", sent)
         self.assertIn("<aws-key>", sent)
         self.assertIn("<generalcontext-key>", sent)
+        self.assertEqual(generalcontext.mask_secrets("postgres://app:Hunter2pass@db:5432/x"), "postgres://app:<password>@db:5432/x")
         self.assertNotIn("extra_query", sent)
         self.assertTrue(generalcontext.report_outcome("s1", "fail", "customer read out " + openai_key))
         self.assertNotIn(openai_key, json.dumps(Server.received[-1][2]))
